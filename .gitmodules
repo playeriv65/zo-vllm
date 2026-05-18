@@ -1,3 +1,6 @@
 [submodule "third_party/LOZO"]
 	path = third_party/LOZO
 	url = https://github.com/optsuite/LOZO.git
+[submodule "third_party/vllm"]
+	path = third_party/vllm
+	url = https://github.com/playeriv65/vllm-ZO.git
