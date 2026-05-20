@@ -2,9 +2,21 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
-.venv/
 *.so
 .triton/
 dist/
 build/
 *.log
+
+# Environments
+.venv/
+.venv312/
+
+# Generated artifacts
+adapters/
+*.pt
+phase1_results.json
+
+# Cache
+__pycache__/
+*.pyc
