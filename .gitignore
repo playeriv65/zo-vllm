@@ -13,9 +13,14 @@ build/
 .venv312/
 
 # Generated artifacts
-adapters/
+adapters*/
 *.pt
-phase1_results.json
+phase1*_results.json
+
+# Logs and results
+logs/
+phase1/phase1_results/
+phase1/*.log
 
 # Cache
 __pycache__/
