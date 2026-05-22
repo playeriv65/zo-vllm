@@ -19,8 +19,11 @@ phase1*_results.json
 
 # Logs and results
 logs/
+results/
 phase1/phase1_results/
 phase1/*.log
+wandb/
+scratch/
 
 # Cache
 __pycache__/
