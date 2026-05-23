@@ -104,7 +104,7 @@ class WeightSync:
                 else:
                     other_weights[vllm_name] = tensor
             
-            # Update packed qkv_proj weights
+            # Update packed qkv_proj weights.
             for vllm_name, proj_dict in qkv_weights.items():
                 # Get module and unwrap LoRA wrapper
                 module_path = vllm_name.replace(".weight", "")
@@ -112,26 +112,23 @@ class WeightSync:
                 base_layer = unwrap_lora_module(module)
                 param = base_layer.weight
                 
-                # Construct packed weight by copying each slice
-                # OPT model: q/k/v all have same shape [hidden_size, hidden_size]
-                # Packed weight shape: [3*hidden_size, hidden_size]
-                # Slice allocation:
-                #   q: [0:hidden_size, :]
-                #   k: [hidden_size:2*hidden_size, :]
-                #   v: [2*hidden_size:3*hidden_size, :]
-                packed_weight = param.data.clone()
-                hidden_size = packed_weight.shape[1]
+                # OPT packs q/k/v as [3 * hidden_size, hidden_size].
+                # Copy directly into slices to avoid cloning the full packed
+                # tensor for every layer on every training step.
+                hidden_size = param.data.shape[0] // 3
                 
                 for proj_key, tensor in proj_dict.items():
-                    tensor_gpu = tensor.cuda().to(param.dtype)
+                    tensor_gpu = tensor.to(
+                        device=param.device,
+                        dtype=param.dtype,
+                        non_blocking=True,
+                    )
                     if proj_key == "q":
-                        packed_weight[0:hidden_size, :] = tensor_gpu
+                        param.data[0:hidden_size, :].copy_(tensor_gpu)
                     elif proj_key == "k":
-                        packed_weight[hidden_size:2*hidden_size, :] = tensor_gpu
+                        param.data[hidden_size:2 * hidden_size, :].copy_(tensor_gpu)
                     elif proj_key == "v":
-                        packed_weight[2*hidden_size:3*hidden_size, :] = tensor_gpu
-                
-                param.data.copy_(packed_weight)
+                        param.data[2 * hidden_size:3 * hidden_size, :].copy_(tensor_gpu)
             
             # Update other weights (non-packed)
             for vllm_name, tensor in other_weights.items():
@@ -140,7 +137,11 @@ class WeightSync:
                 base_layer = unwrap_lora_module(module)
                 param = base_layer.weight
                 
-                tensor_gpu = tensor.cuda().to(param.dtype)
+                tensor_gpu = tensor.to(
+                    device=param.device,
+                    dtype=param.dtype,
+                    non_blocking=True,
+                )
                 param.data.copy_(tensor_gpu)
             
             torch.cuda.synchronize()

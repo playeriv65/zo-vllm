@@ -8,7 +8,7 @@
 - ✅ LOZOController with V cache
 - ✅ TempLoRARuntime for all layers
 
-### Simplifications (for initial implementation)
+### Simplifications (accepted vLLM scope)
 
 #### 1D Parameters Skipped
 
@@ -34,9 +34,9 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 - `final_layer_norm.bias`: [2560]
 - Linear layers' bias (if present)
 
-**Future work**: 
-- Option A: Directly modify base weights for 1D params (bypass LoRA)
-- Option B: Accept simplification and compare with baseline
+**Current handling**:
+- vLLM accepted path uses `train_scope=lora_only`, so 1D params remain skipped.
+- HF/LOZO baseline supports `train_scope=full` for ablations that include 1D params.
 
 ---
 
@@ -52,11 +52,11 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 - `embed_tokens.weight`: Token embeddings
 - `embed_positions.weight`: Position embeddings (OPT uses learned position embeddings)
 
-**Future work**: 
-- Modify vLLM source code to support embedding perturbation via:
-  - Option A: Extend LoRA to support embedding layers
-  - Option B: Temporarily modify base weights before/after forward pass
-  - Option C: Use hooks to inject embedding perturbations
+**Current handling**:
+- vLLM accepted path uses `train_scope=lora_only`, so embeddings remain skipped.
+- HF/LOZO baseline supports `train_scope=full` for ablations that include embeddings.
+- 100-step baseline ablation with CUDA RNG: `full` drops eval loss by `0.250000`;
+  `lora_only` drops by `0.140625` under the same hyperparameters.
 
 ---
 
@@ -64,9 +64,9 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 
 ### Data Flow
 ```
-LOZOController (HF model on CPU)
+LOZOController (HF model master weights on CPU or CUDA)
     │
-    │ 1. Maintain master weights (all 2D trainable params)
+    │ 1. Maintain master weights (LoRA-compatible params by default)
     │ 2. Sample U, V directions (V cached for step_interval steps)
     │ 3. Build LoRA tensors for perturbation forward
     │
@@ -127,11 +127,14 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1  # Allow pickle serialization
 
 ---
 
-## Next Steps
+## RNG And Ablation Notes
 
-1. Implement complete LOZO training loop (2D params only)
-2. Test convergence with SST2 dataset
-3. Compare with baseline:
-   - Loss curves
-   - Accuracy metrics
-4. Decide on 1D params handling
+- `--seed` controls the numpy stream that produces the per-step ZO seeds.
+- `--zo-random-device cpu|cuda` controls where U/V/z tensors are sampled.
+- Phase 2 CLIs default to CUDA RNG for speed. CPU RNG and CUDA RNG are not
+  bitwise-identical streams; CPU RNG remains available only to reproduce older
+  CPU-RNG experiments.
+- CUDA RNG side-by-side is accepted: 20/20 U/V digests match and all
+  plus/minus loss and `c` differences pass tolerance.
+- Embedding/1D support remains a baseline-only ablation unless vLLM gains
+  a direct non-LoRA perturbation path for those tensors.

@@ -16,7 +16,7 @@ import numpy as np
 from transformers import AutoTokenizer
 
 MODEL_NAME = "opt-2.7b-bf16"  # Local bf16 model
-DEVICE = "cuda:0"
+DEVICE = "cuda"
 DTYPE = torch.bfloat16
 EPS = 1e-3
 ADAPTER_DIR = Path("adapters_batch_test")

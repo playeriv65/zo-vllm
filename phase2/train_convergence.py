@@ -13,26 +13,22 @@ Aligned with LOZO baseline (third_party/LOZO/large_models/lozo.sh).
 
 import os
 
-# Set cache directories BEFORE any imports
-os.environ["VLLM_BATCH_INVARIANT"] = "1"
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-os.environ["WANDB_MODE"] = "offline"
-os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_datasets_cache"
-os.environ["HF_HOME"] = "/tmp/hf_home"
-os.environ["TRANSFORMERS_CACHE"] = "/tmp/transformers_cache"
-os.environ["HF_HUB_CACHE"] = "/tmp/hf_hub_cache"
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+os.environ.setdefault("WANDB_MODE", "offline")
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import time
 import torch
 import wandb
 import numpy as np
-from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from vllm import LLM
 
 from phase2.lozo_controller import LOZOController, LOZOConfig
@@ -40,38 +36,63 @@ from phase2.temp_lora_runtime import TempLoRARuntime
 from phase2.vllm_scorer import VLLMScorer
 from phase2.weight_sync import WeightSync
 from phase2.memory_lora_loader import install_mocks
+from phase2.direction_digest import digest_named_uv
 
 
-def prepare_sst2_data(tokenizer, num_samples=1000, max_length=512):
+class SimpleDataset(Dataset):
+    def __init__(self, prompts):
+        self.prompts = prompts
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, idx):
+        return self.prompts[idx]
+
+
+def prepare_sst2_data(num_samples=1000):
     """Load and prepare SST2 dataset for causal LM training."""
     dataset = load_dataset("glue", "sst2", split="train")
-    
-    # Sample subset
+
+    # Sample subset (consumes numpy state - same seed => same selection)
     if num_samples < len(dataset):
         indices = np.random.choice(len(dataset), num_samples, replace=False)
         dataset = dataset.select(indices)
-    
-    # Format as prompts for causal LM
-    # SST2: sentence + " It was" -> "great"/"terrible"
+
     prompts = []
     for item in dataset:
         sentence = item["sentence"]
-        label = item["label"]  # 0=negative, 1=positive
-        # Format: "<sentence> It was" -> model should complete with sentiment
         prompt = f"{sentence} It was"
         prompts.append(prompt)
-    
-    return prompts, [dataset[i]['label'] for i in range(len(dataset))]
+
+    return SimpleDataset(prompts)
 
 
 def main():
     import argparse
+    import json
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=1e-7, help="Learning rate")
     parser.add_argument("--rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--steps", type=int, default=100, help="Number of training steps")
     parser.add_argument("--eps", type=float, default=1e-3, help="ZO perturbation epsilon")
+    parser.add_argument("--step-interval", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help="Optional CUDA_VISIBLE_DEVICES override. If omitted, inherit the environment.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--train-scope", choices=["lora_only"], default="lora_only")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
+    parser.add_argument("--no-wandb", dest="no_wandb", action="store_true", help="Disable WandB logging")
     args = parser.parse_args()
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     # Install mocks before any vLLM operations
     install_mocks()
@@ -81,28 +102,31 @@ def main():
     rank_r = args.rank
     lr = args.lr
     zo_eps = args.eps
-    step_interval = 100
-    batch_size = 16
+    step_interval = args.step_interval
+    batch_size = args.batch_size
     num_steps = args.steps
     
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"zo-vllm-r{rank_r}-{num_steps}steps-{timestamp}"
     
     # WandB setup
-    wandb.init(
-        project="zo-vllm",
-        entity="playeriv65-university-of-minnesota",
-        name=run_name,
-        config={
-            "model": model_name,
-            "rank_r": rank_r,
-            "lr": lr,
-            "zo_eps": zo_eps,
-            "step_interval": step_interval,
-            "batch_size": batch_size,
-            "num_steps": num_steps,
-        }
-    )
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(
+            project="zo-vllm",
+            entity="playeriv65-university-of-minnesota",
+            name=run_name,
+            config={
+                "model": model_name,
+                "rank_r": rank_r,
+                "lr": lr,
+                "zo_eps": zo_eps,
+                "step_interval": step_interval,
+                "batch_size": batch_size,
+                "num_steps": num_steps,
+            }
+        )
     
     print(f"Run: {run_name}")
     print(f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}")
@@ -133,6 +157,9 @@ def main():
         eps=zo_eps,
         lr=lr,
         step_interval=step_interval,
+        master_device="cuda" if torch.cuda.is_available() else "cpu",
+        random_device=args.zo_random_device,
+        train_scope=args.train_scope,
     )
     
     controller = LOZOController(hf_model, lozo_config)
@@ -144,97 +171,206 @@ def main():
     
     weight_sync = WeightSync(llm, num_layers=num_layers)
     
-    # Load SST2 data
-    prompts, labels = prepare_sst2_data(tokenizer, num_samples=1000)
-    print(f"Loaded {len(prompts)} prompts from SST2")
-    
-    # Initial loss (base model)
-    initial_prompts = prompts[:batch_size]
-    initial_loss = scorer.score_base(initial_prompts)
+    # Load SST2 data (np.random seed before np.random.choice to align with baseline)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    dataset = prepare_sst2_data(num_samples=1000)
+    print(f"Loaded {len(dataset)} prompts from SST2")
+
+    # DataLoader with SequentialSampler (no numpy consumption for batch selection)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=SequentialSampler(dataset),
+        drop_last=True,
+    )
+
+    # Eval prompts: first batch from dataset (fixed, same for both baseline and vLLM)
+    eval_prompts = [dataset[i] for i in range(batch_size)]
+
+    # Initial loss (base model on eval batch)
+    initial_loss = scorer.score_base(eval_prompts)
     print(f"Initial loss: {initial_loss:.6f}")
-    wandb.log({"step": 0, "loss": initial_loss, "type": "base"})
-    
+    if use_wandb:
+        wandb.log({"step": 0, "loss": initial_loss, "type": "base"})
+
     # Training loop
-    losses = []
-    np.random.seed(42)
-    
-    for step in tqdm(range(1, num_steps + 1), desc="Training"):
-        # Sample batch
-        batch_idx = np.random.randint(0, len(prompts) - batch_size)
-        batch_prompts = prompts[batch_idx:batch_idx + batch_size]
-        
-        # Sample random seed
-        random_seed = np.random.randint(1000000000)
-        
-        # Sample directions
-        directions_2d, directions_1d = controller.sample_direction(random_seed)
-        
-        # Build LoRA tensors
-        plus_A, plus_B = controller.build_temp_lora_tensors(directions_2d, sign=+1)
-        minus_A, minus_B = controller.build_temp_lora_tensors(directions_2d, sign=-1)
-        
-        # Update LoRA slots
-        temp_lora.update_plus_minus(plus_A, plus_B, minus_A, minus_B)
-        
-        # Compute loss
-        loss_plus, loss_minus = scorer.score_plus_minus(batch_prompts, temp_lora)
-        
-        # Compute c
-        c = controller.compute_c(loss_plus, loss_minus)
-        
-        # Update master weights
-        updated_weights = controller.apply_update_to_master(
-            directions_2d, directions_1d, c
-        )
-        
-        # Sync to vLLM
-        weight_sync.sync(updated_weights)
-        
-        # Compute current loss
-        current_loss = scorer.score_base(batch_prompts)
-        losses.append(current_loss)
-        
-        # Log to WandB
-        wandb.log({
-            "step": step,
-            "loss_plus": loss_plus,
-            "loss_minus": loss_minus,
-            "c": c,
-            "loss": current_loss,
-            "type": "train",
-        })
-        
-        # Print progress every 10 steps
-        if step % 10 == 0:
-            print(f"Step {step}: loss={current_loss:.4f}, c={c:.4f}")
-        
-        # Periodic evaluation on the fixed validation batch (no sampling noise)
-        if step % 20 == 0 or step == num_steps:
-            val_loss = scorer.score_base(prompts[:batch_size])
-            print(f"Step {step} Fixed Eval Loss: {val_loss:.6f}")
-            wandb.log({"step": step, "val_loss": val_loss})
-        
-        # V cache update indicator
-        if step % step_interval == 0:
-            print(f"  V cache updated at step {step}")
-            wandb.log({"step": step, "v_cache_update": step})
-    
+    np.random.seed(args.seed)
+    eval_losses = [{"step": 0, "loss": float(initial_loss)}]
+    history = []
+    timing = {
+        "step_s": [],
+        "direction_s": [],
+        "build_lora_s": [],
+        "score_s": [],
+        "master_update_s": [],
+        "sync_s": [],
+        "lora_update_s": [],
+    }
+
+    step = 0
+    data_iter = iter(dataloader)
+    train_t0 = time.perf_counter()
+
+    for epoch in range(num_steps // len(dataloader) + 2):
+        for batch in dataloader:
+            if step >= num_steps:
+                break
+            step += 1
+            step_t0 = time.perf_counter()
+
+            batch_prompts = batch
+
+            # Sample ZO seed (same as baseline: np.random.randint consumes one numpy state)
+            random_seed = np.random.randint(1000000000)
+
+            # Sample directions
+            direction_t0 = time.perf_counter()
+            directions_2d, directions_1d = controller.sample_direction(random_seed)
+            direction_digest = digest_named_uv(
+                (name, item["U"], item["V"])
+                for name, item in directions_2d.items()
+            )
+            timing["direction_s"].append(time.perf_counter() - direction_t0)
+
+            # Build LoRA tensors
+            build_lora_t0 = time.perf_counter()
+            plus_A, plus_B = controller.build_temp_lora_tensors(directions_2d, sign=+1)
+            minus_A, minus_B = controller.build_temp_lora_tensors(directions_2d, sign=-1)
+            timing["build_lora_s"].append(time.perf_counter() - build_lora_t0)
+
+            # Update LoRA slots
+            lora_update_t0 = time.perf_counter()
+            temp_lora.update_plus_minus(plus_A, plus_B, minus_A, minus_B, step=step)
+            timing["lora_update_s"].append(time.perf_counter() - lora_update_t0)
+
+            # Compute loss
+            score_t0 = time.perf_counter()
+            loss_plus, loss_minus = scorer.score_plus_minus(batch_prompts, temp_lora)
+            timing["score_s"].append(time.perf_counter() - score_t0)
+
+            # Compute c
+            c = controller.compute_c(loss_plus, loss_minus)
+
+            # Update master weights
+            master_update_t0 = time.perf_counter()
+            updated_weights = controller.apply_update_to_master(
+                directions_2d, directions_1d, c
+            )
+            timing["master_update_s"].append(time.perf_counter() - master_update_t0)
+
+            # Sync to vLLM
+            sync_t0 = time.perf_counter()
+            weight_sync.sync(updated_weights)
+            timing["sync_s"].append(time.perf_counter() - sync_t0)
+            timing["step_s"].append(time.perf_counter() - step_t0)
+
+            # Record history
+            history.append({
+                "step": step,
+                "seed": int(random_seed),
+                "loss_plus": float(loss_plus),
+                "loss_minus": float(loss_minus),
+                "c": float(c),
+                "direction_digest": direction_digest,
+                "step_s": float(timing["step_s"][-1]),
+                "direction_s": float(timing["direction_s"][-1]),
+                "build_lora_s": float(timing["build_lora_s"][-1]),
+                "score_s": float(timing["score_s"][-1]),
+                "master_update_s": float(timing["master_update_s"][-1]),
+                "sync_s": float(timing["sync_s"][-1]),
+                "lora_update_s": float(timing["lora_update_s"][-1]),
+            })
+
+            # Log to WandB
+            if use_wandb:
+                wandb.log({
+                    "step": step,
+                    "loss_plus": loss_plus,
+                    "loss_minus": loss_minus,
+                    "c": c,
+                    "type": "train",
+                })
+
+            # Print progress every 10 steps
+            if step % 10 == 0:
+                print(f"Step {step}: c={c:.4f}")
+
+            # Periodic evaluation: forward base model on fixed eval batch
+            if step % args.eval_interval == 0:
+                val_loss = scorer.score_base(eval_prompts)
+                eval_losses.append({"step": step, "loss": float(val_loss)})
+                print(f"Step {step} Eval Loss: {val_loss:.6f}")
+                if use_wandb:
+                    wandb.log({"step": step, "val_loss": val_loss})
+
+            # V cache update indicator
+            if step % step_interval == 0:
+                print(f"  V cache updated at step {step}")
+                if use_wandb:
+                    wandb.log({"step": step, "v_cache_update": step})
+
+        if step >= num_steps:
+            break
+
     # Final evaluation
-    final_loss = scorer.score_base(prompts[:batch_size])
+    final_loss = scorer.score_base(eval_prompts)
+    if not eval_losses or eval_losses[-1]["step"] != num_steps:
+        eval_losses.append({"step": num_steps, "loss": float(final_loss)})
+    total_s = time.perf_counter() - train_t0
     print(f"\nInitial loss: {initial_loss:.4f}")
     print(f"Final loss: {final_loss:.4f}")
     print(f"Loss change: {final_loss - initial_loss:.4f}")
-    print(f"Average loss: {np.mean(losses):.4f}")
-    
-    wandb.log({
-        "final_loss": final_loss,
-        "loss_change": final_loss - initial_loss,
-        "avg_loss": np.mean(losses),
-    })
+
+    if use_wandb:
+        wandb.log({
+            "final_loss": final_loss,
+            "loss_change": final_loss - initial_loss,
+        })
+
+    # Save local results
+    results_dir = args.output_dir or os.path.join(project_root, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    history_file = os.path.join(results_dir, f"vllm_convergence_r{rank_r}_{timestamp}.json")
+    with open(history_file, "w") as f:
+        json.dump({
+            "config": {
+                "model": model_name,
+                "rank_r": rank_r,
+                "lr": lr,
+                "zo_eps": zo_eps,
+                "step_interval": step_interval,
+                "batch_size": batch_size,
+                "num_steps": num_steps,
+                "backend": "vllm",
+                "seed": args.seed,
+                "zo_random_device": args.zo_random_device,
+                "train_scope": args.train_scope,
+            },
+            "initial_loss": float(initial_loss),
+            "final_loss": float(final_loss),
+            "loss_change": float(final_loss - initial_loss),
+            "eval_losses": eval_losses,
+            "history": history,
+            "timing": {
+                "total_s": float(total_s),
+                "step_s_mean": float(np.mean(timing["step_s"])) if timing["step_s"] else 0.0,
+                "direction_s_mean": float(np.mean(timing["direction_s"])) if timing["direction_s"] else 0.0,
+                "build_lora_s_mean": float(np.mean(timing["build_lora_s"])) if timing["build_lora_s"] else 0.0,
+                "score_s_mean": float(np.mean(timing["score_s"])) if timing["score_s"] else 0.0,
+                "master_update_s_mean": float(np.mean(timing["master_update_s"])) if timing["master_update_s"] else 0.0,
+                "sync_s_mean": float(np.mean(timing["sync_s"])) if timing["sync_s"] else 0.0,
+                "lora_update_s_mean": float(np.mean(timing["lora_update_s"])) if timing["lora_update_s"] else 0.0,
+            },
+        }, f, indent=2)
+    print(f"Saved convergence history to {history_file}")
     
     # Cleanup
     temp_lora.cleanup()
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
     
     print("\n✅ Convergence training completed!")
 

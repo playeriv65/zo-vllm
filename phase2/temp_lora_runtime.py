@@ -33,11 +33,15 @@ class TempLoRARuntime:
         num_layers: int = 32,
         plus_id: int = 9001,
         minus_id: int = 9002,
+        stable_lora_ids: bool = True,
     ):
         self.rank = rank
         self.num_layers = num_layers
         self.plus_id = plus_id
         self.minus_id = minus_id
+        self._base_plus_id = plus_id
+        self._base_minus_id = minus_id
+        self.stable_lora_ids = stable_lora_ids
         self.plus_name = "lozo_plus"
         self.minus_name = "lozo_minus"
         
@@ -169,17 +173,31 @@ class TempLoRARuntime:
         plus_B: Dict[str, torch.Tensor],
         minus_A: Dict[str, torch.Tensor],
         minus_B: Dict[str, torch.Tensor],
+        step: int = 0,
     ):
         """
         Update both plus/minus LoRA slots.
         
-        Note: This re-registers the slots with new tensors.
-              In the future, we can optimize with in-place update.
+        Note: This re-registers the slots with new tensors. With stable IDs,
+              VLLMScorer requests load_inplace=True so vLLM reloads the
+              adapter weights instead of reusing the old LoRA cache entry.
         """
         if self._registered:
             unregister_memory_lora(self.plus_id)
             unregister_memory_lora(self.minus_id)
         
+        if self.stable_lora_ids:
+            self.plus_id = self._base_plus_id
+            self.minus_id = self._base_minus_id
+            self.plus_name = "lozo_plus"
+            self.minus_name = "lozo_minus"
+        else:
+            # Compatibility path for vLLM versions without load_inplace support.
+            self.plus_id = 9000 + 2 * step + 1
+            self.minus_id = 9000 + 2 * step + 2
+            self.plus_name = f"lozo_plus_step_{step}"
+            self.minus_name = f"lozo_minus_step_{step}"
+
         target_modules = self._build_target_modules()
         
         config = {

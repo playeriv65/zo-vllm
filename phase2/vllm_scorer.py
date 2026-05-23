@@ -100,6 +100,7 @@ class VLLMScorer:
             prompts,
             self.sampling_params,
             lora_request=LoRARequest(lora_name, lora_id, lora_path),
+            use_tqdm=False,
         )
         return compute_nll_from_prompt_logprobs(outputs, self.tokenizer)
     
@@ -108,6 +109,7 @@ class VLLMScorer:
         outputs = self.llm.generate(
             prompts,
             self.sampling_params,
+            use_tqdm=False,
         )
         return compute_nll_from_prompt_logprobs(outputs, self.tokenizer)
     
@@ -129,7 +131,20 @@ class VLLMScorer:
         plus_name, plus_id, plus_path = temp_lora_runtime.get_plus_request_info()
         minus_name, minus_id, minus_path = temp_lora_runtime.get_minus_request_info()
         
-        loss_plus = self.score_with_lora(prompts, plus_name, plus_id, plus_path)
-        loss_minus = self.score_with_lora(prompts, minus_name, minus_id, minus_path)
+        outputs = self.llm.generate(
+            list(prompts) + list(prompts),
+            self.sampling_params,
+            lora_request=[
+                LoRARequest(plus_name, plus_id, plus_path, load_inplace=True)
+                for _ in prompts
+            ] + [
+                LoRARequest(minus_name, minus_id, minus_path, load_inplace=True)
+                for _ in prompts
+            ],
+            use_tqdm=False,
+        )
+        split = len(prompts)
+        loss_plus = compute_nll_from_prompt_logprobs(outputs[:split], self.tokenizer)
+        loss_minus = compute_nll_from_prompt_logprobs(outputs[split:], self.tokenizer)
         
         return loss_plus, loss_minus

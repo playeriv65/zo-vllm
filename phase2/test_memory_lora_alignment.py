@@ -5,8 +5,8 @@ This test verifies that in-memory LoRA produces identical outputs to file-based 
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
-os.environ["VLLM_BATCH_INVARIANT"] = "1"
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import time
 import torch
@@ -14,7 +14,12 @@ from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
 from memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
-from utils import build_lora_tensors, build_lora_config, write_lora_to_file, cleanup_lora_file
+from memory_lora_test_utils import (
+    build_lora_config,
+    build_lora_tensors,
+    cleanup_lora_file,
+    write_lora_to_file,
+)
 
 MODEL_NAME = "facebook/opt-2.7b"
 RANK = 16

@@ -2,11 +2,31 @@
 
 Zeroth-Order optimization with vLLM inference engine.
 
+## Current Phase 2 Status
+
+Phase 2 is in an accepted state for OPT-2.7B LOZO convergence alignment and
+training-speed validation. The recommended configuration is:
+
+```text
+rank=8, step_interval=50, lr=3e-7, eps=1e-3, batch_size=16
+```
+
+300-step vLLM training reaches 98.6% of the baseline loss drop and runs at
+2.42 steps/s versus 2.03 steps/s for the baseline. See
+[`phase2/README.md`](phase2/README.md) for acceptance results, commands, and
+validation notes.
+
+Recent stepwise validation also passes with CUDA-side LOZO RNG
+(`--zo-random-device cuda`): 20/20 U/V direction digests match, with max
+plus/minus loss diffs near 0.01. A 100-step HF baseline ablation shows full
+training scope, including embeddings and 1D params, drops loss faster than the
+vLLM-compatible `lora_only` scope but not by an order of magnitude.
+
 ## Structure
 
 - `third_party/vllm` — vLLM fork (local vendored copy)
 - `third_party/LOZO` — LOZO algorithm reference (submodule)
-- `zo_vllm` — core system code
+- `phase2` — LOZO controller, memory LoRA runtime, vLLM scorer, convergence CLIs
 - `scripts` — experiment entry points
 - `configs` — configuration files
 

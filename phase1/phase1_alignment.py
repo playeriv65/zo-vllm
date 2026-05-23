@@ -24,7 +24,7 @@ RANK = 8
 RHO_VALUES = [1e-1, 5e-1, 1.0]
 ADAPTER_DIR = Path("adapters")
 SEED = 42
-DEVICE = "cuda:0"
+DEVICE = "cuda"
 DTYPE = torch.float32
 
 SAMPLE_TEXTS = [

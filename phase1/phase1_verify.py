@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "facebook/opt-2.7b"
-DEVICE = "cuda:0"
+DEVICE = "cuda"
 # All fp16
 HF_DTYPE = torch.float16
 EPS_VALUES = [1e-3]  # Only test eps=1e-3

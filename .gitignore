@@ -16,6 +16,7 @@ build/
 adapters*/
 *.pt
 phase1*_results.json
+phase2_results/
 
 # Logs and results
 logs/
@@ -28,3 +29,5 @@ scratch/
 # Cache
 __pycache__/
 *.pyc
+.cache/
+tmp/

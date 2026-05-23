@@ -4,7 +4,6 @@ Separate runs for file-based and in-memory adapters
 """
 import os
 os.environ["VLLM_BATCH_INVARIANT"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 import json
 import shutil
@@ -18,7 +17,7 @@ from vllm.lora.request import LoRARequest
 
 
 MODEL_NAME = "facebook/opt-2.7b"
-DEVICE = "cuda:0"
+DEVICE = "cuda"
 EPS = 1e-3
 RANK = 16
 ADAPTER_DIR = Path("adapters_milestone1")

@@ -8,20 +8,22 @@ This test verifies:
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
-os.environ["VLLM_BATCH_INVARIANT"] = "1"
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
+import gc
 import torch
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
 from memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
-from utils import build_lora_tensors, build_lora_config
+from memory_lora_test_utils import build_lora_config, build_lora_tensors
 
 MODEL_NAME = "facebook/opt-2.7b"
 RANK = 16
 LAYERS = [8, 9, 10, 11, 12, 13, 14, 15]
 PROJS = ["q_proj", "v_proj"]
+GPU_MEMORY_UTILIZATION = 0.3
 
 
 def test_sequential():
@@ -51,7 +53,7 @@ def test_sequential():
         max_loras=10,
         dtype="float16",
         max_model_len=128,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         seed=42,
     )
     
@@ -81,6 +83,9 @@ def test_sequential():
         for i, o in enumerate(outputs):
             print(f"  LoRA {i + 1}: {o}")
     
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
     clear_all_memory_loras()
     return all_different
 
@@ -113,7 +118,7 @@ def test_batch():
         max_loras=10,
         dtype="float16",
         max_model_len=128,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         seed=42,
     )
     
@@ -146,6 +151,9 @@ def test_batch():
     
     print("\nPASS: Sequential batch works correctly")
     
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
     clear_all_memory_loras()
     return True
 
@@ -179,7 +187,7 @@ def test_boundary():
         max_loras=max_loras,
         dtype="float16",
         max_model_len=128,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         seed=42,
     )
     
@@ -216,6 +224,9 @@ def test_boundary():
         print("PASS: Exception correctly raised!")
         passed = True
     
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
     clear_all_memory_loras()
     return passed
 

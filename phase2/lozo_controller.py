@@ -19,6 +19,9 @@ class LOZOConfig:
     step_interval: int
     weight_decay: float = 0.0
     seed: Optional[int] = None
+    master_device: str = "cpu"
+    random_device: str = "cpu"
+    train_scope: str = "lora_only"
 
 
 class LOZOController:
@@ -38,8 +41,8 @@ class LOZOController:
     See IMPLEMENTATION_NOTES.md for details.
     """
     
-    # Parameters to skip (vLLM LoRA limitations)
-    SKIP_PARAMS = [
+    # Parameters to skip in LoRA-compatible mode (vLLM LoRA limitations)
+    LORA_INCOMPATIBLE_PARAMS = [
         "embed_tokens",      # Token embeddings (not Linear)
         "embed_positions",   # Position embeddings (not Linear)
     ]
@@ -72,17 +75,56 @@ class LOZOController:
             if not param.requires_grad:
                 continue
             
-            # Skip embeddings
-            if any(skip in name for skip in self.SKIP_PARAMS):
+            if self._should_skip_param(name, param):
                 continue
-            
-            # Skip 1D params (bias, layer_norm)
-            if param.ndim == 1:
-                continue
-            
-            # Only 2D Linear weights
-            if param.ndim >= 2:
-                self.master[name] = param.data.detach().clone().cpu()
+
+            self.master[name] = (
+                param.data.detach()
+                .clone()
+                .to(self.config.master_device)
+                .contiguous()
+            )
+
+    def _should_skip_param(self, name: str, param: torch.nn.Parameter) -> bool:
+        if self.config.train_scope == "full":
+            return False
+        if self.config.train_scope != "lora_only":
+            raise ValueError(f"unknown train_scope: {self.config.train_scope}")
+        if any(skip in name for skip in self.LORA_INCOMPATIBLE_PARAMS):
+            return True
+        return param.ndim == 1
+
+    def _save_rng_state(self):
+        cpu_state = torch.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        return cpu_state, cuda_states
+
+    def _restore_rng_state(self, state) -> None:
+        cpu_state, cuda_states = state
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    def _seed_rng(self, random_seed: int) -> None:
+        torch.manual_seed(random_seed)
+        if self.config.random_device == "cuda" and torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_seed)
+
+    def _sample_device_for(self, target_device: torch.device) -> torch.device:
+        if self.config.random_device == "cpu":
+            return torch.device("cpu")
+        if self.config.random_device == "cuda":
+            if target_device.type != "cuda":
+                raise ValueError("random_device='cuda' requires CUDA master weights")
+            return target_device
+        raise ValueError(f"unknown random_device: {self.config.random_device}")
+
+    def _randn(self, shape, target_device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.randn(
+            shape,
+            dtype=dtype,
+            device=self._sample_device_for(target_device),
+        ).to(target_device)
     
     def get_trainable_2d_params(self) -> List[str]:
         """Get names of 2D trainable parameters."""
@@ -115,52 +157,38 @@ class LOZOController:
                 directions_1d: {name: z_tensor}
         """
         # Save global RNG state and set our seed (to match baseline)
-        rng_state = torch.get_rng_state()
-        torch.manual_seed(random_seed)
+        rng_state = self._save_rng_state()
+        self._seed_rng(random_seed)
         
         directions_2d = {}
         directions_1d = {}
         
-        # Sample for 2D parameters (low-rank)
-        for name, W in self.master.items():
-            if W.ndim >= 2:
-                out_features, in_features = W.shape
-                
+        # Sample for all parameters (2D + 1D) in the SAME order as they appear in master
+        # This preserves the randn call sequence to match baseline
+        try:
+            for name, W in self.master.items():
+                if W.ndim >= 2:
+                    out_features, in_features = W.shape
+
                 # V cache logic aligned with baseline:
                 # - First step (self.step=0): initialize V (0 % step_interval == 0)
                 # - step % step_interval == 0: refresh V
                 # - Otherwise: reuse cached V
-                if self.step % self.config.step_interval == 0:
-                    V = torch.randn(
-                        in_features, self.config.rank,
-                        dtype=W.dtype,
-                        device="cpu",
-                    )
-                    self.v_cache[name] = V
-                else:
-                    V = self.v_cache[name]
-                
-                # U: freshly sampled every step
-                U = torch.randn(
-                    out_features, self.config.rank,
-                    dtype=W.dtype,
-                    device="cpu",
-                )
-                
-                directions_2d[name] = {"U": U, "V": V}
-        
-        # Sample for 1D parameters (full-rank)
-        for name, W in self.master.items():
-            if W.ndim == 1:
-                z = torch.randn(
-                    W.shape,
-                    dtype=W.dtype,
-                    device="cpu",
-                )
-                directions_1d[name] = z
-        
-        # Restore global RNG state
-        torch.set_rng_state(rng_state)
+                    if self.step % self.config.step_interval == 0:
+                        V = self._randn((in_features, self.config.rank), W.device, W.dtype)
+                        self.v_cache[name] = V
+                    else:
+                        V = self.v_cache[name]
+
+                    # U: freshly sampled every step
+                    U = self._randn((out_features, self.config.rank), W.device, W.dtype)
+
+                    directions_2d[name] = {"U": U, "V": V}
+                elif W.ndim == 1:
+                    directions_1d[name] = self._randn(tuple(W.shape), W.device, W.dtype)
+        finally:
+            # Restore global RNG state
+            self._restore_rng_state(rng_state)
         
         # Increment step AFTER sampling (aligned with baseline: step++ at end of lowrank_zo_step)
         self.step += 1
@@ -242,8 +270,8 @@ class LOZOController:
             U = d["U"]
             V = d["V"]
             
-            lora_A = V.T.contiguous().half()
-            lora_B = (sign * self.config.eps * U).contiguous().half()
+            lora_A = V.T.contiguous().half().cpu()
+            lora_B = (sign * self.config.eps * U).contiguous().half().cpu()
             
             layer_to_A[name] = lora_A
             layer_to_B[name] = lora_B

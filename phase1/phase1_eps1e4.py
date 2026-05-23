@@ -21,7 +21,7 @@ from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
 MODEL_NAME = "facebook/opt-2.7b"
-DEVICE = "cuda:0"
+DEVICE = "cuda"
 HF_DTYPE = torch.float16
 EPS = 1e-4
 ADAPTER_DIR = Path("adapters_phase1_eps1e4")

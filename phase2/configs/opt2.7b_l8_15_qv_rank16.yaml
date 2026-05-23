@@ -1,7 +1,7 @@
 model: facebook/opt-2.7b
 dtype: float16
 max_model_len: 128
-gpu_memory_utilization: 0.5
+gpu_memory_utilization: 0.3
 
 lozo:
   eps: 1e-3

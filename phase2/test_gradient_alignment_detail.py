@@ -1,14 +1,13 @@
 """
 Gradient Alignment Test - Compare manual baseline vs our vLLM implementation.
 
-Run both on GPU 0 simultaneously to verify:
+Run both on the CUDA device selected by CUDA_VISIBLE_DEVICES to verify:
 1. U/V matrices match (same random seed)
 2. Loss values match
 3. c coefficient match
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
@@ -215,7 +214,7 @@ def main():
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
-        device_map="cuda:0",
+        device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
