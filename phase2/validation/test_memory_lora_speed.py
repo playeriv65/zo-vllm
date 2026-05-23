@@ -11,13 +11,18 @@ os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import gc
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import torch
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
-from memory_lora_test_utils import (
+from phase2.core.memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
+from phase2.validation.memory_lora_test_utils import (
     build_lora_config,
     build_lora_tensors,
     cleanup_lora_file,

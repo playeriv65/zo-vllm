@@ -22,7 +22,8 @@ MODEL_NAME = "facebook/opt-2.7b"
 DEVICE = "cuda"
 HF_DTYPE = torch.float16
 EPS = 1e-3
-ADAPTER_DIR = Path("adapters_batch_test")
+PHASE1_DIR = Path(__file__).resolve().parent
+ADAPTER_DIR = PHASE1_DIR / "artifacts" / "adapters_batch_test"
 
 # Test configuration
 RANKS = [8, 16]

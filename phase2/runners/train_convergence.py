@@ -13,7 +13,7 @@ Aligned with LOZO baseline (third_party/LOZO/large_models/lozo.sh).
 
 import os
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE_ROOT = os.path.join(PROJECT_ROOT, ".cache", "hf")
 os.environ.setdefault("HF_HOME", os.path.join(CACHE_ROOT, "home"))
 os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(CACHE_ROOT, "datasets"))
@@ -37,11 +37,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
 
-from phase2.lozo_controller import LOZOController, LOZOConfig
-from phase2.temp_lora_runtime import TempLoRARuntime
-from phase2.weight_sync import WeightSync
-from phase2.memory_lora_loader import install_mocks
-from phase2.direction_digest import digest_named_uv
+from phase2.core.lozo_controller import LOZOController, LOZOConfig
+from phase2.core.temp_lora_runtime import TempLoRARuntime
+from phase2.core.weight_sync import WeightSync
+from phase2.core.memory_lora_loader import install_mocks
+from phase2.core.direction_digest import digest_named_uv
 
 
 class SimpleDataset(Dataset):
@@ -154,7 +154,7 @@ def main():
         install_mocks()
 
     from vllm import LLM
-    from phase2.vllm_scorer import VLLMScorer
+    from phase2.core.vllm_scorer import VLLMScorer
     
     # Configuration
     model_name = "facebook/opt-2.7b"
@@ -449,7 +449,12 @@ def main():
         })
 
     # Save local results
-    results_dir = args.output_dir or os.path.join(PROJECT_ROOT, "results")
+    results_dir = args.output_dir or os.path.join(
+        PROJECT_ROOT,
+        "phase2",
+        "results",
+        "convergence",
+    )
     os.makedirs(results_dir, exist_ok=True)
     history_file = os.path.join(results_dir, f"vllm_convergence_r{rank_r}_{timestamp}.json")
     with open(history_file, "w") as f:

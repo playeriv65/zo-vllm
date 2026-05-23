@@ -107,6 +107,6 @@ bs=1 和 bs=8 结果不同是因为数据组成不同，需要 sample-level extr
 
 ## 原始数据
 
-- 文件：`phase1_results/phase1_raw_20260520_205605.json`
+- 文件：`phase1/results/official/phase1_raw_20260523_162032.json`
 - 大小：1.1MB
 - 包含所有原始数据（c_lozo, c_vllm, sign_match, abs_err, rel_err, delta_lozo, delta_vllm）

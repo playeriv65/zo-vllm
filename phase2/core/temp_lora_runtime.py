@@ -1,7 +1,7 @@
 """
 Temporary LoRA Runtime - Manages plus/minus LoRA slots for LOZO perturbation.
 
-Uses either the in-memory CPU LoRA interface from memory_lora_loader.py,
+Uses either the in-memory CPU LoRA interface from phase2.core.memory_lora_loader.py,
 the GPU-resident manager path, or the training-only direct slot updater that
 writes fixed vLLM LoRA slots in place.
 Supports all 2D trainable parameters (Linear layers).

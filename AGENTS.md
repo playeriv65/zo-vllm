@@ -60,7 +60,7 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 | High-signal (\|delta\| >= 0.005) | 2020 | 78.9% | **100.0%** |
 | Low-signal (\|delta\| < 0.005) | 540 | 21.1% | 69.4% |
 
-详见 `phase1_results.md`
+详见 `phase1/phase1_results.md`
 
 ## 注意事项
 
@@ -73,45 +73,35 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 ## 文件结构
 
 ```
-scripts/
-├── persistent_test.py      # 主测试脚本（批量处理版本）
+phase1/
 ├── phase1_verify.py        # Phase 1验证
 ├── phase1_official.py      # Phase 1官方对齐验证
 ├── batch_test.py           # 批量测试CLI版本
-└── test_batch_invariance.py # 批量不变性测试
-
-phase1_results/
-└── phase1_raw_*.json       # Phase 1原始数据
+├── persistent_test.py      # 主测试脚本（批量处理版本）
+└── results/                # Phase 1结果；脚本默认写这里
 
 phase2/
-├── memory_lora_loader.py    # 内存LoRA Mock框架
-├── lozo_controller.py       # LOZO控制器（master weights, U/V采样, V cache）
-├── temp_lora_runtime.py     # 临时LoRA slots（plus/minus扰动）
-├── vllm_scorer.py           # vLLM loss计算（prompt_logprobs，返回avg）
-├── weight_sync.py           # 权重同步到vLLM（packed qkv处理）
-├── module_map.py            # HF/vLLM/LoRA模块名映射
-├── IMPLEMENTATION_NOTES.md  # 实现简化说明（1D/embedding跳过）
-├── run_baseline_helper.py   # LOZO baseline helper（subprocess调用）
-├── test_step_a.py           # Step A测试（in-memory LoRA scoring）
-├── test_step_b.py           # Step B测试（weight sync）
-├── test_step_c.py           # Step C测试（LOZO closure）
-├── test_training_loop.py    # 完整训练loop测试
-├── test_gradient_alignment.py        # 梯度对齐基础测试
-├── test_gradient_alignment_detail.py # 详细对比（U/V + loss + c）
-├── test_gradient_alignment_vllm.py   # 使用baseline U/V对比
-├── test_multi_step_alignment.py      # 多步trajectory对齐
-├── test_lozo_baseline_alignment.py   # 单步完整对比
-├── test_real_lozo_baseline_side_by_side.py # 并行运行LOZO
-└── test_memory_lora_*.py    # 内存LoRA测试（Phase 2 Milestone 1-2）
-
-logs/
-└── *.log                   # 运行日志
-
-results/
-└── *.json                  # 结果文件
-└── baseline_gradient_data.json  # baseline U/V + loss数据
-└── baseline_trajectory.json      # baseline多步trajectory
-└── vllm_trajectory.json          # vLLM多步trajectory
+├── core/                    # LOZO/vLLM runtime核心模块
+│   ├── lozo_controller.py
+│   ├── temp_lora_runtime.py
+│   ├── vllm_scorer.py
+│   ├── weight_sync.py
+│   ├── memory_lora_loader.py
+│   └── module_map.py
+├── runners/                 # 训练、baseline和sweep入口
+│   ├── train_convergence.py
+│   ├── run_baseline_helper.py
+│   ├── run_convergence_experiment.py
+│   └── run_convergence_sweep.py
+├── validation/              # 验收与回归脚本
+│   ├── test_real_lozo_baseline_side_by_side.py
+│   ├── test_batch_invariance.py
+│   ├── test_training_loop.py
+│   └── test_memory_lora_*.py
+├── configs/                 # 实验配置
+├── artifacts/               # 临时adapter等运行产物；git忽略
+├── results/                 # Phase 2日志和结果；git忽略
+└── IMPLEMENTATION_NOTES.md  # 实现简化说明（1D/embedding跳过）
 ```
 
 ## Phase 2 Milestone 1-2 完成 ✅
@@ -131,7 +121,7 @@ results/
 ### API
 
 ```python
-from phase2.memory_lora_loader import register_memory_lora_cpu
+from phase2.core.memory_lora_loader import register_memory_lora_cpu
 from vllm.lora.request import LoRARequest
 
 # 注册内存LoRA
@@ -268,23 +258,23 @@ W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
 短验证结果：
 - fake packed-qkv 单测：`float32`模式与旧controller公式逐元素一致
 - 2026-05-23正式验收：
-  - 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.010167`，`max_loss_minus_diff=0.009344`，`max_c_diff=5.898678`
-  - 100-step vLLM-only：`copy` `step_s_mean=0.2032`，`direct/float32` `0.1363`，`direct/param` `0.1054`（含debug digest）；关闭debug-only U/V digest后，正式速度为 `0.0842`；`weight_update_s_mean` `0.1015 -> 0.0077`（快 `13.22x`）
-  - 300-step推荐配置：baseline `5.132812 -> 4.832031`，vLLM direct/param `5.132858 -> 4.831568`，vLLM达到baseline loss drop的 `100.17%`，final diff `0.000464`
+  - clean 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.030806`，`max_loss_minus_diff=0.023877`，`max_c_diff=18.560467`
+  - clean 300-step推荐配置：baseline `5.132812 -> 4.832031`，vLLM direct/param `5.132858 -> 4.831391`，vLLM达到baseline loss drop的 `100.23%`，final diff `0.000640`
+  - clean 300-step速度：instrumented baseline `0.1155 s/step`，vLLM direct/param `0.0864 s/step`，速度提升 `1.34x`
 
 ### 当前vLLM瓶颈
 
-正式测速默认关闭 `direction_digest`；side-by-side wrapper 会显式开启，用于确认每步 U/V 扰动完全一致。最新100-step digest-off计时：
+正式测速默认关闭 `direction_digest`；side-by-side wrapper 会显式开启，用于确认每步 U/V 扰动完全一致。clean 300-step计时：
 
 | component | mean s/step |
 |---|---:|
-| total step | 0.0842 |
-| score | 0.0568 |
-| score_generate | 0.0567 |
-| score_postprocess | 0.000073 |
-| direction sampling | 0.0024 |
-| build_lora | 0.0067 |
-| lora_update | 0.0104 |
+| total step | 0.0864 |
+| score | 0.0585 |
+| score_generate | 0.0584 |
+| score_postprocess | 0.000064 |
+| direction sampling | 0.0027 |
+| build_lora | 0.0071 |
+| lora_update | 0.0100 |
 | weight_update | 0.0078 |
 
 结论：当前主要瓶颈在 vLLM `generate(prompt_logprobs=1)` scoring 路径；Python loss后处理和request构造可以忽略。
@@ -325,7 +315,7 @@ Loss change: -0.0030
 
 ### Phase 2 收敛与性能验收结果
 
-详见 `phase2/README.md` 和本地结果表 `phase2_results/convergence/official_results.md`。
+详见 `phase2/README.md` 和本地结果表 `phase2/results/convergence/official_results.md`。
 
 推荐配置：
 ```
@@ -333,17 +323,17 @@ rank=8, step_interval=50, lr=3e-7, eps=1e-3, batch_size=16
 ```
 
 300-step 对齐：
-- baseline: `5.132812 -> 4.851562`，loss drop `0.281250`
-- vLLM: `5.132571 -> 4.855313`，loss drop `0.277259`
-- vLLM 达到 baseline loss drop 的 `98.6%`
-- final loss diff: `0.003750`
-- sign match: `96.7%`
-- high-signal sign match: `97.6%`
+- baseline: `5.132812 -> 4.832031`，loss drop `0.300781`
+- vLLM: `5.132858 -> 4.831391`，loss drop `0.301467`
+- vLLM 达到 baseline loss drop 的 `100.2%`
+- final loss diff: `0.000640`
+- sign match: `98.3%`
+- high-signal sign match: `99.0%`
 
 训练速度：
-- instrumented baseline: `0.1149 s/step`
-- vLLM direct/param, digest off: `0.0842 s/step`
-- 原始风格 LOZO baseline（full scope, CUDA RNG, plus/minus两次forward，无额外base loss）100-step约 `0.0937 s/step`；因此速度对比必须区分原始baseline和side-by-side instrumented baseline。
+- instrumented baseline: `0.1155 s/step`
+- vLLM direct/param: `0.0864 s/step`
+- vLLM 相对 instrumented baseline 速度提升 `1.34x`。
 
 批量不变性：
 - batch sizes: `1, 2, 4, 8`

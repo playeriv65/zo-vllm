@@ -12,7 +12,7 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 import numpy as np
@@ -20,11 +20,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM
 
-from phase2.lozo_controller import LOZOController, LOZOConfig
-from phase2.temp_lora_runtime import TempLoRARuntime
-from phase2.vllm_scorer import VLLMScorer, compute_nll_from_prompt_logprobs
-from phase2.weight_sync import WeightSync
-from phase2.memory_lora_loader import install_mocks
+from phase2.core.lozo_controller import LOZOController, LOZOConfig
+from phase2.core.temp_lora_runtime import TempLoRARuntime
+from phase2.core.vllm_scorer import VLLMScorer, compute_nll_from_prompt_logprobs
+from phase2.core.weight_sync import WeightSync
+from phase2.core.memory_lora_loader import install_mocks
 
 
 def prepare_sst2_batch(tokenizer, num_samples=16, seed=42):

@@ -24,8 +24,9 @@ MODEL_NAME = "facebook/opt-2.7b"
 DEVICE = "cuda"
 HF_DTYPE = torch.float16
 EPS = 1e-4
-ADAPTER_DIR = Path("adapters_phase1_eps1e4")
-RESULTS_DIR = Path("phase1_results_eps1e4")
+PHASE1_DIR = Path(__file__).resolve().parent
+ADAPTER_DIR = PHASE1_DIR / "artifacts" / "adapters_phase1_eps1e4"
+RESULTS_DIR = PHASE1_DIR / "results" / "eps1e4"
 
 SAMPLE_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -176,8 +177,8 @@ def compute_raw_data(lozo_plus, lozo_minus, vllm_plus, vllm_minus, eps):
 
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    RESULTS_DIR.mkdir(exist_ok=True)
-    ADAPTER_DIR.mkdir(exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Loading HF model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STEP_LOSS_ABS_TOL = 4e-2
 STEP_C_ABS_TOL = 25.0
 
@@ -106,13 +106,13 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
     if name == "baseline":
         cmd = [
             python_for_baseline(),
-            str(PROJECT_ROOT / "phase2" / "run_baseline_helper.py"),
+            str(PROJECT_ROOT / "phase2" / "runners" / "run_baseline_helper.py"),
             *build_common_args(args, output_dir),
         ]
     elif name == "vllm":
         cmd = [
             sys.executable,
-            str(PROJECT_ROOT / "phase2" / "train_convergence.py"),
+            str(PROJECT_ROOT / "phase2" / "runners" / "train_convergence.py"),
             *build_common_args(args, output_dir),
             "--lora-residency",
             args.lora_residency,
@@ -350,7 +350,11 @@ def main() -> None:
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "phase2_results" / "convergence" / timestamp
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else PROJECT_ROOT / "phase2" / "results" / "convergence" / timestamp
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     write_git_state(output_dir)
 

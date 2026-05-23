@@ -9,16 +9,16 @@ Verify:
 
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM
 
-from phase2.lozo_controller import LOZOController, LOZOConfig
-from phase2.temp_lora_runtime import TempLoRARuntime
-from phase2.vllm_scorer import VLLMScorer
-from phase2.weight_sync import WeightSync
+from phase2.core.lozo_controller import LOZOController, LOZOConfig
+from phase2.core.temp_lora_runtime import TempLoRARuntime
+from phase2.core.vllm_scorer import VLLMScorer
+from phase2.core.weight_sync import WeightSync
 
 
 def test_training_loop():

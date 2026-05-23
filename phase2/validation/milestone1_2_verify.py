@@ -5,22 +5,30 @@ Separate runs for file-based and in-memory adapters
 import os
 os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
+import gc
 import json
 import shutil
+import sys
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.lora.request import LoRARequest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from phase2.core.memory_lora_loader import clear_all_memory_loras, register_memory_lora_cpu
 
 
 MODEL_NAME = "facebook/opt-2.7b"
 DEVICE = "cuda"
 EPS = 1e-3
 RANK = 16
-ADAPTER_DIR = Path("adapters_milestone1")
+PHASE2_DIR = Path(__file__).resolve().parents[1]
+ADAPTER_DIR = PHASE2_DIR / "artifacts" / "adapters_milestone1"
 
 
 SAMPLE_TEXTS = [
@@ -33,6 +41,16 @@ def get_module_path(layer_idx, module_name):
     if module_name in ["q_proj", "v_proj"]:
         return f"model.decoder.layers.{layer_idx}.self_attn.{module_name}"
     return f"model.decoder.layers.{layer_idx}.{module_name}"
+
+
+def release_llm(llm):
+    engine_core = getattr(getattr(llm, "llm_engine", None), "engine_core", None)
+    if engine_core is not None:
+        engine_core.shutdown()
+    del llm
+    cleanup_dist_env_and_memory()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def generate_lozo_perturbation(weight_shape, rank, eps, seed):
@@ -83,10 +101,8 @@ def build_in_memory_lora_tensors(modules_U_V_eps, rank, sign="+"):
     for mod_name, (U, V, eps) in modules_U_V_eps.items():
         lora_A = V.T.half()
         lora_B = (sign_factor * eps * U).half()
-        lora_tensors[mod_name] = {
-            "lora_A": lora_A.cpu(),
-            "lora_B": lora_B.cpu(),
-        }
+        lora_tensors[f"base_model.model.{mod_name}.lora_A.weight"] = lora_A.cpu()
+        lora_tensors[f"base_model.model.{mod_name}.lora_B.weight"] = lora_B.cpu()
     
     return lora_tensors
 
@@ -149,19 +165,33 @@ def run_file_based_test(llm, sampling_params, all_ids, modules_U_V_eps, seed, re
 def run_in_memory_test(llm, sampling_params, all_ids, modules_U_V_eps, seed, results):
     plus_tensors = build_in_memory_lora_tensors(modules_U_V_eps, RANK, sign="+")
     minus_tensors = build_in_memory_lora_tensors(modules_U_V_eps, RANK, sign="-")
-    
-    llm.add_lora_from_tensors(1, RANK, plus_tensors)
-    llm.add_lora_from_tensors(2, RANK, minus_tensors)
+
+    target_module_names = sorted({name.split(".")[-1] for name in modules_U_V_eps})
+    config = {
+        "alpha_pattern": {},
+        "base_model_name_or_path": MODEL_NAME,
+        "bias": "none",
+        "inference_mode": True,
+        "init_lora_weights": True,
+        "lora_alpha": float(RANK),
+        "lora_dropout": 0.0,
+        "r": RANK,
+        "target_modules": target_module_names,
+        "task_type": "CAUSAL_LM",
+    }
+    clear_all_memory_loras()
+    plus_path = register_memory_lora_cpu(1, config, plus_tensors)
+    minus_path = register_memory_lora_cpu(2, config, minus_tensors)
     
     outputs_plus = llm.generate(
         [{"prompt_token_ids": ids.tolist()} for ids in all_ids],
         sampling_params,
-        lora_request=LoRARequest("plus_mem", 1),
+        lora_request=LoRARequest("plus_mem", 1, plus_path),
     )
     outputs_minus = llm.generate(
         [{"prompt_token_ids": ids.tolist()} for ids in all_ids],
         sampling_params,
-        lora_request=LoRARequest("minus_mem", 2),
+        lora_request=LoRARequest("minus_mem", 2, minus_path),
     )
     
     L_plus = get_vllm_nll(outputs_plus, all_ids)
@@ -181,7 +211,7 @@ def run_in_memory_test(llm, sampling_params, all_ids, modules_U_V_eps, seed, res
 
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ADAPTER_DIR.mkdir(exist_ok=True)
+    ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
     
     print("Loading HF model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -222,8 +252,7 @@ def main():
         
         run_file_based_test(llm_file, sampling_params, all_ids, modules_U_V_eps, seed, file_results)
     
-    del llm_file
-    torch.cuda.empty_cache()
+    release_llm(llm_file)
     
     print("Running in-memory test...")
     llm_mem = LLM(
@@ -248,9 +277,11 @@ def main():
                 modules_U_V_eps[module_path] = (U, V, EPS)
         
         run_in_memory_test(llm_mem, sampling_params, all_ids, modules_U_V_eps, seed, in_memory_results)
+
+    release_llm(llm_mem)
     
-    results_dir = Path("phase2_results")
-    results_dir.mkdir(exist_ok=True)
+    results_dir = PHASE2_DIR / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
     results_file = results_dir / f"milestone1_2_{timestamp}.json"
     
     all_results = {

@@ -22,7 +22,8 @@ TARGET_MODULES = [
 ]
 RANK = 8
 RHO_VALUES = [1e-1, 5e-1, 1.0]
-ADAPTER_DIR = Path("adapters")
+PHASE1_DIR = Path(__file__).resolve().parent
+ADAPTER_DIR = PHASE1_DIR / "artifacts" / "adapters"
 SEED = 42
 DEVICE = "cuda"
 DTYPE = torch.float32

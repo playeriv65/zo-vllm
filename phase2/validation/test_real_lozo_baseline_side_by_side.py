@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
@@ -50,11 +50,11 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else PROJECT_ROOT / "phase2_results" / "convergence" / f"side_by_side_{timestamp}"
+        else PROJECT_ROOT / "phase2" / "results" / "convergence" / f"side_by_side_{timestamp}"
     )
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "phase2" / "run_convergence_experiment.py"),
+        str(PROJECT_ROOT / "phase2" / "runners" / "run_convergence_experiment.py"),
         "--backend",
         "both",
         "--steps",

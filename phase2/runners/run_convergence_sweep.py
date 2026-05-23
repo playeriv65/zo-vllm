@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_list(raw: str, cast):
@@ -25,7 +25,7 @@ def parse_list(raw: str, cast):
 def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, step_interval: int) -> None:
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "phase2" / "run_convergence_experiment.py"),
+        str(PROJECT_ROOT / "phase2" / "runners" / "run_convergence_experiment.py"),
         "--backend",
         args.backend,
         "--steps",
@@ -199,7 +199,7 @@ def main() -> None:
     output_root = (
         Path(args.output_root)
         if args.output_root
-        else PROJECT_ROOT / "phase2_results" / "convergence" / f"sweep100_{timestamp}"
+        else PROJECT_ROOT / "phase2" / "results" / "convergence" / f"sweep100_{timestamp}"
     )
     output_root.mkdir(parents=True, exist_ok=True)
 

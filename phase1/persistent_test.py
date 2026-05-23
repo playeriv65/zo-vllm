@@ -19,7 +19,8 @@ MODEL_NAME = "opt-2.7b-bf16"  # Local bf16 model
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 EPS = 1e-3
-ADAPTER_DIR = Path("adapters_batch_test")
+PHASE1_DIR = Path(__file__).resolve().parent
+ADAPTER_DIR = PHASE1_DIR / "artifacts" / "adapters_batch_test"
 
 SEEDS = list(range(42, 50))  # 8 seeds
 RUNS_PER_SEED = 3

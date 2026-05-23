@@ -18,12 +18,14 @@ build/
 adapters*/
 *.pt
 phase1*_results.json
-phase2_results/
+phase1/artifacts/
+phase2/artifacts/
+phase2/results/
 
 # Logs and results
 logs/
 results/
-phase1/phase1_results/
+phase1/results/
 phase1/*.log
 wandb/
 scratch/

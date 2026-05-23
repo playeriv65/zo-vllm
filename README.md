@@ -11,19 +11,18 @@ training-speed validation. The recommended configuration is:
 rank=8, step_interval=50, lr=3e-7, eps=1e-3, batch_size=16
 ```
 
-Latest 300-step direct base-weight validation reaches 100.2% of the
-instrumented baseline loss drop (`5.132858 -> 4.831568` for vLLM,
-`5.132812 -> 4.832031` for baseline). The speed path now keeps U/V digest
-hashing off by default and runs at 0.0842 s/step on the 100-step timing check;
-digest hashing remains enabled only for strict side-by-side alignment. See
+Latest clean 300-step direct base-weight validation reaches 100.2% of the
+instrumented baseline loss drop (`5.132858 -> 4.831391` for vLLM,
+`5.132812 -> 4.832031` for baseline). The same clean run measured
+`0.0864 s/step` for vLLM and `0.1155 s/step` for the instrumented baseline.
+Digest hashing remains enabled only for strict side-by-side alignment. See
 [`phase2/README.md`](phase2/README.md) for acceptance results, commands, and
 validation notes.
 
 Recent stepwise validation also passes with CUDA-side LOZO RNG
 (`--zo-random-device cuda`): 20/20 U/V direction digests match, with max
-plus/minus loss diffs near 0.01. A 100-step HF baseline ablation shows full
-training scope, including embeddings and 1D params, drops loss faster than the
-vLLM-compatible `lora_only` scope but not by an order of magnitude.
+plus/minus loss diffs of `0.030806` and `0.023877` in the 2026-05-23 clean
+run.
 
 Temporary plus/minus LoRA adapters can run through the original CPU
 mock-safetensors path or the newer GPU-resident path (`--lora-residency gpu`).
@@ -35,18 +34,17 @@ path remains available with `--lora-injection manager`.
 The training loop also has a direct base-weight update path
 (`--weight-update direct --weight-update-precision param`) that applies the
 LOZO low-rank update inside the vLLM worker with in-place `addmm_`, avoiding
-the old external-master plus full-weight sync step. In the current 100-step
-timing check this reduced vLLM step time from 0.203s to 0.084s after removing
-debug-only U/V digest hashing from the speed path. Strict side-by-side tests
-still enable digest hashing explicitly.
+the old external-master plus full-weight sync step. In the clean 300-step
+validation, scoring remains the dominant cost (`score_s_mean=0.0585`), while
+direct weight update is small (`weight_update_s_mean=0.0078`). Strict
+side-by-side tests still enable digest hashing explicitly.
 
 ## Structure
 
 - `third_party/vllm` — vLLM fork (local vendored copy)
 - `third_party/LOZO` — LOZO algorithm reference (submodule)
-- `phase2` — LOZO controller, memory LoRA runtime, vLLM scorer, convergence CLIs
-- `scripts` — experiment entry points
-- `configs` — configuration files
+- `phase1` — Phase 1 alignment scripts and generated Phase 1 outputs
+- `phase2` — Phase 2 core code, runners, validation scripts, and generated outputs
 
 ## Phase 1: LOZO Perturbation Alignment (Initial)
 
@@ -85,7 +83,7 @@ sign 8/8 | mean|c_err| = 3.29% | max|c_err| = 10.63%
 param.data = param.data + scaling_factor * (u @ v.t()) * zo_eps
 ```
 
-Run: `.venv/bin/python scripts/phase1p5c_alignment.py`
+Run: `.venv/bin/python phase1/phase1_official.py`
 
 ## Environment
 

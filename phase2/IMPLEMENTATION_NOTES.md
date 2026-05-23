@@ -185,24 +185,17 @@ in-place `addmm_`.
 Short validation:
 - Fake packed-qkv unit check: exact equality with the controller formula in
   `float32` mode.
-- 20-step `direct/param` side-by-side vs LOZO baseline accepted:
+- Clean 20-step `direct/param` side-by-side vs LOZO baseline accepted:
   `direction_digest_mismatch_steps=[]`, `sign_fail_steps=[]`,
-  `max_loss_plus_diff=0.010216`, `max_loss_minus_diff=0.010008`,
-  `max_c_diff=6.163657`.
-- 100-step vLLM-only `direct/param` vs `copy`: seed and U/V digests matched
-  100/100 steps; step time improved from `0.2044s` to `0.1109s`, and
-  `weight_update_s_mean` improved from `0.1014s` to `0.0079s`.
+  `max_loss_plus_diff=0.030806`, `max_loss_minus_diff=0.023877`,
+  `max_c_diff=18.560467`.
 - The normal speed path keeps `direction_digest` off. Digest hashing is a
-  side-by-side/debug check that copies U/V from GPU to CPU and costs about
-  `0.021s/step`. With digest disabled, the 100-step `direct/param` timing is
-  `0.0842s/step`.
-- Scoring is now timed internally. The digest-off run measured
-  `score_s_mean=0.0568`, `score_generate_s_mean=0.0567`, and
-  `score_postprocess_s_mean=0.000073`, so the bottleneck is vLLM
+  side-by-side/debug check that copies U/V from GPU to CPU.
+- Scoring is now timed internally. The clean 300-step run measured
+  `step_s_mean=0.0864`, `score_s_mean=0.0585`,
+  `score_generate_s_mean=0.0584`, and
+  `score_postprocess_s_mean=0.000064`, so the bottleneck is vLLM
   `generate(prompt_logprobs=1)`.
-- GPU direct vs manager, 20 steps: `lora_update_s_mean` improved from
-  `0.014718` to `0.010747` (`1.37x`), with identical step seeds and U/V
-  digests.
 
 ### Execution flags
 

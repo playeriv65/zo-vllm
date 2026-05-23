@@ -10,13 +10,13 @@ from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForTokenClassification
 from datasets import load_dataset
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, "third_party", "LOZO", "large_models"))
 
 from LOZOtrainer import LowRankTrainer
 from run_lozo import OurArguments
-from phase2.direction_digest import digest_named_uv
+from phase2.core.direction_digest import digest_named_uv
 
 
 class SimpleDataset(Dataset):
@@ -232,7 +232,12 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    results_dir = args.output_dir or os.path.join(project_root, "results")
+    results_dir = args.output_dir or os.path.join(
+        project_root,
+        "phase2",
+        "results",
+        "convergence",
+    )
     trainer_output_dir = os.path.join(
         results_dir,
         "_tmp",

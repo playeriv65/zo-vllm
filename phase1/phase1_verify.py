@@ -22,7 +22,8 @@ DEVICE = "cuda"
 # All fp16
 HF_DTYPE = torch.float16
 EPS_VALUES = [1e-3]  # Only test eps=1e-3
-ADAPTER_DIR = Path("adapters_phase1")
+PHASE1_DIR = Path(__file__).resolve().parent
+ADAPTER_DIR = PHASE1_DIR / "artifacts" / "adapters_phase1"
 
 # LOZO hyperparameters
 EPS = 1e-3
