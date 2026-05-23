@@ -31,3 +31,4 @@ scratch/
 # Cache
 .cache/
 tmp/
+temp_out*/

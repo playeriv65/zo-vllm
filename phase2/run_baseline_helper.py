@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import shutil
 import torch
 import numpy as np
 import time
@@ -231,8 +232,15 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    results_dir = args.output_dir or os.path.join(project_root, "results")
+    trainer_output_dir = os.path.join(
+        results_dir,
+        "_tmp",
+        f"baseline_trainer_{timestamp}",
+    )
+
     our_args = OurArguments(
-        output_dir=f"./temp_out_baseline_{timestamp}",
+        output_dir=trainer_output_dir,
         model_name=model_name,
         learning_rate=lr,
         zo_eps=zo_eps,
@@ -282,7 +290,6 @@ def main():
     print(f"[Baseline] Final loss: {final_loss:.6f}")
 
     # Save results
-    results_dir = args.output_dir or os.path.join(project_root, "results")
     os.makedirs(results_dir, exist_ok=True)
     output_file = os.path.join(results_dir, f"baseline_convergence_r{rank_r}_{timestamp}.json")
     step_times = [item["step_s"] for item in trainer.history]
@@ -314,6 +321,11 @@ def main():
                 "lora_update_s_mean": 0.0,
             },
         }, f, indent=2)
+    shutil.rmtree(trainer_output_dir, ignore_errors=True)
+    try:
+        os.rmdir(os.path.dirname(trainer_output_dir))
+    except OSError:
+        pass
     print(f"[Baseline] Results saved to {output_file}")
 
 
