@@ -77,7 +77,8 @@ TempLoRARuntime (CPU mock or GPU-resident LoRA)
     │ 4. Register/select stable plus/minus LoRA IDs
     │ 5. Update LoRA tensors each step
     │    - cpu: mock safetensors path + LoRARequest(load_inplace=True)
-    │    - gpu: LoRAModel.from_lora_tensors + model.lora_manager
+    │    - gpu/direct: fixed slots + in-place wrapper.set_lora(slot_index, ...)
+    │    - gpu/manager: LoRAModel.from_lora_tensors + model.lora_manager
     │
     ▼
 VLLMScorer
@@ -137,24 +138,29 @@ tensors if multi-process serving becomes a requirement.
 
 ### GPU-resident LoRA path
 
-`--lora-residency gpu` avoids the old host round trip:
+`--lora-residency gpu --lora-injection direct` avoids the old host round trip
+and the per-step LoRAModelManager reload:
 
 ```text
-CUDA U/V -> CUDA LoRA A/B -> LoRAModel.from_lora_tensors(device=manager.device)
-         -> LoRAModelManager.add_adapter/activate_adapter -> GPU LoRA slots
+CUDA U/V -> CUDA LoRA A/B -> fixed plus/minus slot
+         -> BaseLayerWithLoRA.set_lora(slot_index, A/B)
 ```
 
-This keeps vLLM's existing packed qkv handling, tensor-parallel slicing, and
-slot metadata logic. It does not write `lora_a_stacked` or `lora_b_stacked`
-directly from phase2 code.
+The direct updater still uses vLLM's wrapper APIs, so packed qkv expansion,
+tensor-parallel slicing, and slot layout remain centralized in vLLM. The
+manager path remains available with `--lora-injection manager`.
 
 Short validation:
 - vLLM CPU mock vs GPU residency: exact seed, U/V digest, plus/minus loss, and
   `c` match for 3/3 steps.
-- GPU-resident side-by-side vs LOZO baseline: 3/3 steps accepted,
-  `direction_digest_mismatch_steps=[]`, `max_loss_plus_diff=0.007089`,
-  `max_loss_minus_diff=0.001356`, `max_c_diff=2.866773` under the default
+- GPU direct side-by-side vs LOZO baseline: 20/20 steps accepted,
+  `direction_digest_mismatch_steps=[]`, `sign_fail_steps=[]`,
+  `max_loss_plus_diff=0.009428`, `max_loss_minus_diff=0.009200`,
+  `max_c_diff=6.066894` under the default
   `batch_invariant=0,enforce_eager=1` training mode.
+- GPU direct vs manager, 20 steps: `lora_update_s_mean` improved from
+  `0.014718` to `0.010747` (`1.37x`), with identical step seeds and U/V
+  digests.
 
 ### Execution flags
 

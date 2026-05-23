@@ -110,6 +110,12 @@ def main():
         default="gpu",
         help="Where temporary plus/minus LoRA tensors are loaded from.",
     )
+    parser.add_argument(
+        "--lora-injection",
+        choices=["auto", "direct", "manager"],
+        default="auto",
+        help="LoRA update path. auto selects direct for GPU and manager for CPU.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
     parser.add_argument("--no-wandb", dest="no_wandb", action="store_true", help="Disable WandB logging")
@@ -118,8 +124,14 @@ def main():
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
+    lora_injection = args.lora_injection
+    if lora_injection == "auto":
+        lora_injection = "direct" if args.lora_residency == "gpu" else "manager"
+
     if args.lora_residency == "gpu" and not torch.cuda.is_available():
         raise SystemExit("--lora-residency gpu requires CUDA")
+    if args.lora_residency == "cpu" and lora_injection != "manager":
+        raise SystemExit("--lora-injection direct requires --lora-residency gpu")
     if args.lora_residency == "cpu":
         # Install mocks before any vLLM operations on the CPU memory-LoRA path.
         install_mocks()
@@ -161,6 +173,7 @@ def main():
     print(
         f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}, "
         f"lora_residency={args.lora_residency}, "
+        f"lora_injection={lora_injection}, "
         f"batch_invariant={args.batch_invariant}, "
         f"enforce_eager={args.enforce_eager}"
     )
@@ -202,6 +215,7 @@ def main():
         rank=rank_r,
         num_layers=num_layers,
         residency=args.lora_residency,
+        injection=lora_injection,
         llm=llm,
     )
     temp_lora.register_slots()
@@ -397,6 +411,7 @@ def main():
                 "zo_random_device": args.zo_random_device,
                 "train_scope": args.train_scope,
                 "lora_residency": args.lora_residency,
+                "lora_injection": lora_injection,
                 "batch_invariant": int(args.batch_invariant),
                 "enforce_eager": int(args.enforce_eager),
             },

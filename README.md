@@ -24,9 +24,10 @@ vLLM-compatible `lora_only` scope but not by an order of magnitude.
 
 Temporary plus/minus LoRA adapters can run through the original CPU
 mock-safetensors path or the newer GPU-resident path (`--lora-residency gpu`).
-The GPU path loads CUDA PEFT tensors directly into vLLM's existing LoRA manager
-and has passed short CPU/GPU residency equivalence and baseline side-by-side
-smoke checks.
+The default GPU path uses `--lora-injection direct`: it initializes fixed
+plus/minus slots once and overwrites their LoRA tensors in place during
+training, bypassing per-step LoRA manager reload/activation. The older manager
+path remains available with `--lora-injection manager`.
 
 ## Structure
 

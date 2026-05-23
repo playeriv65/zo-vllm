@@ -30,6 +30,7 @@ U, V ~ N(0,1)                   # 随机矩阵分布
 seed=42                         # 默认step seed流，可通过--seed覆盖
 zo_random_device=cuda            # U/V/z采样设备；cpu仅用于复现旧CPU-RNG结果
 lora_residency=gpu               # 默认GPU-resident；cpu仅用于旧mock路径回归
+lora_injection=direct            # 训练默认固定slot原位写LoRA；manager仅作回退/对比
 ```
 
 ## 构建命令
@@ -157,7 +158,7 @@ llm.generate(prompts, lora_request=LoRARequest("name", lora_id, path))
 ### 注意事项
 
 1. **CPU mock保留**：`register_memory_lora_cpu()` 仍用于回归和旧验收结果
-2. **GPU residency可用**：`--lora-residency gpu` 直接把CUDA LoRA tensor加载进vLLM GPU LoRA slots
+2. **GPU direct injection默认**：`--lora-residency gpu --lora-injection direct` 先固定plus/minus slot，再每步原位写LoRA；`manager`路径仅作回退/对比
 3. **不需要LRU**：LOZO训练每次只用plus/minus扰动LoRA，内存占用小
 4. **类型兼容**：Mock函数需处理 `str` 和 `pathlib.Path` 类型
 5. **context manager**：`FakeSafeFile` 必须实现 `__enter__`/`__exit__`
@@ -244,17 +245,19 @@ Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍�
 
 ### GPU-resident LoRA路径
 
-`--lora-residency gpu` 绕过CPU mock safetensors路径：
-`CUDA U/V -> CUDA LoRA A/B -> LoRAModel.from_lora_tensors(device=manager.device) -> model.lora_manager.activate_adapter()`。
+`--lora-residency gpu --lora-injection direct` 绕过CPU mock safetensors路径，并绕过每步 LoRAModelManager 重建/activate：
+`CUDA U/V -> CUDA LoRA A/B -> fixed plus/minus slot -> module.set_lora(slot_index, ...)`。
 
 短验证结果：
 - vLLM CPU mock vs GPU residency：3/3 steps 的 seed、U/V digest、loss_plus/loss_minus、`c` 完全一致
 - 默认训练配置（GPU residency, batch_invariant=0, enforce_eager=1）3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.007089`，`max_loss_minus_diff=0.001356`，`max_c_diff=2.866773`
 - batch=2短跑速度：CPU mock `step_s_mean=0.276578`，GPU residency `step_s_mean=0.238013`
+- direct slot updater 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.009428`，`max_loss_minus_diff=0.009200`，`max_c_diff=6.066894`
+- direct vs manager 20-step：`lora_update_s_mean` `0.010747` vs `0.014718`（direct快 `1.37x`），`step_s_mean` `0.209159` vs `0.214355`（整体快 `1.03x`）
 
 ### vLLM执行参数消融
 
-20-step vLLM-only 计时（rank=8, lr=1e-7, eps=1e-3, step_interval=100, batch=16, CUDA RNG, GPU-resident LoRA）：
+20-step vLLM-only 计时（rank=8, lr=1e-7, eps=1e-3, step_interval=100, batch=16, CUDA RNG, GPU-resident manager路径；direct更新器实现前结果）：
 
 | batch_invariant | enforce_eager | total_s | step_s_mean | tail10_step_s_mean | 结论 |
 |---:|---:|---:|---:|---:|---|

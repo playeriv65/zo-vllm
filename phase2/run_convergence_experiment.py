@@ -116,6 +116,8 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             *build_common_args(args, output_dir),
             "--lora-residency",
             args.lora_residency,
+            "--lora-injection",
+            args.lora_injection,
             "--batch-invariant",
             args.batch_invariant,
             "--enforce-eager",
@@ -311,6 +313,7 @@ def main() -> None:
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
     parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
+    parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
     parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-dir", default=None)

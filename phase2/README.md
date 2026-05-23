@@ -22,6 +22,8 @@ path for OPT-2.7B. The current accepted configuration is:
 | CUDA RNG side-by-side max plus/minus loss diff | 0.010078 / 0.010059 | PASS |
 | CUDA RNG baseline speedup vs CPU RNG | 5.20x on 20-step side-by-side | PASS |
 | GPU-resident LoRA side-by-side smoke | 3 / 3 steps accepted | PASS |
+| GPU direct injection side-by-side | 20 / 20 steps accepted | PASS |
+| GPU direct injection lora_update speedup | 1.37x vs manager | PASS |
 | GPU-resident LoRA vs CPU mock short path | exact 3-step vLLM match, 1.16x step speed | PASS |
 | baseline full-scope ablation loss drop | -0.250000 vs -0.140625 | reference |
 | sample-level batch invariance max NLL diff | 0.000000000 | PASS |
@@ -48,6 +50,7 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   --step-interval 50 \
   --zo-random-device cuda \
   --lora-residency gpu \
+  --lora-injection direct \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --eval-interval 20 \
@@ -65,6 +68,7 @@ Run the 100-step sweep:
   --eps 1e-3 \
   --eval-interval 20 \
   --lora-residency gpu \
+  --lora-injection direct \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --lrs 1e-7,3e-7,1e-6 \
@@ -99,6 +103,7 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_real_lozo_baseline_s
   --eval-interval 3 \
   --zo-random-device cuda \
   --lora-residency gpu \
+  --lora-injection direct \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --output-dir phase2_results/convergence/acceptance_side_by_side_smoke
@@ -125,6 +130,10 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_memory_lora_speed.py
 - Phase 2 CLIs default to `--lora-residency gpu`. The CPU mock path remains
   available for regression of the original in-memory safetensors loader, but it
   is no longer the speed acceptance path.
+- `--lora-injection auto` selects the training-only direct updater on GPU and
+  the manager path on CPU. Direct injection creates fixed plus/minus LoRA slots
+  once, then overwrites the slot tensors in place each step. `manager` remains
+  available as a fallback and comparison path.
 - `--enforce-eager 1` is the default because it avoids a large vLLM
   torch.compile/CUDA graph startup cost. `--enforce-eager 0` can improve steady
   training-loop time on longer runs.
@@ -139,11 +148,11 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_memory_lora_speed.py
   `CUDA_VISIBLE_DEVICES` in the shell/job launcher. The optional `--gpu` flag
   only exists as a one-off environment override and accepts whatever ID string
   the current allocation requires.
-- `TempLoRARuntime` uses stable plus/minus LoRA IDs and vLLM
-  `LoRARequest(load_inplace=True)` on the CPU mock path to avoid stale LoRA
-  cache hits. `--lora-residency gpu` bypasses the mock safetensors path and
-  loads PEFT-format CUDA tensors directly into vLLM's existing GPU LoRA slots
-  via `LoRAModel.from_lora_tensors` and `model.lora_manager`.
+- `TempLoRARuntime` uses stable plus/minus LoRA IDs. The CPU mock path still
+  uses vLLM `LoRARequest(load_inplace=True)` to avoid stale cache hits. The GPU
+  direct path initializes two slots through the manager once, then writes
+  `lora_a_stacked`/`lora_b_stacked` through each wrapper's `set_lora()` without
+  per-step `remove_adapter/add_adapter/activate_adapter`.
 - `LOZOController` supports `train_scope=lora_only` for vLLM-compatible
   Linear-only perturbations and `train_scope=full` for HF baseline ablations
   that include embeddings and 1D parameters.
@@ -202,9 +211,37 @@ GPU-resident LoRA smoke, `rank=8`, `lr=1e-7`, `eps=1e-3`,
 | default GPU side-by-side max plus/minus loss diff vs baseline | 0.007089 / 0.001356 |
 | default GPU side-by-side max c diff vs baseline | 2.866773 |
 
+Direct slot updater, 20-step vLLM-only, `rank=8`, `lr=1e-7`, `eps=1e-3`,
+`step_interval=100`, `batch_size=16`, CUDA RNG,
+`batch_invariant=0,enforce_eager=1`:
+
+| injection | total_s | step_s_mean | tail10_step_s_mean | lora_update_s_mean | tail10_lora_update_s_mean |
+|---|---:|---:|---:|---:|---:|
+| `manager` | 4.3566 | 0.2144 | 0.2140 | 0.0147 | 0.0150 |
+| `direct` | 4.2460 | 0.2092 | 0.2019 | 0.0107 | 0.0108 |
+
+Direct injection preserved the step seed stream and U/V digests. Compared with
+the manager path, `lora_update_s_mean` improved by `1.37x` and total loop time
+by `1.03x`; the modest total speedup is expected because scoring and weight
+sync dominate the step time.
+
+Direct side-by-side vs LOZO baseline, 20 steps:
+
+```text
+steps_compared=20
+seed_mismatch_steps=[]
+direction_digest_mismatch_steps=[]
+loss_fail_steps@0.04=[]
+c_fail_steps@25=[]
+sign_fail_steps=[]
+max_loss_plus_diff=0.009428
+max_loss_minus_diff=0.009200
+max_c_diff=6.066894
+```
+
 Execution flag ablation, 20-step vLLM-only, `rank=8`, `lr=1e-7`,
 `eps=1e-3`, `step_interval=100`, `batch_size=16`, CUDA RNG,
-GPU-resident LoRA:
+GPU-resident manager-path LoRA:
 
 | batch_invariant | enforce_eager | total_s | step_s_mean | tail10_step_s_mean | score_s_mean |
 |---:|---:|---:|---:|---:|---:|
