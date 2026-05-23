@@ -20,7 +20,7 @@ os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(CACHE_ROOT, "datasets"))
 os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_ROOT, "hub"))
 os.environ.setdefault("HF_XET_CACHE", os.path.join(CACHE_ROOT, "xet"))
 os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(CACHE_ROOT, "transformers"))
-os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "0")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 os.environ.setdefault("WANDB_MODE", "offline")
@@ -36,11 +36,9 @@ from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
-from vllm import LLM
 
 from phase2.lozo_controller import LOZOController, LOZOConfig
 from phase2.temp_lora_runtime import TempLoRARuntime
-from phase2.vllm_scorer import VLLMScorer
 from phase2.weight_sync import WeightSync
 from phase2.memory_lora_loader import install_mocks
 from phase2.direction_digest import digest_named_uv
@@ -95,15 +93,28 @@ def main():
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--train-scope", choices=["lora_only"], default="lora_only")
     parser.add_argument(
+        "--batch-invariant",
+        choices=["0", "1"],
+        default=os.environ.get("VLLM_BATCH_INVARIANT", "0"),
+        help="Set VLLM_BATCH_INVARIANT before importing vLLM.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        choices=["0", "1"],
+        default="1",
+        help="Pass enforce_eager to vLLM. 0 enables compile/CUDA graph paths when supported.",
+    )
+    parser.add_argument(
         "--lora-residency",
         choices=["cpu", "gpu"],
-        default="cpu",
+        default="gpu",
         help="Where temporary plus/minus LoRA tensors are loaded from.",
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
     parser.add_argument("--no-wandb", dest="no_wandb", action="store_true", help="Disable WandB logging")
     args = parser.parse_args()
+    os.environ["VLLM_BATCH_INVARIANT"] = args.batch_invariant
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
@@ -112,6 +123,9 @@ def main():
     if args.lora_residency == "cpu":
         # Install mocks before any vLLM operations on the CPU memory-LoRA path.
         install_mocks()
+
+    from vllm import LLM
+    from phase2.vllm_scorer import VLLMScorer
     
     # Configuration
     model_name = "facebook/opt-2.7b"
@@ -146,7 +160,9 @@ def main():
     print(f"Run: {run_name}")
     print(
         f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}, "
-        f"lora_residency={args.lora_residency}"
+        f"lora_residency={args.lora_residency}, "
+        f"batch_invariant={args.batch_invariant}, "
+        f"enforce_eager={args.enforce_eager}"
     )
     
     # Load HF model
@@ -162,7 +178,7 @@ def main():
     # Load vLLM engine
     llm = LLM(
         model=model_name,
-        enforce_eager=True,
+        enforce_eager=bool(int(args.enforce_eager)),
         enable_lora=True,
         max_lora_rank=rank_r,
         max_loras=2,
@@ -381,6 +397,8 @@ def main():
                 "zo_random_device": args.zo_random_device,
                 "train_scope": args.train_scope,
                 "lora_residency": args.lora_residency,
+                "batch_invariant": int(args.batch_invariant),
+                "enforce_eager": int(args.enforce_eager),
             },
             "initial_loss": float(initial_loss),
             "final_loss": float(final_loss),

@@ -36,7 +36,6 @@ because it contains run logs and JSON artifacts.
 Run one strict comparison:
 
 ```bash
-VLLM_BATCH_INVARIANT=1 \
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
 .venv/bin/python phase2/run_convergence_experiment.py \
@@ -48,7 +47,9 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   --eps 1e-3 \
   --step-interval 50 \
   --zo-random-device cuda \
-  --lora-residency cpu \
+  --lora-residency gpu \
+  --batch-invariant 0 \
+  --enforce-eager 1 \
   --eval-interval 20 \
   --output-dir phase2_results/convergence/manual_r8_si50_lr3e-7 \
   --no-wandb
@@ -63,7 +64,9 @@ Run the 100-step sweep:
   --batch-size 16 \
   --eps 1e-3 \
   --eval-interval 20 \
-  --lora-residency cpu \
+  --lora-residency gpu \
+  --batch-invariant 0 \
+  --enforce-eager 1 \
   --lrs 1e-7,3e-7,1e-6 \
   --ranks 8,16 \
   --step-intervals 50,100 \
@@ -96,6 +99,8 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_real_lozo_baseline_s
   --eval-interval 3 \
   --zo-random-device cuda \
   --lora-residency gpu \
+  --batch-invariant 0 \
+  --enforce-eager 1 \
   --output-dir phase2_results/convergence/acceptance_side_by_side_smoke
 
 CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python scripts/test_batch_invariance.py \
@@ -114,7 +119,15 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_memory_lora_speed.py
 ## Implementation Notes
 
 - OPT-2.7B must use fp16, not bf16.
-- `VLLM_BATCH_INVARIANT=1` is required for reproducible prompt logprobs.
+- Training defaults to `VLLM_BATCH_INVARIANT=0` for speed. Set it to `1` only
+  for explicit sample-level batch-invariance validation or when reproducing the
+  older invariant acceptance runs.
+- Phase 2 CLIs default to `--lora-residency gpu`. The CPU mock path remains
+  available for regression of the original in-memory safetensors loader, but it
+  is no longer the speed acceptance path.
+- `--enforce-eager 1` is the default because it avoids a large vLLM
+  torch.compile/CUDA graph startup cost. `--enforce-eager 0` can improve steady
+  training-loop time on longer runs.
 - The baseline uses the separate LOZO environment at
   `third_party/LOZO/large_models/.venv` when available.
 - `--seed` controls the numpy step-seed stream. `--zo-random-device` controls
@@ -186,5 +199,24 @@ GPU-resident LoRA smoke, `rank=8`, `lr=1e-7`, `eps=1e-3`,
 | GPU residency `step_s_mean` | 0.238013 |
 | CPU mock `score_s_mean` | 0.108493 |
 | GPU residency `score_s_mean` | 0.061117 |
-| GPU side-by-side max plus/minus loss diff vs baseline | 0.026914 / 0.003174 |
-| GPU side-by-side max c diff vs baseline | 11.869928 |
+| default GPU side-by-side max plus/minus loss diff vs baseline | 0.007089 / 0.001356 |
+| default GPU side-by-side max c diff vs baseline | 2.866773 |
+
+Execution flag ablation, 20-step vLLM-only, `rank=8`, `lr=1e-7`,
+`eps=1e-3`, `step_interval=100`, `batch_size=16`, CUDA RNG,
+GPU-resident LoRA:
+
+| batch_invariant | enforce_eager | total_s | step_s_mean | tail10_step_s_mean | score_s_mean |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 4.6126 | 0.2273 | 0.2106 | 0.0768 |
+| 0 | 0 | 4.2308 | 0.2092 | 0.2001 | 0.0580 |
+| 1 | 1 | 4.5978 | 0.2257 | 0.2188 | 0.0754 |
+| 1 | 0 | 4.5380 | 0.2235 | 0.2142 | 0.0737 |
+
+All four runs used identical step seeds and U/V direction digests. With
+`batch_invariant=0`, disabling eager was the fastest training loop
+(`1.09x` tail-10 speedup vs `batch_invariant=1,enforce_eager=1`), but a cached
+`batch_invariant=1,enforce_eager=0` run still spent `23.05s` in vLLM engine
+initialization (`8.98s` compile plus `11s` CUDA graph capture). For current
+short acceptance and 300-step comparisons, `batch_invariant=0,enforce_eager=1`
+is the pragmatic default; use `enforce_eager=0` for longer throughput runs.

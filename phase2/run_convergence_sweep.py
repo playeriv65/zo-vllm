@@ -44,6 +44,10 @@ def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, st
         str(args.eval_interval),
         "--lora-residency",
         args.lora_residency,
+        "--batch-invariant",
+        args.batch_invariant,
+        "--enforce-eager",
+        args.enforce_eager,
         "--output-dir",
         str(output_dir),
         "--no-wandb",
@@ -174,7 +178,9 @@ def main() -> None:
     parser.add_argument("--lrs", default="1e-7,3e-7,1e-6")
     parser.add_argument("--ranks", default="8,16")
     parser.add_argument("--step-intervals", default="50,100")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="cpu")
+    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
+    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
+    parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-root", default=None)
     args = parser.parse_args()
 

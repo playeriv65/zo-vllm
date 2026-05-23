@@ -16,11 +16,12 @@ ZO-vLLM: 在vLLM上实现LOZO（零阶优化）的LoRA适配器验证框架
 
 ```bash
 # 环境变量
-VLLM_BATCH_INVARIANT=1          # 批量不变性，确保跨batch size结果一致
+VLLM_BATCH_INVARIANT=0          # 训练默认关闭；专门做batch不变性验证时设为1
 
 # vLLM引擎参数
 gpu_memory_utilization=0.5      # GPU内存利用率
 max_lora_rank=16                # LoRA最大rank
+enforce_eager=1                 # 默认保留eager；长跑吞吐实验可设为0
 
 # LOZO参数
 eps=1e-3                        # 扰动步长（论文对齐）
@@ -28,7 +29,7 @@ rank=8 或 16                    # LoRA rank
 U, V ~ N(0,1)                   # 随机矩阵分布
 seed=42                         # 默认step seed流，可通过--seed覆盖
 zo_random_device=cuda            # U/V/z采样设备；cpu仅用于复现旧CPU-RNG结果
-lora_residency=cpu/gpu           # 临时plus/minus LoRA加载路径；gpu已通过smoke验证
+lora_residency=gpu               # 默认GPU-resident；cpu仅用于旧mock路径回归
 ```
 
 ## 构建命令
@@ -61,7 +62,7 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 ## 注意事项
 
 1. **不要使用bf16**：OPT-2.7B是fp16训练的，bf16会损失精度（尾数7位 vs fp16的10位）
-2. **VLLM_BATCH_INVARIANT=1**：必须设置，否则跨batch size结果不一致
+2. **Batch invariant**：训练默认 `VLLM_BATCH_INVARIANT=0`；只有验证跨 batch size 每样本 logprob 完全一致时设为 `1`
 3. **多模块adapter格式**：vLLM需要多模块adapter格式才能正确加载
 4. **PEFT lora_alpha = r**：scaling factor = 1
 5. **GPU 不写死**：可用 GPU 是临时协商资源，脚本和文档不要固定具体编号；通过外部 `CUDA_VISIBLE_DEVICES` 传入，或用可选 `--gpu` 临时覆盖。
@@ -221,7 +222,6 @@ Loss change: -0.0030 (10 steps)
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0  # 单进程模式（mock需要）
 VLLM_ALLOW_INSECURE_SERIALIZATION=1
-VLLM_BATCH_INVARIANT=1
 CUDA_VISIBLE_DEVICES=<GPU_IDS>
 ```
 
@@ -249,8 +249,21 @@ Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍�
 
 短验证结果：
 - vLLM CPU mock vs GPU residency：3/3 steps 的 seed、U/V digest、loss_plus/loss_minus、`c` 完全一致
-- 3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.026914`，`max_loss_minus_diff=0.003174`，`max_c_diff=11.869928`
+- 默认训练配置（GPU residency, batch_invariant=0, enforce_eager=1）3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.007089`，`max_loss_minus_diff=0.001356`，`max_c_diff=2.866773`
 - batch=2短跑速度：CPU mock `step_s_mean=0.276578`，GPU residency `step_s_mean=0.238013`
+
+### vLLM执行参数消融
+
+20-step vLLM-only 计时（rank=8, lr=1e-7, eps=1e-3, step_interval=100, batch=16, CUDA RNG, GPU-resident LoRA）：
+
+| batch_invariant | enforce_eager | total_s | step_s_mean | tail10_step_s_mean | 结论 |
+|---:|---:|---:|---:|---:|---|
+| 0 | 1 | 4.6126 | 0.2273 | 0.2106 | 推荐默认；启动轻，稳态接近最快 |
+| 0 | 0 | 4.2308 | 0.2092 | 0.2001 | 训练loop最快，但有torch.compile/CUDA graph启动成本 |
+| 1 | 1 | 4.5978 | 0.2257 | 0.2188 | 旧验收路径 |
+| 1 | 0 | 4.5380 | 0.2235 | 0.2142 | batch invariant抵消了大部分compile收益 |
+
+所有组合的 step seed 和 U/V digest 完全一致。`enforce_eager=0` 在一次缓存命中的短跑里仍有约 `23s` vLLM引擎初始化成本；300-step 以内总 wall-clock 通常不划算，长跑才考虑。
 
 ## Phase 2 Milestone 4: 梯度对齐验证 完成 ✅
 

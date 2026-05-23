@@ -126,7 +126,11 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0  # Disable multi-process
 VLLM_ALLOW_INSECURE_SERIALIZATION=1  # Allow pickle serialization
 ```
 
-**Performance impact**: ~2-3x slower (CUDA Graphs disabled)
+**Performance impact**: single-process mode is required for this research
+harness, but CUDA graphs are controlled independently by `--enforce-eager`.
+Current default is `--enforce-eager 1` for low startup cost; set
+`--enforce-eager 0` only when the run is long enough to amortize compile and
+graph-capture time.
 
 **Future work**: Add a first-class vLLM worker RPC for in-memory CUDA LoRA
 tensors if multi-process serving becomes a requirement.
@@ -148,8 +152,23 @@ Short validation:
 - vLLM CPU mock vs GPU residency: exact seed, U/V digest, plus/minus loss, and
   `c` match for 3/3 steps.
 - GPU-resident side-by-side vs LOZO baseline: 3/3 steps accepted,
-  `direction_digest_mismatch_steps=[]`, `max_loss_plus_diff=0.026914`,
-  `max_loss_minus_diff=0.003174`, `max_c_diff=11.869928`.
+  `direction_digest_mismatch_steps=[]`, `max_loss_plus_diff=0.007089`,
+  `max_loss_minus_diff=0.001356`, `max_c_diff=2.866773` under the default
+  `batch_invariant=0,enforce_eager=1` training mode.
+
+### Execution flags
+
+- `--batch-invariant 0` is the training default. Use `--batch-invariant 1` only
+  for explicit sample-level batch-invariance validation or reproducing older
+  accepted runs.
+- `--enforce-eager 1` is the default because it keeps vLLM engine startup low.
+  A 20-step GPU-resident timing ablation found the fastest loop at
+  `batch_invariant=0,enforce_eager=0` (`step_s_mean=0.2092`,
+  `tail10_step_s_mean=0.2001`), but cached vLLM initialization still took
+  `23.05s` on the `batch_invariant=1,enforce_eager=0` run because of
+  torch.compile and CUDA graph capture.
+- All four `batch_invariant`/`enforce_eager` combinations produced identical
+  step seeds and U/V direction digests in the 20-step ablation.
 
 ---
 

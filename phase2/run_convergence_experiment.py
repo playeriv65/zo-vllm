@@ -88,7 +88,7 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
     cache_root = PROJECT_ROOT / ".cache" / "hf"
     env.update(
         {
-            "VLLM_BATCH_INVARIANT": "1",
+            "VLLM_BATCH_INVARIANT": args.batch_invariant,
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
             "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
             "HF_HOME": str(cache_root / "home"),
@@ -116,6 +116,10 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             *build_common_args(args, output_dir),
             "--lora-residency",
             args.lora_residency,
+            "--batch-invariant",
+            args.batch_invariant,
+            "--enforce-eager",
+            args.enforce_eager,
         ]
     else:
         raise ValueError(f"unknown backend: {name}")
@@ -306,7 +310,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="cpu")
+    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
+    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
+    parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()

@@ -35,7 +35,9 @@ def main() -> None:
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="cpu")
+    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
+    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
+    parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--loss-tol", type=float, default=4e-2)
     parser.add_argument("--c-tol", type=float, default=25.0)
     parser.add_argument("--output-dir", default=None)
@@ -72,6 +74,10 @@ def main() -> None:
         args.zo_random_device,
         "--lora-residency",
         args.lora_residency,
+        "--batch-invariant",
+        args.batch_invariant,
+        "--enforce-eager",
+        args.enforce_eager,
         "--train-scope",
         "lora_only",
         "--output-dir",
