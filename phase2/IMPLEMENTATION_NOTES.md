@@ -7,6 +7,7 @@
 - ✅ HF→vLLM complete parameter mapping
 - ✅ LOZOController with V cache
 - ✅ TempLoRARuntime for all layers
+- ✅ GPU-resident TempLoRARuntime path for plus/minus LoRA slots
 
 ### Simplifications (accepted vLLM scope)
 
@@ -71,10 +72,12 @@ LOZOController (HF model master weights on CPU or CUDA)
     │ 3. Build LoRA tensors for perturbation forward
     │
     ▼
-TempLoRARuntime (in-memory LoRA)
+TempLoRARuntime (CPU mock or GPU-resident LoRA)
     │
-    │ 4. Register plus/minus LoRA slots
+    │ 4. Register/select stable plus/minus LoRA IDs
     │ 5. Update LoRA tensors each step
+    │    - cpu: mock safetensors path + LoRARequest(load_inplace=True)
+    │    - gpu: LoRAModel.from_lora_tensors + model.lora_manager
     │
     ▼
 VLLMScorer
@@ -103,7 +106,7 @@ vLLM Engine (GPU)
 | Component | File | Description |
 |-----------|------|-------------|
 | LOZOController | `lozo_controller.py` | Master weights, U/V sampling, updates |
-| TempLoRARuntime | `temp_lora_runtime.py` | In-memory LoRA for perturbation |
+| TempLoRARuntime | `temp_lora_runtime.py` | CPU mock or GPU-resident LoRA for perturbation |
 | VLLMScorer | `vllm_scorer.py` | Loss computation via vLLM |
 | WeightSync | `weight_sync.py` | Sync updated weights to vLLM |
 
@@ -113,7 +116,9 @@ vLLM Engine (GPU)
 
 ### Single-process mode required
 
-**Issue**: Mock functions only work in single-process mode.
+**Issue**: CPU mock functions only work in single-process mode. The
+GPU-resident path also currently uses `LLM.apply_model()` and is validated for
+the same UniProc research harness, not general vLLM multi-process serving.
 
 **Environment variables**:
 ```bash
@@ -123,7 +128,28 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1  # Allow pickle serialization
 
 **Performance impact**: ~2-3x slower (CUDA Graphs disabled)
 
-**Future work**: Modify vLLM source to support in-memory LoRA in multi-process mode.
+**Future work**: Add a first-class vLLM worker RPC for in-memory CUDA LoRA
+tensors if multi-process serving becomes a requirement.
+
+### GPU-resident LoRA path
+
+`--lora-residency gpu` avoids the old host round trip:
+
+```text
+CUDA U/V -> CUDA LoRA A/B -> LoRAModel.from_lora_tensors(device=manager.device)
+         -> LoRAModelManager.add_adapter/activate_adapter -> GPU LoRA slots
+```
+
+This keeps vLLM's existing packed qkv handling, tensor-parallel slicing, and
+slot metadata logic. It does not write `lora_a_stacked` or `lora_b_stacked`
+directly from phase2 code.
+
+Short validation:
+- vLLM CPU mock vs GPU residency: exact seed, U/V digest, plus/minus loss, and
+  `c` match for 3/3 steps.
+- GPU-resident side-by-side vs LOZO baseline: 3/3 steps accepted,
+  `direction_digest_mismatch_steps=[]`, `max_loss_plus_diff=0.026914`,
+  `max_loss_minus_diff=0.003174`, `max_c_diff=11.869928`.
 
 ---
 

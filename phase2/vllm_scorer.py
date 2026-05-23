@@ -130,15 +130,16 @@ class VLLMScorer:
         """
         plus_name, plus_id, plus_path = temp_lora_runtime.get_plus_request_info()
         minus_name, minus_id, minus_path = temp_lora_runtime.get_minus_request_info()
+        load_inplace = getattr(temp_lora_runtime, "request_load_inplace", True)
         
         outputs = self.llm.generate(
             list(prompts) + list(prompts),
             self.sampling_params,
             lora_request=[
-                LoRARequest(plus_name, plus_id, plus_path, load_inplace=True)
+                LoRARequest(plus_name, plus_id, plus_path, load_inplace=load_inplace)
                 for _ in prompts
             ] + [
-                LoRARequest(minus_name, minus_id, minus_path, load_inplace=True)
+                LoRARequest(minus_name, minus_id, minus_path, load_inplace=load_inplace)
                 for _ in prompts
             ],
             use_tqdm=False,

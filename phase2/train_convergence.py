@@ -13,13 +13,20 @@ Aligned with LOZO baseline (third_party/LOZO/large_models/lozo.sh).
 
 import os
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_ROOT = os.path.join(PROJECT_ROOT, ".cache", "hf")
+os.environ.setdefault("HF_HOME", os.path.join(CACHE_ROOT, "home"))
+os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(CACHE_ROOT, "datasets"))
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_ROOT, "hub"))
+os.environ.setdefault("HF_XET_CACHE", os.path.join(CACHE_ROOT, "xet"))
+os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(CACHE_ROOT, "transformers"))
 os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 os.environ.setdefault("WANDB_MODE", "offline")
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 import time
 import torch
@@ -87,6 +94,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--train-scope", choices=["lora_only"], default="lora_only")
+    parser.add_argument(
+        "--lora-residency",
+        choices=["cpu", "gpu"],
+        default="cpu",
+        help="Where temporary plus/minus LoRA tensors are loaded from.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
     parser.add_argument("--no-wandb", dest="no_wandb", action="store_true", help="Disable WandB logging")
@@ -94,8 +107,11 @@ def main():
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    # Install mocks before any vLLM operations
-    install_mocks()
+    if args.lora_residency == "gpu" and not torch.cuda.is_available():
+        raise SystemExit("--lora-residency gpu requires CUDA")
+    if args.lora_residency == "cpu":
+        # Install mocks before any vLLM operations on the CPU memory-LoRA path.
+        install_mocks()
     
     # Configuration
     model_name = "facebook/opt-2.7b"
@@ -106,7 +122,6 @@ def main():
     batch_size = args.batch_size
     num_steps = args.steps
     
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"zo-vllm-r{rank_r}-{num_steps}steps-{timestamp}"
     
@@ -129,7 +144,10 @@ def main():
         )
     
     print(f"Run: {run_name}")
-    print(f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}")
+    print(
+        f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}, "
+        f"lora_residency={args.lora_residency}"
+    )
     
     # Load HF model
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -164,7 +182,12 @@ def main():
     
     controller = LOZOController(hf_model, lozo_config)
     
-    temp_lora = TempLoRARuntime(rank=rank_r, num_layers=num_layers)
+    temp_lora = TempLoRARuntime(
+        rank=rank_r,
+        num_layers=num_layers,
+        residency=args.lora_residency,
+        llm=llm,
+    )
     temp_lora.register_slots()
     
     scorer = VLLMScorer(llm, tokenizer)
@@ -237,8 +260,17 @@ def main():
 
             # Build LoRA tensors
             build_lora_t0 = time.perf_counter()
-            plus_A, plus_B = controller.build_temp_lora_tensors(directions_2d, sign=+1)
-            minus_A, minus_B = controller.build_temp_lora_tensors(directions_2d, sign=-1)
+            lora_tensor_device = "cuda" if args.lora_residency == "gpu" else "cpu"
+            plus_A, plus_B = controller.build_temp_lora_tensors(
+                directions_2d,
+                sign=+1,
+                output_device=lora_tensor_device,
+            )
+            minus_A, minus_B = controller.build_temp_lora_tensors(
+                directions_2d,
+                sign=-1,
+                output_device=lora_tensor_device,
+            )
             timing["build_lora_s"].append(time.perf_counter() - build_lora_t0)
 
             # Update LoRA slots
@@ -331,7 +363,7 @@ def main():
         })
 
     # Save local results
-    results_dir = args.output_dir or os.path.join(project_root, "results")
+    results_dir = args.output_dir or os.path.join(PROJECT_ROOT, "results")
     os.makedirs(results_dir, exist_ok=True)
     history_file = os.path.join(results_dir, f"vllm_convergence_r{rank_r}_{timestamp}.json")
     with open(history_file, "w") as f:
@@ -348,6 +380,7 @@ def main():
                 "seed": args.seed,
                 "zo_random_device": args.zo_random_device,
                 "train_scope": args.train_scope,
+                "lora_residency": args.lora_residency,
             },
             "initial_loss": float(initial_loss),
             "final_loss": float(final_loss),

@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="cpu")
     parser.add_argument("--loss-tol", type=float, default=4e-2)
     parser.add_argument("--c-tol", type=float, default=25.0)
     parser.add_argument("--output-dir", default=None)
@@ -69,6 +70,8 @@ def main() -> None:
         str(args.seed),
         "--zo-random-device",
         args.zo_random_device,
+        "--lora-residency",
+        args.lora_residency,
         "--train-scope",
         "lora_only",
         "--output-dir",

@@ -237,6 +237,7 @@ class LOZOController:
         self,
         directions_2d: Dict[str, Dict[str, torch.Tensor]],
         sign: int,
+        output_device: str | torch.device | None = "cpu",
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Build LoRA A/B tensors for plus or minus perturbation.
@@ -251,7 +252,10 @@ class LOZOController:
         Args:
             directions_2d: U/V matrices from sample_direction()
             sign: +1 for plus, -1 for minus
-        
+            output_device: Device for returned LoRA tensors. The historical
+                memory LoRA path uses CPU tensors; GPU-resident LoRA passes
+                "cuda" to avoid the host round trip.
+
         Returns:
             (layer_to_A, layer_to_B): LoRA tensors
         """
@@ -270,8 +274,11 @@ class LOZOController:
             U = d["U"]
             V = d["V"]
             
-            lora_A = V.T.contiguous().half().cpu()
-            lora_B = (sign * self.config.eps * U).contiguous().half().cpu()
+            lora_A = V.T.contiguous().half()
+            lora_B = (sign * self.config.eps * U).contiguous().half()
+            if output_device is not None:
+                lora_A = lora_A.to(output_device).contiguous()
+                lora_B = lora_B.to(output_device).contiguous()
             
             layer_to_A[name] = lora_A
             layer_to_B[name] = lora_B

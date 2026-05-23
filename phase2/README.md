@@ -21,6 +21,8 @@ path for OPT-2.7B. The current accepted configuration is:
 | CUDA RNG side-by-side U/V digest mismatch | 0 / 20 steps | PASS |
 | CUDA RNG side-by-side max plus/minus loss diff | 0.010078 / 0.010059 | PASS |
 | CUDA RNG baseline speedup vs CPU RNG | 5.20x on 20-step side-by-side | PASS |
+| GPU-resident LoRA side-by-side smoke | 3 / 3 steps accepted | PASS |
+| GPU-resident LoRA vs CPU mock short path | exact 3-step vLLM match, 1.16x step speed | PASS |
 | baseline full-scope ablation loss drop | -0.250000 vs -0.140625 | reference |
 | sample-level batch invariance max NLL diff | 0.000000000 | PASS |
 | memory LoRA write/register speedup | 88.1x / 111.9x / 159.4x | PASS |
@@ -46,6 +48,7 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   --eps 1e-3 \
   --step-interval 50 \
   --zo-random-device cuda \
+  --lora-residency cpu \
   --eval-interval 20 \
   --output-dir phase2_results/convergence/manual_r8_si50_lr3e-7 \
   --no-wandb
@@ -60,6 +63,7 @@ Run the 100-step sweep:
   --batch-size 16 \
   --eps 1e-3 \
   --eval-interval 20 \
+  --lora-residency cpu \
   --lrs 1e-7,3e-7,1e-6 \
   --ranks 8,16 \
   --step-intervals 50,100 \
@@ -91,6 +95,7 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_real_lozo_baseline_s
   --steps 3 \
   --eval-interval 3 \
   --zo-random-device cuda \
+  --lora-residency gpu \
   --output-dir phase2_results/convergence/acceptance_side_by_side_smoke
 
 CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python scripts/test_batch_invariance.py \
@@ -122,7 +127,10 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_memory_lora_speed.py
   only exists as a one-off environment override and accepts whatever ID string
   the current allocation requires.
 - `TempLoRARuntime` uses stable plus/minus LoRA IDs and vLLM
-  `LoRARequest(load_inplace=True)` to avoid stale LoRA cache hits.
+  `LoRARequest(load_inplace=True)` on the CPU mock path to avoid stale LoRA
+  cache hits. `--lora-residency gpu` bypasses the mock safetensors path and
+  loads PEFT-format CUDA tensors directly into vLLM's existing GPU LoRA slots
+  via `LoRAModel.from_lora_tensors` and `model.lora_manager`.
 - `LOZOController` supports `train_scope=lora_only` for vLLM-compatible
   Linear-only perturbations and `train_scope=full` for HF baseline ablations
   that include embeddings and 1D parameters.
@@ -167,3 +175,16 @@ Baseline train-scope ablation, 100 steps, `rank=8`, `lr=3e-7`,
 
 The full baseline, which includes embeddings and 1D parameters, drops loss
 faster in this 100-step run, but it is not an order-of-magnitude difference.
+
+GPU-resident LoRA smoke, `rank=8`, `lr=1e-7`, `eps=1e-3`,
+`step_interval=100`, `batch_size=2`, CUDA RNG:
+
+| check | result |
+|---|---:|
+| vLLM CPU mock vs GPU residency seed/digest/loss/c mismatch | 0 / 3 steps |
+| CPU mock `step_s_mean` | 0.276578 |
+| GPU residency `step_s_mean` | 0.238013 |
+| CPU mock `score_s_mean` | 0.108493 |
+| GPU residency `score_s_mean` | 0.061117 |
+| GPU side-by-side max plus/minus loss diff vs baseline | 0.026914 / 0.003174 |
+| GPU side-by-side max c diff vs baseline | 11.869928 |

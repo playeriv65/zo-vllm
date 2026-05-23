@@ -28,6 +28,7 @@ rank=8 或 16                    # LoRA rank
 U, V ~ N(0,1)                   # 随机矩阵分布
 seed=42                         # 默认step seed流，可通过--seed覆盖
 zo_random_device=cuda            # U/V/z采样设备；cpu仅用于复现旧CPU-RNG结果
+lora_residency=cpu/gpu           # 临时plus/minus LoRA加载路径；gpu已通过smoke验证
 ```
 
 ## 构建命令
@@ -154,10 +155,11 @@ llm.generate(prompts, lora_request=LoRARequest("name", lora_id, path))
 
 ### 注意事项
 
-1. **GPU版本暂缓**：CPU版本已足够快（LoRA tensor <1MB，拷贝开销极小）
-2. **不需要LRU**：LOZO训练每次只用一个扰动LoRA，内存占用小
-3. **类型兼容**：Mock函数需处理 `str` 和 `pathlib.Path` 类型
-4. **context manager**：`FakeSafeFile` 必须实现 `__enter__`/`__exit__`
+1. **CPU mock保留**：`register_memory_lora_cpu()` 仍用于回归和旧验收结果
+2. **GPU residency可用**：`--lora-residency gpu` 直接把CUDA LoRA tensor加载进vLLM GPU LoRA slots
+3. **不需要LRU**：LOZO训练每次只用plus/minus扰动LoRA，内存占用小
+4. **类型兼容**：Mock函数需处理 `str` 和 `pathlib.Path` 类型
+5. **context manager**：`FakeSafeFile` 必须实现 `__enter__`/`__exit__`
 
 ## 下一步
 
@@ -239,6 +241,16 @@ Baseline-only 100-step 消融（rank=8, lr=3e-7, eps=1e-3, step_interval=50, bat
 | `full`（含embedding/1D） | 5.132812 | 4.882812 | -0.250000 | 0.1340 |
 
 Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍以 `lora_only` 为验收范围。
+
+### GPU-resident LoRA路径
+
+`--lora-residency gpu` 绕过CPU mock safetensors路径：
+`CUDA U/V -> CUDA LoRA A/B -> LoRAModel.from_lora_tensors(device=manager.device) -> model.lora_manager.activate_adapter()`。
+
+短验证结果：
+- vLLM CPU mock vs GPU residency：3/3 steps 的 seed、U/V digest、loss_plus/loss_minus、`c` 完全一致
+- 3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.026914`，`max_loss_minus_diff=0.003174`，`max_c_diff=11.869928`
+- batch=2短跑速度：CPU mock `step_s_mean=0.276578`，GPU residency `step_s_mean=0.238013`
 
 ## Phase 2 Milestone 4: 梯度对齐验证 完成 ✅
 

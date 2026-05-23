@@ -94,6 +94,7 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             "HF_HOME": str(cache_root / "home"),
             "HF_DATASETS_CACHE": str(cache_root / "datasets"),
             "HF_HUB_CACHE": str(cache_root / "hub"),
+            "HF_XET_CACHE": str(cache_root / "xet"),
             "TRANSFORMERS_CACHE": str(cache_root / "transformers"),
             "WANDB_MODE": "offline",
             "WANDB_DISABLED": "true",
@@ -113,6 +114,8 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             sys.executable,
             str(PROJECT_ROOT / "phase2" / "train_convergence.py"),
             *build_common_args(args, output_dir),
+            "--lora-residency",
+            args.lora_residency,
         ]
     else:
         raise ValueError(f"unknown backend: {name}")
@@ -303,6 +306,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
+    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="cpu")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
