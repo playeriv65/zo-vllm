@@ -50,6 +50,10 @@ def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, st
         args.batch_invariant,
         "--enforce-eager",
         args.enforce_eager,
+        "--weight-update",
+        args.weight_update,
+        "--weight-update-precision",
+        args.weight_update_precision,
         "--output-dir",
         str(output_dir),
         "--no-wandb",
@@ -110,6 +114,7 @@ def row_for(run_dir: Path, config: dict, summary: dict) -> dict:
         "steps_per_s": 1.0 / timing["step_s_mean"] if timing.get("step_s_mean") else 0.0,
         "score_s_mean": timing.get("score_s_mean", 0.0),
         "sync_s_mean": timing.get("sync_s_mean", 0.0),
+        "weight_update_s_mean": timing.get("weight_update_s_mean", 0.0),
     }
     if "alignment" in summary:
         row.update(
@@ -137,6 +142,7 @@ def write_sweep_summary(rows: list[dict], output_root: Path) -> None:
         "step_s_mean",
         "score_s_mean",
         "sync_s_mean",
+        "weight_update_s_mean",
         "run_dir",
     ]
     optional_fields = [
@@ -182,6 +188,8 @@ def main() -> None:
     parser.add_argument("--step-intervals", default="50,100")
     parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
     parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
+    parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
+    parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
     parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-root", default=None)

@@ -31,6 +31,8 @@ seed=42                         # 默认step seed流，可通过--seed覆盖
 zo_random_device=cuda            # U/V/z采样设备；cpu仅用于复现旧CPU-RNG结果
 lora_residency=gpu               # 默认GPU-resident；cpu仅用于旧mock路径回归
 lora_injection=direct            # 训练默认固定slot原位写LoRA；manager仅作回退/对比
+weight_update=direct             # 可选：vLLM worker内原位更新base weights
+weight_update_precision=param    # 最快；float32用于对齐旧controller数学
 ```
 
 ## 构建命令
@@ -183,7 +185,7 @@ llm.generate(prompts, lora_request=LoRARequest("name", lora_id, path))
 | `LOZOController` | Master weights + U/V采样 + V cache | 仅管理 Linear 2D weights，过滤 embeddings/1D params |
 | `TempLoRARuntime` | In-memory LoRA slots | plus/minus扰动，PEFT格式 |
 | `VLLMScorer` | Loss计算 | prompt_logprobs |
-| `WeightSync` | 权重同步 | unwrap_lora_module + packed qkv_proj |
+| `WeightSync` | 权重同步/原位更新 | unwrap_lora_module + packed qkv_proj |
 
 ### Weight Sync 关键逻辑
 
@@ -194,13 +196,13 @@ def unwrap_lora_module(module):
         return module.base_layer
     return module
 
-# qkv_proj packed weight: [3*hidden_size, hidden_size]
-# Slice: q[0:H], k[H:2H], v[2H:3H]
-packed_weight = param.data.clone()
-packed_weight[0:hidden_size, :] = tensor_q  # q_proj
-packed_weight[hidden_size:2*hidden_size, :] = tensor_k  # k_proj
-packed_weight[2*hidden_size:3*hidden_size, :] = tensor_v  # v_proj
-param.data.copy_(packed_weight)
+# copy path: qkv_proj packed weight [3*hidden_size, hidden_size]
+param.data[0:hidden_size, :].copy_(tensor_q)
+param.data[hidden_size:2 * hidden_size, :].copy_(tensor_k)
+param.data[2 * hidden_size:3 * hidden_size, :].copy_(tensor_v)
+
+# direct path: apply LOZO update in the vLLM worker
+param_slice.addmm_(U, V.T, alpha=-lr * c)
 ```
 
 ### 测试结果
@@ -255,6 +257,38 @@ Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍�
 - direct slot updater 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.009428`，`max_loss_minus_diff=0.009200`，`max_c_diff=6.066894`
 - direct vs manager 20-step：`lora_update_s_mean` `0.010747` vs `0.014718`（direct快 `1.37x`），`step_s_mean` `0.209159` vs `0.214355`（整体快 `1.03x`）
 
+### Direct base-weight update路径
+
+`--weight-update direct --weight-update-precision param` 在vLLM worker内对base weight做原位低秩更新，跳过旧的 `LOZOController.apply_update_to_master()` + 全量 `WeightSync.sync()`：
+
+```text
+W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
+```
+
+短验证结果：
+- fake packed-qkv 单测：`float32`模式与旧controller公式逐元素一致
+- 2026-05-23正式验收：
+  - 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.010167`，`max_loss_minus_diff=0.009344`，`max_c_diff=5.898678`
+  - 100-step vLLM-only：`copy` `step_s_mean=0.2032`，`direct/float32` `0.1363`，`direct/param` `0.1054`（含debug digest）；关闭debug-only U/V digest后，正式速度为 `0.0842`；`weight_update_s_mean` `0.1015 -> 0.0077`（快 `13.22x`）
+  - 300-step推荐配置：baseline `5.132812 -> 4.832031`，vLLM direct/param `5.132858 -> 4.831568`，vLLM达到baseline loss drop的 `100.17%`，final diff `0.000464`
+
+### 当前vLLM瓶颈
+
+正式测速默认关闭 `direction_digest`；side-by-side wrapper 会显式开启，用于确认每步 U/V 扰动完全一致。最新100-step digest-off计时：
+
+| component | mean s/step |
+|---|---:|
+| total step | 0.0842 |
+| score | 0.0568 |
+| score_generate | 0.0567 |
+| score_postprocess | 0.000073 |
+| direction sampling | 0.0024 |
+| build_lora | 0.0067 |
+| lora_update | 0.0104 |
+| weight_update | 0.0078 |
+
+结论：当前主要瓶颈在 vLLM `generate(prompt_logprobs=1)` scoring 路径；Python loss后处理和request构造可以忽略。
+
 ### vLLM执行参数消融
 
 20-step vLLM-only 计时（rank=8, lr=1e-7, eps=1e-3, step_interval=100, batch=16, CUDA RNG, GPU-resident manager路径；direct更新器实现前结果）：
@@ -307,9 +341,9 @@ rank=8, step_interval=50, lr=3e-7, eps=1e-3, batch_size=16
 - high-signal sign match: `97.6%`
 
 训练速度：
-- baseline: `0.4915 s/step`，约 `2.03 steps/s`
-- vLLM: `0.4139 s/step`，约 `2.42 steps/s`
-- vLLM 约快 `1.19x`
+- instrumented baseline: `0.1149 s/step`
+- vLLM direct/param, digest off: `0.0842 s/step`
+- 原始风格 LOZO baseline（full scope, CUDA RNG, plus/minus两次forward，无额外base loss）100-step约 `0.0937 s/step`；因此速度对比必须区分原始baseline和side-by-side instrumented baseline。
 
 批量不变性：
 - batch sizes: `1, 2, 4, 8`

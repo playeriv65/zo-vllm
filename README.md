@@ -11,8 +11,11 @@ training-speed validation. The recommended configuration is:
 rank=8, step_interval=50, lr=3e-7, eps=1e-3, batch_size=16
 ```
 
-300-step vLLM training reaches 98.6% of the baseline loss drop and runs at
-2.42 steps/s versus 2.03 steps/s for the baseline. See
+Latest 300-step direct base-weight validation reaches 100.2% of the
+instrumented baseline loss drop (`5.132858 -> 4.831568` for vLLM,
+`5.132812 -> 4.832031` for baseline). The speed path now keeps U/V digest
+hashing off by default and runs at 0.0842 s/step on the 100-step timing check;
+digest hashing remains enabled only for strict side-by-side alignment. See
 [`phase2/README.md`](phase2/README.md) for acceptance results, commands, and
 validation notes.
 
@@ -28,6 +31,14 @@ The default GPU path uses `--lora-injection direct`: it initializes fixed
 plus/minus slots once and overwrites their LoRA tensors in place during
 training, bypassing per-step LoRA manager reload/activation. The older manager
 path remains available with `--lora-injection manager`.
+
+The training loop also has a direct base-weight update path
+(`--weight-update direct --weight-update-precision param`) that applies the
+LOZO low-rank update inside the vLLM worker with in-place `addmm_`, avoiding
+the old external-master plus full-weight sync step. In the current 100-step
+timing check this reduced vLLM step time from 0.203s to 0.084s after removing
+debug-only U/V digest hashing from the speed path. Strict side-by-side tests
+still enable digest hashing explicitly.
 
 ## Structure
 

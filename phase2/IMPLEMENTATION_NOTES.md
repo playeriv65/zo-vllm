@@ -89,14 +89,16 @@ VLLMScorer
 LOZOController
     │
     │ 7. Compute c = (L+ - L-) / (2*eps)
-    │ 8. Update master weights
+    │ 8a. copy path: update external master weights
+    │ 8b. direct path: keep vLLM base weights as master
     │
     ▼
 WeightSync
     │
-    │ 9. Map HF names → vLLM names
-    │ 10. Write q/k/v via shard_id
-    │ 11. Write other params directly
+    │ 9a. copy path: map HF names → vLLM names, copy full updated tensors
+    │ 9b. direct path: map HF names → vLLM names, apply in-place low-rank update
+    │ 10. Handle packed q/k/v slices
+    │ 11. Write or update other params directly
     │
     ▼
 vLLM Engine (GPU)
@@ -109,7 +111,7 @@ vLLM Engine (GPU)
 | LOZOController | `lozo_controller.py` | Master weights, U/V sampling, updates |
 | TempLoRARuntime | `temp_lora_runtime.py` | CPU mock or GPU-resident LoRA for perturbation |
 | VLLMScorer | `vllm_scorer.py` | Loss computation via vLLM |
-| WeightSync | `weight_sync.py` | Sync updated weights to vLLM |
+| WeightSync | `weight_sync.py` | Sync updated weights or apply direct vLLM in-place updates |
 
 ---
 
@@ -158,6 +160,46 @@ Short validation:
   `max_loss_plus_diff=0.009428`, `max_loss_minus_diff=0.009200`,
   `max_c_diff=6.066894` under the default
   `batch_invariant=0,enforce_eager=1` training mode.
+
+### Direct base-weight update path
+
+`--weight-update direct` skips the old sequence:
+
+```text
+LOZOController.apply_update_to_master()
+    -> WeightSync.sync(full_updated_weights)
+```
+
+and instead applies the update in the vLLM worker:
+
+```text
+W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
+```
+
+For packed OPT q/k/v weights, the update is applied to the corresponding
+`qkv_proj.weight` slice. For other Linear weights, it is applied directly to
+the base layer weight. The `float32` precision mode mirrors the controller's
+math; the faster `param` precision mode uses the vLLM parameter dtype and true
+in-place `addmm_`.
+
+Short validation:
+- Fake packed-qkv unit check: exact equality with the controller formula in
+  `float32` mode.
+- 20-step `direct/param` side-by-side vs LOZO baseline accepted:
+  `direction_digest_mismatch_steps=[]`, `sign_fail_steps=[]`,
+  `max_loss_plus_diff=0.010216`, `max_loss_minus_diff=0.010008`,
+  `max_c_diff=6.163657`.
+- 100-step vLLM-only `direct/param` vs `copy`: seed and U/V digests matched
+  100/100 steps; step time improved from `0.2044s` to `0.1109s`, and
+  `weight_update_s_mean` improved from `0.1014s` to `0.0079s`.
+- The normal speed path keeps `direction_digest` off. Digest hashing is a
+  side-by-side/debug check that copies U/V from GPU to CPU and costs about
+  `0.021s/step`. With digest disabled, the 100-step `direct/param` timing is
+  `0.0842s/step`.
+- Scoring is now timed internally. The digest-off run measured
+  `score_s_mean=0.0568`, `score_generate_s_mean=0.0567`, and
+  `score_postprocess_s_mean=0.000073`, so the bottleneck is vLLM
+  `generate(prompt_logprobs=1)`.
 - GPU direct vs manager, 20 steps: `lora_update_s_mean` improved from
   `0.014718` to `0.010747` (`1.37x`), with identical step seeds and U/V
   digests.

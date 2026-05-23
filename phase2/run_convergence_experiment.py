@@ -122,7 +122,13 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             args.batch_invariant,
             "--enforce-eager",
             args.enforce_eager,
+            "--weight-update",
+            args.weight_update,
+            "--weight-update-precision",
+            args.weight_update_precision,
         ]
+        if args.direction_digest:
+            cmd.append("--direction-digest")
     else:
         raise ValueError(f"unknown backend: {name}")
 
@@ -178,8 +184,12 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
             loss_minus_diff = abs(float(b_step["loss_minus"]) - float(v_step["loss_minus"]))
             c_diff = abs(b_c - v_c)
             seed_match = b_step.get("seed") == v_step.get("seed")
-            direction_digest_match = (
+            direction_digest_checked = (
                 b_step.get("direction_digest") is not None
+                and v_step.get("direction_digest") is not None
+            )
+            direction_digest_match = (
+                direction_digest_checked
                 and b_step.get("direction_digest") == v_step.get("direction_digest")
             )
             sign_match = (b_c == 0.0 and v_c == 0.0) or (b_c * v_c > 0.0)
@@ -190,6 +200,7 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
                     "baseline_seed": b_step.get("seed"),
                     "vllm_seed": v_step.get("seed"),
                     "seed_match": seed_match,
+                    "direction_digest_checked": direction_digest_checked,
                     "direction_digest_match": direction_digest_match,
                     "baseline_loss_plus": float(b_step["loss_plus"]),
                     "vllm_loss_plus": float(v_step["loss_plus"]),
@@ -214,7 +225,9 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
                 item["step"] for item in step_pairs if not item["seed_match"]
             ],
             "direction_digest_mismatch_steps": [
-                item["step"] for item in step_pairs if not item["direction_digest_match"]
+                item["step"]
+                for item in step_pairs
+                if item["direction_digest_checked"] and not item["direction_digest_match"]
             ],
             "sign_match_rate": (
                 sum(item["sign_match"] for item in step_pairs) / len(step_pairs)
@@ -247,8 +260,8 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
     )
 
     lines = [
-        "| backend | initial | final | change | step_s_mean | score_s_mean | sync_s_mean |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| backend | initial | final | change | step_s_mean | score_s_mean | weight_update_s_mean | sync_s_mean |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for backend, data in results.items():
         if not data:
@@ -257,7 +270,9 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
         lines.append(
             f"| {backend} | {data['initial_loss']:.6f} | {data['final_loss']:.6f} | "
             f"{data['loss_change']:.6f} | {timing.get('step_s_mean', 0.0):.4f} | "
-            f"{timing.get('score_s_mean', 0.0):.4f} | {timing.get('sync_s_mean', 0.0):.4f} |"
+            f"{timing.get('score_s_mean', 0.0):.4f} | "
+            f"{timing.get('weight_update_s_mean', 0.0):.4f} | "
+            f"{timing.get('sync_s_mean', 0.0):.4f} |"
         )
     if baseline and vllm:
         alignment = summary["alignment"]
@@ -282,9 +297,16 @@ def compact_summary(results: dict[str, dict | None], output_dir: Path) -> None:
             ]
         )
         for item in alignment["step_pairs"]:
+            digest_status = (
+                "ok"
+                if item["direction_digest_match"]
+                else "skip"
+                if not item["direction_digest_checked"]
+                else "FAIL"
+            )
             lines.append(
                 f"| {item['step']} | {'ok' if item['seed_match'] else 'FAIL'} | "
-                f"{'ok' if item['direction_digest_match'] else 'FAIL'} | "
+                f"{digest_status} | "
                 f"{item['baseline_loss_plus']:.6f} | {item['vllm_loss_plus']:.6f} | "
                 f"{item['loss_plus_diff']:.6f} | {item['baseline_loss_minus']:.6f} | "
                 f"{item['vllm_loss_minus']:.6f} | {item['loss_minus_diff']:.6f} | "
@@ -314,6 +336,13 @@ def main() -> None:
     parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
     parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
     parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
+    parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
+    parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
+    parser.add_argument(
+        "--direction-digest",
+        action="store_true",
+        help="Enable vLLM U/V digest hashing for strict side-by-side alignment.",
+    )
     parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-dir", default=None)

@@ -116,6 +116,23 @@ def main():
         default="auto",
         help="LoRA update path. auto selects direct for GPU and manager for CPU.",
     )
+    parser.add_argument(
+        "--weight-update",
+        choices=["copy", "direct"],
+        default="direct",
+        help="Base weight update path. copy keeps the external master+sync path; direct updates vLLM weights in place.",
+    )
+    parser.add_argument(
+        "--weight-update-precision",
+        choices=["float32", "param"],
+        default="param",
+        help="Precision for --weight-update direct. float32 matches the controller update; param uses the vLLM weight dtype in-place.",
+    )
+    parser.add_argument(
+        "--direction-digest",
+        action="store_true",
+        help="Hash every step's U/V tensors for side-by-side alignment checks. Disabled for speed.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
     parser.add_argument("--no-wandb", dest="no_wandb", action="store_true", help="Disable WandB logging")
@@ -174,6 +191,8 @@ def main():
         f"Config: rank={rank_r}, lr={lr}, eps={zo_eps}, steps={num_steps}, "
         f"lora_residency={args.lora_residency}, "
         f"lora_injection={lora_injection}, "
+        f"weight_update={args.weight_update}, "
+        f"weight_update_precision={args.weight_update_precision}, "
         f"batch_invariant={args.batch_invariant}, "
         f"enforce_eager={args.enforce_eager}"
     )
@@ -258,8 +277,17 @@ def main():
         "direction_s": [],
         "build_lora_s": [],
         "score_s": [],
+        "score_request_build_s": [],
+        "score_generate_s": [],
+        "score_postprocess_s": [],
+        "score_postprocess_plus_s": [],
+        "score_postprocess_minus_s": [],
+        "score_num_outputs": [],
+        "score_num_prompt_positions": [],
+        "score_num_loss_tokens": [],
         "master_update_s": [],
         "sync_s": [],
+        "weight_update_s": [],
         "lora_update_s": [],
     }
 
@@ -282,10 +310,12 @@ def main():
             # Sample directions
             direction_t0 = time.perf_counter()
             directions_2d, directions_1d = controller.sample_direction(random_seed)
-            direction_digest = digest_named_uv(
-                (name, item["U"], item["V"])
-                for name, item in directions_2d.items()
-            )
+            direction_digest = None
+            if args.direction_digest:
+                direction_digest = digest_named_uv(
+                    (name, item["U"], item["V"])
+                    for name, item in directions_2d.items()
+                )
             timing["direction_s"].append(time.perf_counter() - direction_t0)
 
             # Build LoRA tensors
@@ -310,23 +340,40 @@ def main():
 
             # Compute loss
             score_t0 = time.perf_counter()
-            loss_plus, loss_minus = scorer.score_plus_minus(batch_prompts, temp_lora)
+            loss_plus, loss_minus, score_detail = scorer.score_plus_minus_detailed(
+                batch_prompts, temp_lora
+            )
             timing["score_s"].append(time.perf_counter() - score_t0)
+            for key, value in score_detail.items():
+                timing[key].append(value)
 
             # Compute c
             c = controller.compute_c(loss_plus, loss_minus)
 
-            # Update master weights
-            master_update_t0 = time.perf_counter()
-            updated_weights = controller.apply_update_to_master(
-                directions_2d, directions_1d, c
-            )
-            timing["master_update_s"].append(time.perf_counter() - master_update_t0)
+            # Update base weights
+            weight_update_t0 = time.perf_counter()
+            if args.weight_update == "copy":
+                master_update_t0 = time.perf_counter()
+                updated_weights = controller.apply_update_to_master(
+                    directions_2d, directions_1d, c
+                )
+                timing["master_update_s"].append(time.perf_counter() - master_update_t0)
 
-            # Sync to vLLM
-            sync_t0 = time.perf_counter()
-            weight_sync.sync(updated_weights)
-            timing["sync_s"].append(time.perf_counter() - sync_t0)
+                sync_t0 = time.perf_counter()
+                weight_sync.sync(updated_weights)
+                timing["sync_s"].append(time.perf_counter() - sync_t0)
+            else:
+                timing["master_update_s"].append(0.0)
+                weight_sync.apply_lozo_update(
+                    directions_2d,
+                    directions_1d,
+                    c=c,
+                    lr=lozo_config.lr,
+                    weight_decay=lozo_config.weight_decay,
+                    precision=args.weight_update_precision,
+                )
+                timing["sync_s"].append(0.0)
+            timing["weight_update_s"].append(time.perf_counter() - weight_update_t0)
             timing["step_s"].append(time.perf_counter() - step_t0)
 
             # Record history
@@ -341,8 +388,17 @@ def main():
                 "direction_s": float(timing["direction_s"][-1]),
                 "build_lora_s": float(timing["build_lora_s"][-1]),
                 "score_s": float(timing["score_s"][-1]),
+                "score_request_build_s": float(timing["score_request_build_s"][-1]),
+                "score_generate_s": float(timing["score_generate_s"][-1]),
+                "score_postprocess_s": float(timing["score_postprocess_s"][-1]),
+                "score_postprocess_plus_s": float(timing["score_postprocess_plus_s"][-1]),
+                "score_postprocess_minus_s": float(timing["score_postprocess_minus_s"][-1]),
+                "score_num_outputs": int(timing["score_num_outputs"][-1]),
+                "score_num_prompt_positions": int(timing["score_num_prompt_positions"][-1]),
+                "score_num_loss_tokens": int(timing["score_num_loss_tokens"][-1]),
                 "master_update_s": float(timing["master_update_s"][-1]),
                 "sync_s": float(timing["sync_s"][-1]),
+                "weight_update_s": float(timing["weight_update_s"][-1]),
                 "lora_update_s": float(timing["lora_update_s"][-1]),
             })
 
@@ -412,8 +468,11 @@ def main():
                 "train_scope": args.train_scope,
                 "lora_residency": args.lora_residency,
                 "lora_injection": lora_injection,
+                "weight_update": args.weight_update,
+                "weight_update_precision": args.weight_update_precision,
                 "batch_invariant": int(args.batch_invariant),
                 "enforce_eager": int(args.enforce_eager),
+                "direction_digest": bool(args.direction_digest),
             },
             "initial_loss": float(initial_loss),
             "final_loss": float(final_loss),
@@ -426,8 +485,17 @@ def main():
                 "direction_s_mean": float(np.mean(timing["direction_s"])) if timing["direction_s"] else 0.0,
                 "build_lora_s_mean": float(np.mean(timing["build_lora_s"])) if timing["build_lora_s"] else 0.0,
                 "score_s_mean": float(np.mean(timing["score_s"])) if timing["score_s"] else 0.0,
+                "score_request_build_s_mean": float(np.mean(timing["score_request_build_s"])) if timing["score_request_build_s"] else 0.0,
+                "score_generate_s_mean": float(np.mean(timing["score_generate_s"])) if timing["score_generate_s"] else 0.0,
+                "score_postprocess_s_mean": float(np.mean(timing["score_postprocess_s"])) if timing["score_postprocess_s"] else 0.0,
+                "score_postprocess_plus_s_mean": float(np.mean(timing["score_postprocess_plus_s"])) if timing["score_postprocess_plus_s"] else 0.0,
+                "score_postprocess_minus_s_mean": float(np.mean(timing["score_postprocess_minus_s"])) if timing["score_postprocess_minus_s"] else 0.0,
+                "score_num_outputs_mean": float(np.mean(timing["score_num_outputs"])) if timing["score_num_outputs"] else 0.0,
+                "score_num_prompt_positions_mean": float(np.mean(timing["score_num_prompt_positions"])) if timing["score_num_prompt_positions"] else 0.0,
+                "score_num_loss_tokens_mean": float(np.mean(timing["score_num_loss_tokens"])) if timing["score_num_loss_tokens"] else 0.0,
                 "master_update_s_mean": float(np.mean(timing["master_update_s"])) if timing["master_update_s"] else 0.0,
                 "sync_s_mean": float(np.mean(timing["sync_s"])) if timing["sync_s"] else 0.0,
+                "weight_update_s_mean": float(np.mean(timing["weight_update_s"])) if timing["weight_update_s"] else 0.0,
                 "lora_update_s_mean": float(np.mean(timing["lora_update_s"])) if timing["lora_update_s"] else 0.0,
             },
         }, f, indent=2)

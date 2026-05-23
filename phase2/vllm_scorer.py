@@ -4,6 +4,7 @@ vLLM Scorer - Compute loss using vLLM with prompt logprobs.
 Reuses Phase 1 loss computation logic.
 """
 
+import time
 from typing import List, Dict, Optional
 import torch
 from vllm import LLM, SamplingParams
@@ -51,6 +52,44 @@ def compute_nll_from_prompt_logprobs(outputs, tokenizer) -> float:
     if total_tokens == 0:
         return 0.0
     return total_nll / total_tokens
+
+
+def compute_nll_from_prompt_logprobs_detailed(outputs, tokenizer) -> tuple[float, dict]:
+    """Compute NLL and return lightweight postprocess counters/timing."""
+    t0 = time.perf_counter()
+    total_nll = 0.0
+    total_tokens = 0
+    total_positions = 0
+
+    for output in outputs:
+        prompt_logprobs = output.prompt_logprobs
+        if prompt_logprobs is None:
+            continue
+
+        prompt_token_ids = getattr(output, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            continue
+
+        for j in range(1, len(prompt_logprobs)):
+            total_positions += 1
+            token_logprobs = prompt_logprobs[j]
+            if token_logprobs is None:
+                continue
+
+            token_id = prompt_token_ids[j]
+            if token_id in token_logprobs:
+                val = token_logprobs[token_id]
+                logprob = val.logprob if hasattr(val, "logprob") else float(val)
+                total_nll += -logprob
+                total_tokens += 1
+
+    loss = total_nll / total_tokens if total_tokens else 0.0
+    return loss, {
+        "postprocess_s": time.perf_counter() - t0,
+        "num_outputs": len(outputs),
+        "num_prompt_positions": total_positions,
+        "num_loss_tokens": total_tokens,
+    }
 
 
 class VLLMScorer:
@@ -149,3 +188,55 @@ class VLLMScorer:
         loss_minus = compute_nll_from_prompt_logprobs(outputs[split:], self.tokenizer)
         
         return loss_plus, loss_minus
+
+    def score_plus_minus_detailed(
+        self,
+        prompts: List[str],
+        temp_lora_runtime,
+    ) -> tuple[float, float, dict]:
+        """Compute plus/minus NLL with a timing breakdown for profiling."""
+        plus_name, plus_id, plus_path = temp_lora_runtime.get_plus_request_info()
+        minus_name, minus_id, minus_path = temp_lora_runtime.get_minus_request_info()
+        load_inplace = getattr(temp_lora_runtime, "request_load_inplace", True)
+        prompt_list = list(prompts)
+
+        request_build_t0 = time.perf_counter()
+        request_prompts = prompt_list + prompt_list
+        lora_requests = [
+            LoRARequest(plus_name, plus_id, plus_path, load_inplace=load_inplace)
+            for _ in prompt_list
+        ] + [
+            LoRARequest(minus_name, minus_id, minus_path, load_inplace=load_inplace)
+            for _ in prompt_list
+        ]
+        request_build_s = time.perf_counter() - request_build_t0
+
+        generate_t0 = time.perf_counter()
+        outputs = self.llm.generate(
+            request_prompts,
+            self.sampling_params,
+            lora_request=lora_requests,
+            use_tqdm=False,
+        )
+        generate_s = time.perf_counter() - generate_t0
+
+        split = len(prompt_list)
+        loss_plus, plus_stats = compute_nll_from_prompt_logprobs_detailed(
+            outputs[:split], self.tokenizer
+        )
+        loss_minus, minus_stats = compute_nll_from_prompt_logprobs_detailed(
+            outputs[split:], self.tokenizer
+        )
+        postprocess_s = plus_stats["postprocess_s"] + minus_stats["postprocess_s"]
+        return loss_plus, loss_minus, {
+            "score_request_build_s": request_build_s,
+            "score_generate_s": generate_s,
+            "score_postprocess_s": postprocess_s,
+            "score_postprocess_plus_s": plus_stats["postprocess_s"],
+            "score_postprocess_minus_s": minus_stats["postprocess_s"],
+            "score_num_outputs": plus_stats["num_outputs"] + minus_stats["num_outputs"],
+            "score_num_prompt_positions": (
+                plus_stats["num_prompt_positions"] + minus_stats["num_prompt_positions"]
+            ),
+            "score_num_loss_tokens": plus_stats["num_loss_tokens"] + minus_stats["num_loss_tokens"],
+        }

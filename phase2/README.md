@@ -11,19 +11,20 @@ path for OPT-2.7B. The current accepted configuration is:
 
 | check | result | status |
 |---|---:|---|
-| baseline/vLLM initial loss diff | 0.000241 | PASS |
-| 300-step vLLM loss drop vs baseline | 98.6% | PASS |
-| 300-step final loss diff | 0.003750 | PASS |
-| 300-step sign match | 96.7% | PASS |
-| 300-step high-signal sign match | 97.6% | PASS |
-| vLLM training speed | 2.42 steps/s | PASS |
-| baseline training speed | 2.03 steps/s | reference |
+| latest baseline/vLLM initial loss diff | 0.000045 | PASS |
+| latest 300-step vLLM loss drop vs baseline | 100.2% | PASS |
+| latest 300-step final loss diff | 0.000464 | PASS |
+| latest vLLM training speed, digest off | 0.0842 s/step | PASS |
+| latest instrumented baseline training speed | 0.1149 s/step | reference |
+| 20-step direct weight side-by-side | 20 / 20 steps accepted | PASS |
 | CUDA RNG side-by-side U/V digest mismatch | 0 / 20 steps | PASS |
 | CUDA RNG side-by-side max plus/minus loss diff | 0.010078 / 0.010059 | PASS |
 | CUDA RNG baseline speedup vs CPU RNG | 5.20x on 20-step side-by-side | PASS |
 | GPU-resident LoRA side-by-side smoke | 3 / 3 steps accepted | PASS |
 | GPU direct injection side-by-side | 20 / 20 steps accepted | PASS |
 | GPU direct injection lora_update speedup | 1.37x vs manager | PASS |
+| direct base-weight update step speedup | 1.93x vs copy path | PASS |
+| direct base-weight update weight-update speedup | 13.22x vs copy path | PASS |
 | GPU-resident LoRA vs CPU mock short path | exact 3-step vLLM match, 1.16x step speed | PASS |
 | baseline full-scope ablation loss drop | -0.250000 vs -0.140625 | reference |
 | sample-level batch invariance max NLL diff | 0.000000000 | PASS |
@@ -32,6 +33,12 @@ path for OPT-2.7B. The current accepted configuration is:
 The formal local result table is generated at
 `phase2_results/convergence/official_results.md`. `phase2_results/` is ignored
 because it contains run logs and JSON artifacts.
+
+Latest direct base-weight validation artifact:
+`phase2_results/convergence/weight_update_acceptance_20260523/README.md`.
+
+Latest digest-off vLLM timing artifact:
+`phase2_results/convergence/no_digest_scoring_detail_20260523/vllm_convergence_r8_20260523_132259.json`.
 
 ## Main Entry Points
 
@@ -51,6 +58,8 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   --zo-random-device cuda \
   --lora-residency gpu \
   --lora-injection direct \
+  --weight-update direct \
+  --weight-update-precision param \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --eval-interval 20 \
@@ -69,6 +78,8 @@ Run the 100-step sweep:
   --eval-interval 20 \
   --lora-residency gpu \
   --lora-injection direct \
+  --weight-update direct \
+  --weight-update-precision param \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --lrs 1e-7,3e-7,1e-6 \
@@ -104,6 +115,8 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_real_lozo_baseline_s
   --zo-random-device cuda \
   --lora-residency gpu \
   --lora-injection direct \
+  --weight-update direct \
+  --weight-update-precision param \
   --batch-invariant 0 \
   --enforce-eager 1 \
   --output-dir phase2_results/convergence/acceptance_side_by_side_smoke
@@ -158,6 +171,10 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/test_memory_lora_speed.py
   that include embeddings and 1D parameters.
 - `WeightSync` copies packed QKV slices in place instead of cloning the full
   packed tensor per layer.
+- `--weight-update direct` applies the LOZO base-weight update inside the vLLM
+  worker, so vLLM's base weights become the training master state. The `copy`
+  path remains available for regression against the older external-master plus
+  full-weight sync flow.
 
 ## Recent Stepwise And Ablation Results
 
@@ -225,7 +242,57 @@ the manager path, `lora_update_s_mean` improved by `1.37x` and total loop time
 by `1.03x`; the modest total speedup is expected because scoring and weight
 sync dominate the step time.
 
-Direct side-by-side vs LOZO baseline, 20 steps:
+Direct base-weight update, 100-step vLLM-only, `rank=8`, `lr=1e-7`,
+`eps=1e-3`, `step_interval=50`, `batch_size=16`, CUDA RNG,
+`batch_invariant=0,enforce_eager=1`, GPU direct LoRA injection:
+
+| weight_update | precision | total_s | step_s_mean | tail20_step_s_mean | weight_update_s_mean | score_s_mean |
+|---|---|---:|---:|---:|---:|---:|
+| `copy` | `float32` | 20.4066 | 0.2032 | 0.2032 | 0.1015 | 0.0589 |
+| `direct` | `float32` | 13.6976 | 0.1363 | 0.1315 | 0.0349 | 0.0583 |
+| `direct` | `param` | 10.6032 | 0.1054 | 0.1041 | 0.0077 | 0.0567 |
+
+The direct `param` path preserved all 100 step seeds and U/V digests compared
+with `copy`. It reduced total training-loop time by `1.92x` and the weight
+update section by `13.22x`. The only direct-vs-copy sign mismatch was a
+low-signal step (`|loss_plus-loss_minus| < 0.005`); the maximum c difference
+was `0.95`.
+
+Production-speed timing disables debug-only U/V digest hashing. With the same
+recommended `direct/param` path and `lr=3e-7`, the 100-step digest-off run
+measured:
+
+| metric | mean |
+|---|---:|
+| `step_s_mean` | 0.0842 |
+| `direction_s_mean` | 0.0024 |
+| `build_lora_s_mean` | 0.0067 |
+| `lora_update_s_mean` | 0.0104 |
+| `score_s_mean` | 0.0568 |
+| `score_generate_s_mean` | 0.0567 |
+| `score_postprocess_s_mean` | 0.000073 |
+| `weight_update_s_mean` | 0.0078 |
+
+This makes the live bottleneck explicit: nearly all scoring time is inside
+vLLM `generate(prompt_logprobs=1)`, not request construction or Python loss
+postprocessing. Digest hashing remains available through `--direction-digest`
+and is enabled by the side-by-side wrapper.
+
+Direct `param` side-by-side vs LOZO baseline, 20 steps:
+
+```text
+steps_compared=20
+seed_mismatch_steps=[]
+direction_digest_mismatch_steps=[]
+loss_fail_steps@0.04=[]
+c_fail_steps@25=[]
+sign_fail_steps=[]
+max_loss_plus_diff=0.010167
+max_loss_minus_diff=0.009344
+max_c_diff=5.898678
+```
+
+Direct LoRA-slot side-by-side vs LOZO baseline, 20 steps:
 
 ```text
 steps_compared=20

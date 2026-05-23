@@ -1,4 +1,6 @@
+# Python cache
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
@@ -27,7 +29,5 @@ wandb/
 scratch/
 
 # Cache
-__pycache__/
-*.pyc
 .cache/
 tmp/
