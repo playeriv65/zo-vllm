@@ -44,6 +44,15 @@ def model_batch_dir(base_dir: Path, model: str, batch_size: int) -> Path:
     return base_dir / f"model_{safe_model_name(model)}" / f"batch_b{batch_size}"
 
 
+def has_backend_result(base_dir: Path, model: str, batch_size: int, backend: str) -> bool:
+    run_dir = model_batch_dir(base_dir, model, batch_size)
+    if backend == "lozo":
+        return any((run_dir / "lozo_baseline").glob("lozo_perf_*.json"))
+    if backend == "vllm":
+        return any((run_dir / "vllm_optimized").glob("vllm_perf_*.json"))
+    raise ValueError(f"unknown backend: {backend}")
+
+
 def ensure_tmux_session(session: str) -> bool:
     result = subprocess.run(
         ["tmux", "has-session", "-t", session],
@@ -64,6 +73,19 @@ def ensure_run_dir_available(base_dir: Path) -> None:
 
 def tmux_new_window_command(session: str, window: str, body: str) -> list[str]:
     return ["tmux", "new-window", "-t", session, "-n", window, body]
+
+
+def write_job_script(base_dir: Path, window: str, body: str) -> Path:
+    scripts_dir = base_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script_path = scripts_dir / f"{window}.sh"
+    script_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{body}\n"
+    )
+    script_path.chmod(0o755)
+    return script_path
 
 
 def write_manifest(path: Path, manifest: dict) -> None:
@@ -224,6 +246,8 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         str(args.seed),
         "--zo-random-device",
         "cuda",
+        "--direction-sampling",
+        args.direction_sampling,
         "--train-scope",
         "lora_only",
         "--batch-invariant",
@@ -238,6 +262,8 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         "direct",
         "--weight-update-precision",
         "param",
+        "--qkv-weight-update",
+        args.qkv_weight_update,
         "--sync-weight-update",
         "0",
         "--scoring-backend",
@@ -308,6 +334,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--direct-worker-max-logits-tokens", type=int, default=8192)
+    parser.add_argument("--direction-sampling", choices=["exact", "flat"], default="flat")
+    parser.add_argument("--qkv-weight-update", choices=["separate", "batched"], default="batched")
     parser.add_argument("--lozo-torch-compile", action="store_true")
     parser.add_argument("--lozo-torch-compile-mode", default="default")
     parser.add_argument("--backend", choices=["both", "lozo", "vllm"], default="both")
@@ -341,13 +369,19 @@ def main() -> None:
     vllm_commands = []
     for model in args.models:
         for batch_size in args.batch_sizes:
-            lozo_commands.append(build_lozo_command(args, model, batch_size, base_dir))
-            vllm_commands.append(build_vllm_command(args, model, batch_size, base_dir))
+            if not args.resume_existing or not has_backend_result(
+                base_dir, model, batch_size, "lozo"
+            ):
+                lozo_commands.append(build_lozo_command(args, model, batch_size, base_dir))
+            if not args.resume_existing or not has_backend_result(
+                base_dir, model, batch_size, "vllm"
+            ):
+                vllm_commands.append(build_vllm_command(args, model, batch_size, base_dir))
 
     jobs = []
-    if args.backend in {"both", "lozo"}:
+    if args.backend in {"both", "lozo"} and lozo_commands:
         jobs.append(("zo-vllm-p3-scale-lozo", sequential_body(lozo_commands)))
-    if args.backend in {"both", "vllm"}:
+    if args.backend in {"both", "vllm"} and vllm_commands:
         jobs.append(("zo-vllm-p3-scale-vllm", sequential_body(vllm_commands)))
     collect_command = [
         ".venv/bin/python",
@@ -374,6 +408,8 @@ def main() -> None:
         "vllm_path": "direct_worker+direct_lora_from_directions+direct_weight_update",
         "vllm_enforce_eager": int(args.enforce_eager),
         "vllm_gpu_memory_utilization": args.gpu_memory_utilization,
+        "vllm_direction_sampling": args.direction_sampling,
+        "vllm_qkv_weight_update": args.qkv_weight_update,
         "lozo_torch_compile": bool(args.lozo_torch_compile),
         "lozo_torch_compile_mode": args.lozo_torch_compile_mode,
         "backend": args.backend,
@@ -411,6 +447,16 @@ def main() -> None:
                     parents=True,
                     exist_ok=True,
                 )
+        tmux_commands = []
+        for window, body in jobs:
+            script_path = write_job_script(base_dir, window, body)
+            tmux_commands.append(
+                tmux_new_window_command(
+                    args.tmux_session,
+                    window,
+                    f"bash {shlex.quote(str(script_path))}",
+                )
+            )
         manifest_path = base_dir / "manifest.json"
         manifest = {}
         if args.resume_existing and manifest_path.exists():

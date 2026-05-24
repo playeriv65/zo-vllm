@@ -5,8 +5,19 @@ training efficiency.
 
 ## Current Checkpoint
 
-Phase 3 is still in progress. The current code captures a checkpoint after
-fixing several obvious q=1 throughput problems:
+Phase 3 is still in progress. The latest formal throughput checkpoint is the
+OPT-family q=1 scaling run documented in `phase3/OPT_SCALING_REPORT.md`. It
+compares LOZO minimal against the optimized vLLM direct-worker path for
+`facebook/opt-1.3b`, `facebook/opt-2.7b`, `facebook/opt-6.7b`, and
+`facebook/opt-13b` at batch sizes `16,32,64,128`.
+
+That report is the source of truth for the current speedup accounting. It also
+records the caveats: vLLM base evaluation was skipped, the LOZO baseline was not
+compiled with `torch.compile`, both sides use `lora_only`, and the 13B vLLM rows
+required a higher vLLM GPU memory utilization setting.
+
+The current code captures a checkpoint after fixing several obvious q=1
+throughput problems:
 
 - direct worker scoring for prompt token IDs
 - direct plus/minus LoRA slot writes from U/V directions
@@ -17,14 +28,14 @@ fixing several obvious q=1 throughput problems:
 Latest formal checkpoint artifacts are under:
 
 ```text
-local ignored vLLM run ending in 20260524_123159
-local ignored LOZO run ending in 20260524_121646
+phase3/results/phase3_scaling_opt1p3b_opt2p7b_opt6p7b_opt13b_b16_32_64_128_s1000_w5_20260524_current/
 ```
 
 The result directory is git-ignored; the key summary is recorded in
-`phase3/STATUS.md`. These speed runs use `base_eval_mode=skip` on the vLLM side,
-so they are throughput checkpoints rather than Phase 2-style convergence
-acceptance runs. New `facebook/opt-1.3b` runs should use the `opt1p3b` slug.
+`phase3/OPT_SCALING_REPORT.md` and `phase3/STATUS.md`. These speed runs use
+`base_eval_mode=skip` on the vLLM side, so they are throughput checkpoints
+rather than Phase 2-style convergence acceptance runs. New `facebook/opt-1.3b`
+runs should use the `opt1p3b` slug.
 
 ## Scope
 
@@ -42,6 +53,7 @@ do not change the accepted Phase 2 evidence.
 | `vllm-detailed` | `phase3/runners/train_vllm_perf.py --profile-mode detailed` | vLLM timing with score request/generate/postprocess breakdown. |
 | `vllm-scoring-microbench` | `phase3/runners/microbench_vllm_scoring.py` | Isolates q=1 base scoring, fixed-LoRA scoring, slot rewrite, and current rewrite+score timing. |
 | `scaling-sweep` | `phase3/runners/launch_scaling_sweep.py` | Runs LOZO and optimized vLLM across OPT models and batch sizes. |
+| `scaling-validator` | `phase3/runners/validate_scaling_sweep.py` | Checks the OPT scaling accounting contract and per-result JSON configs. |
 
 The default comparable speed pair is:
 

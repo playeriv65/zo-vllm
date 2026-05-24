@@ -2,8 +2,39 @@
 
 ## Latest Checkpoint
 
-Phase 3 is not finished. The current checkpoint only addresses the obvious
-q=1 performance blockers found after the initial batch sweep:
+Phase 3 is not finished. The latest formal throughput checkpoint is now the
+OPT-family q=1 scaling run documented in `phase3/OPT_SCALING_REPORT.md`.
+
+Final scaling run directory:
+
+```text
+phase3/results/phase3_scaling_opt1p3b_opt2p7b_opt6p7b_opt13b_b16_32_64_128_s1000_w5_20260524_current/
+```
+
+The audited table compares LOZO minimal against optimized vLLM for
+`facebook/opt-1.3b`, `facebook/opt-2.7b`, `facebook/opt-6.7b`, and
+`facebook/opt-13b` at batch sizes `16,32,64,128`. The primary metric is
+`timing.total_s / config.steps`, with five warmup steps excluded on both sides.
+
+The current speedups range from `2.50x` to `7.14x` under this throughput
+accounting. Important caveats: vLLM base evaluation is skipped, LOZO is not
+compiled with `torch.compile`, both backends use `lora_only`, and the 13B vLLM
+rows use higher vLLM GPU memory utilization because the original lower setting
+could not allocate enough KV cache. These rows are throughput evidence, not
+Phase 2-style convergence acceptance evidence.
+
+The accounting validator for this checkpoint is:
+
+```text
+phase3/runners/validate_scaling_sweep.py
+```
+
+It writes `validation.json` under the ignored run directory and checks that all
+32 backend JSON files are present exactly once, common configs match, and the
+reported speedup uses `timing.total_s / config.steps`.
+
+The current checkpoint addresses the obvious q=1 performance blockers found
+after the initial batch sweep:
 
 - avoid per-step CPU LoRA tensor construction when direct GPU slots are used
 - write plus/minus LoRA slots directly from U/V directions inside vLLM
