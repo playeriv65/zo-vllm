@@ -21,7 +21,7 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from phase2.core.memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
+from zo_vllm.core.memory_lora_loader import register_memory_lora_cpu, clear_all_memory_loras
 from phase2.validation.memory_lora_test_utils import build_lora_config, build_lora_tensors
 
 MODEL_NAME = "facebook/opt-2.7b"

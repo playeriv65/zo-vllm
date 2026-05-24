@@ -24,11 +24,11 @@ os.environ["HF_HOME"] = "/tmp/hf_home"
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 
-from phase2.core.lozo_controller import LOZOController, LOZOConfig
-from phase2.core.temp_lora_runtime import TempLoRARuntime
-from phase2.core.vllm_scorer import VLLMScorer
-from phase2.core.weight_sync import WeightSync
-from phase2.core.memory_lora_loader import install_mocks
+from zo_vllm.core.lozo_controller import LOZOController, LOZOConfig
+from zo_vllm.core.temp_lora_runtime import TempLoRARuntime
+from zo_vllm.core.vllm_scorer import VLLMScorer
+from zo_vllm.core.weight_sync import WeightSync
+from zo_vllm.core.memory_lora_loader import install_mocks
 
 
 def run_hf_baseline_multi_steps(model_name, prompt, rank_r, zo_eps, lr, steps):

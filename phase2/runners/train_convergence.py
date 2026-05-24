@@ -37,11 +37,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
 
-from phase2.core.lozo_controller import LOZOController, LOZOConfig
-from phase2.core.temp_lora_runtime import TempLoRARuntime
-from phase2.core.weight_sync import WeightSync
-from phase2.core.memory_lora_loader import install_mocks
-from phase2.core.direction_digest import digest_named_uv
+from zo_vllm.core.lozo_controller import LOZOController, LOZOConfig
+from zo_vllm.core.temp_lora_runtime import TempLoRARuntime
+from zo_vllm.core.weight_sync import WeightSync
+from zo_vllm.core.memory_lora_loader import install_mocks
+from zo_vllm.core.direction_digest import digest_named_uv
 
 
 class SimpleDataset(Dataset):
@@ -154,7 +154,7 @@ def main():
         install_mocks()
 
     from vllm import LLM
-    from phase2.core.vllm_scorer import VLLMScorer
+    from zo_vllm.core.vllm_scorer import VLLMScorer
     
     # Configuration
     model_name = "facebook/opt-2.7b"

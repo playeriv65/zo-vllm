@@ -284,6 +284,47 @@ class LOZOController:
             layer_to_B[name] = lora_B
         
         return layer_to_A, layer_to_B
+
+    def build_temp_lora_pair_tensors(
+        self,
+        directions_2d: Dict[str, Dict[str, torch.Tensor]],
+        output_device: str | torch.device | None = "cpu",
+    ) -> tuple[
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+    ]:
+        """
+        Build plus/minus LoRA tensors in one pass.
+
+        The A matrix is identical for both signs, so this avoids building and
+        copying V.T twice on every ZO step.
+        """
+        plus_A = {}
+        plus_B = {}
+        minus_A = {}
+        minus_B = {}
+        linear_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+
+        for name, d in directions_2d.items():
+            if not any(module in name for module in linear_modules):
+                continue
+
+            U = d["U"]
+            V = d["V"]
+            lora_A = V.T.contiguous().half()
+            lora_B = (self.config.eps * U).contiguous().half()
+            if output_device is not None:
+                lora_A = lora_A.to(output_device).contiguous()
+                lora_B = lora_B.to(output_device).contiguous()
+
+            plus_A[name] = lora_A
+            minus_A[name] = lora_A
+            plus_B[name] = lora_B
+            minus_B[name] = lora_B.neg()
+
+        return plus_A, plus_B, minus_A, minus_B
     
     def compute_c(self, loss_plus: float, loss_minus: float) -> float:
         """

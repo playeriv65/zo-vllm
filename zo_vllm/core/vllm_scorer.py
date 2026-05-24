@@ -10,6 +10,12 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
+ZO_PROMPT_NLL_KEY = "__zo_prompt_nll__"
+
+
+def is_direct_prompt_nll(prompt_logprobs) -> bool:
+    return isinstance(prompt_logprobs, dict) and bool(prompt_logprobs.get(ZO_PROMPT_NLL_KEY))
+
 
 def compute_nll_from_prompt_logprobs(outputs, tokenizer) -> float:
     """
@@ -30,6 +36,11 @@ def compute_nll_from_prompt_logprobs(outputs, tokenizer) -> float:
     for output in outputs:
         prompt_logprobs = output.prompt_logprobs
         if prompt_logprobs is None:
+            continue
+
+        if is_direct_prompt_nll(prompt_logprobs):
+            total_nll += float(prompt_logprobs["nll_sum"])
+            total_tokens += int(prompt_logprobs["num_tokens"])
             continue
         
         # We start from index 1 because the first token does not have a prefix to predict it.
@@ -64,6 +75,13 @@ def compute_nll_from_prompt_logprobs_detailed(outputs, tokenizer) -> tuple[float
     for output in outputs:
         prompt_logprobs = output.prompt_logprobs
         if prompt_logprobs is None:
+            continue
+
+        if is_direct_prompt_nll(prompt_logprobs):
+            num_tokens = int(prompt_logprobs["num_tokens"])
+            total_nll += float(prompt_logprobs["nll_sum"])
+            total_tokens += num_tokens
+            total_positions += num_tokens
             continue
 
         prompt_token_ids = getattr(output, "prompt_token_ids", None)
@@ -107,13 +125,20 @@ class VLLMScorer:
         llm: LLM,
         tokenizer,
         max_tokens: int = 1,
+        direct_prompt_nll: bool = True,
     ):
         self.llm = llm
         self.tokenizer = tokenizer
+        self.direct_prompt_nll = direct_prompt_nll
         self.sampling_params = SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
-            prompt_logprobs=1,
+            prompt_logprobs=0 if direct_prompt_nll else 1,
+            detokenize=False,
+            skip_clone=True,
+            extra_args=(
+                {"zo_direct_prompt_nll": True} if direct_prompt_nll else None
+            ),
         )
     
     def score_with_lora(

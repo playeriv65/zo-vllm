@@ -15,10 +15,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM
 
-from phase2.core.lozo_controller import LOZOController, LOZOConfig
-from phase2.core.temp_lora_runtime import TempLoRARuntime
-from phase2.core.vllm_scorer import VLLMScorer
-from phase2.core.weight_sync import WeightSync
+from zo_vllm.core.lozo_controller import LOZOController, LOZOConfig
+from zo_vllm.core.temp_lora_runtime import TempLoRARuntime
+from zo_vllm.core.vllm_scorer import VLLMScorer
+from zo_vllm.core.weight_sync import WeightSync
 
 
 def test_training_loop():

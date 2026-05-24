@@ -20,11 +20,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM
 
-from phase2.core.lozo_controller import LOZOController, LOZOConfig
-from phase2.core.temp_lora_runtime import TempLoRARuntime
-from phase2.core.vllm_scorer import VLLMScorer, compute_nll_from_prompt_logprobs
-from phase2.core.weight_sync import WeightSync
-from phase2.core.memory_lora_loader import install_mocks
+from zo_vllm.core.lozo_controller import LOZOController, LOZOConfig
+from zo_vllm.core.temp_lora_runtime import TempLoRARuntime
+from zo_vllm.core.vllm_scorer import VLLMScorer, compute_nll_from_prompt_logprobs
+from zo_vllm.core.weight_sync import WeightSync
+from zo_vllm.core.memory_lora_loader import install_mocks
 
 
 def prepare_sst2_batch(tokenizer, num_samples=16, seed=42):

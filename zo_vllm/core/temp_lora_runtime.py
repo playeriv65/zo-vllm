@@ -1,7 +1,7 @@
 """
 Temporary LoRA Runtime - Manages plus/minus LoRA slots for LOZO perturbation.
 
-Uses either the in-memory CPU LoRA interface from phase2.core.memory_lora_loader.py,
+Uses either the in-memory CPU LoRA interface from zo_vllm.core.memory_lora_loader.py,
 the GPU-resident manager path, or the training-only direct slot updater that
 writes fixed vLLM LoRA slots in place.
 Supports all 2D trainable parameters (Linear layers).
@@ -14,8 +14,6 @@ import torch
 from .memory_lora_loader import register_memory_lora_cpu, unregister_memory_lora
 
 
-# OPT model hidden size
-HIDDEN_SIZE = 2560
 GPU_MEMORY_PATH_PREFIX = "/gpu_lora_loaded"
 
 
@@ -115,6 +113,217 @@ def _read_lora_pair(
     return a, b
 
 
+def _normalize_lora_slices(
+    module,
+    lora_a: torch.Tensor | list[torch.Tensor | None],
+    lora_b: torch.Tensor | list[torch.Tensor | None],
+) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
+    """Normalize LoRA tensors to one A/B pair per vLLM slice."""
+    n_slices = int(getattr(module, "n_slices", len(module.lora_a_stacked)))
+
+    if isinstance(lora_b, list) and len(lora_b) != n_slices:
+        expand = getattr(module, "expand_packed_lora", None)
+        if expand is not None:
+            lora_a, lora_b = expand(lora_a, lora_b)
+
+    if isinstance(lora_a, torch.Tensor):
+        lora_a = [lora_a] * n_slices
+    if isinstance(lora_b, torch.Tensor):
+        if n_slices == 1:
+            lora_b = [lora_b]
+        else:
+            output_sizes = getattr(module, "output_sizes", None)
+            if output_sizes is None:
+                output_sizes = getattr(module.base_layer, "output_sizes")
+            start = 0
+            split_b = []
+            for output_size in output_sizes:
+                end = start + output_size
+                split_b.append(lora_b[start:end, :])
+                start = end
+            lora_b = split_b
+
+    if int(getattr(module, "tp_size", 1)) > 1:
+        lora_a = module.slice_lora_a(lora_a)
+        lora_b = module.slice_lora_b(lora_b)
+
+    return list(lora_a), list(lora_b)
+
+
+def _set_lora_noreset_if_full(
+    module,
+    index: int,
+    lora_a: torch.Tensor | list[torch.Tensor | None],
+    lora_b: torch.Tensor | list[torch.Tensor | None],
+) -> bool:
+    """
+    Overwrite a slot without zeroing it first when every stored slice is full.
+
+    This is a training-only fast path for fixed-rank temporary adapters. If a
+    tensor is partial or missing, the caller falls back to vLLM's set_lora().
+    """
+    lora_a_slices, lora_b_slices = _normalize_lora_slices(module, lora_a, lora_b)
+    if not (
+        len(lora_a_slices)
+        == len(lora_b_slices)
+        == len(module.lora_a_stacked)
+        == len(module.lora_b_stacked)
+    ):
+        return False
+
+    for slice_idx, (lora_a_i, lora_b_i) in enumerate(zip(lora_a_slices, lora_b_slices)):
+        if lora_a_i is None or lora_b_i is None:
+            return False
+        target_a = module.lora_a_stacked[slice_idx][index, 0]
+        target_b = module.lora_b_stacked[slice_idx][index, 0]
+        if tuple(lora_a_i.shape) != tuple(target_a.shape):
+            return False
+        if tuple(lora_b_i.shape) != tuple(target_b.shape):
+            return False
+
+    for slice_idx, (lora_a_i, lora_b_i) in enumerate(zip(lora_a_slices, lora_b_slices)):
+        module.lora_a_stacked[slice_idx][index, 0].copy_(lora_a_i, non_blocking=True)
+        module.lora_b_stacked[slice_idx][index, 0].copy_(lora_b_i, non_blocking=True)
+    return True
+
+
+def _copy_direction_to_slot(
+    module,
+    *,
+    index: int,
+    slice_idx: int,
+    U: torch.Tensor,
+    V: torch.Tensor,
+    scale: float,
+) -> bool:
+    target_a = module.lora_a_stacked[slice_idx][index, 0]
+    target_b = module.lora_b_stacked[slice_idx][index, 0]
+    lora_a = V.T
+    if tuple(lora_a.shape) != tuple(target_a.shape):
+        return False
+    if tuple(U.shape) != tuple(target_b.shape):
+        return False
+    target_a.copy_(lora_a, non_blocking=True)
+    target_b.copy_(U, non_blocking=True)
+    target_b.mul_(scale)
+    return True
+
+
+def _write_direction_to_plus_minus(
+    module,
+    *,
+    plus_index: int,
+    minus_index: int,
+    slice_idx: int,
+    direction: dict[str, torch.Tensor],
+    eps: float,
+) -> bool:
+    U = direction["U"]
+    V = direction["V"]
+    return _copy_direction_to_slot(
+        module,
+        index=plus_index,
+        slice_idx=slice_idx,
+        U=U,
+        V=V,
+        scale=eps,
+    ) and _copy_direction_to_slot(
+        module,
+        index=minus_index,
+        slice_idx=slice_idx,
+        U=U,
+        V=V,
+        scale=-eps,
+    )
+
+
+def _write_plus_minus_slots_from_directions(
+    manager,
+    *,
+    plus_id: int,
+    minus_id: int,
+    directions_2d: Dict[str, Dict[str, torch.Tensor]],
+    eps: float,
+) -> dict:
+    """Write plus/minus slots directly from LOZO U/V directions."""
+    plus_index = _lora_slot_index(manager, plus_id)
+    minus_index = _lora_slot_index(manager, minus_id)
+    modules_written = 0
+    packed_written = 0
+    missing: list[str] = []
+    fallback_required: list[str] = []
+
+    for module_name, module in manager.modules.items():
+        if module_name in manager.packed_modules:
+            replacements = list(manager.packed_modules[module_name])
+            if len(replacements) != len(module.lora_a_stacked):
+                fallback_required.append(module_name)
+                continue
+            wrote_any = False
+            ok = True
+            for slice_idx, replacement in enumerate(replacements):
+                direction = directions_2d.get(f"{replacement}.weight")
+                if direction is None:
+                    ok = False
+                    break
+                wrote_any = True
+                if not _write_direction_to_plus_minus(
+                    module,
+                    plus_index=plus_index,
+                    minus_index=minus_index,
+                    slice_idx=slice_idx,
+                    direction=direction,
+                    eps=eps,
+                ):
+                    ok = False
+                    break
+            if ok and wrote_any:
+                packed_written += 1
+            elif wrote_any:
+                fallback_required.append(module_name)
+            else:
+                module.reset_lora(plus_index)
+                module.reset_lora(minus_index)
+                missing.append(module_name)
+            continue
+
+        direction = directions_2d.get(f"{module_name}.weight")
+        if direction is None:
+            module.reset_lora(plus_index)
+            module.reset_lora(minus_index)
+            missing.append(module_name)
+            continue
+        if len(module.lora_a_stacked) != 1:
+            fallback_required.append(module_name)
+            continue
+        if _write_direction_to_plus_minus(
+            module,
+            plus_index=plus_index,
+            minus_index=minus_index,
+            slice_idx=0,
+            direction=direction,
+            eps=eps,
+        ):
+            modules_written += 1
+        else:
+            fallback_required.append(module_name)
+
+    if fallback_required:
+        raise RuntimeError(
+            "direct direction slot update does not support modules: "
+            + ", ".join(fallback_required[:8])
+        )
+
+    return {
+        "plus": {"lora_id": int(plus_id), "slot_index": int(plus_index)},
+        "minus": {"lora_id": int(minus_id), "slot_index": int(minus_index)},
+        "modules_written": int(modules_written),
+        "packed_written": int(packed_written),
+        "missing": missing,
+        "source": "directions",
+    }
+
+
 def _write_plus_minus_slots(
     manager,
     *,
@@ -153,11 +362,17 @@ def _write_plus_minus_slots(
                 minus_has_any = minus_has_any or minus_a is not None
 
             if plus_has_any:
-                module.set_lora(plus_index, plus_lora_a, plus_lora_b)
+                if not _set_lora_noreset_if_full(
+                    module, plus_index, plus_lora_a, plus_lora_b
+                ):
+                    module.set_lora(plus_index, plus_lora_a, plus_lora_b)
             else:
                 module.reset_lora(plus_index)
             if minus_has_any:
-                module.set_lora(minus_index, minus_lora_a, minus_lora_b)
+                if not _set_lora_noreset_if_full(
+                    module, minus_index, minus_lora_a, minus_lora_b
+                ):
+                    module.set_lora(minus_index, minus_lora_a, minus_lora_b)
             else:
                 module.reset_lora(minus_index)
 
@@ -174,12 +389,14 @@ def _write_plus_minus_slots(
         if plus_a is None:
             module.reset_lora(plus_index)
         else:
-            module.set_lora(plus_index, plus_a, plus_b)
+            if not _set_lora_noreset_if_full(module, plus_index, plus_a, plus_b):
+                module.set_lora(plus_index, plus_a, plus_b)
 
         if minus_a is None:
             module.reset_lora(minus_index)
         else:
-            module.set_lora(minus_index, minus_a, minus_b)
+            if not _set_lora_noreset_if_full(module, minus_index, minus_a, minus_b):
+                module.set_lora(minus_index, minus_a, minus_b)
 
         if plus_a is None and minus_a is None:
             missing.append(module_name)
@@ -221,6 +438,28 @@ def _update_lora_slots_in_vllm_model(
     )
 
 
+def _update_lora_slots_from_directions_in_vllm_model(
+    model,
+    *,
+    plus_id: int,
+    minus_id: int,
+    directions_2d: Dict[str, Dict[str, torch.Tensor]],
+    eps: float,
+) -> dict:
+    """Training-only fast path: build and write fixed slots inside vLLM."""
+    manager = getattr(model, "lora_manager", None)
+    if manager is None:
+        raise RuntimeError("vLLM model has no lora_manager; enable_lora=True is required")
+
+    return _write_plus_minus_slots_from_directions(
+        manager,
+        plus_id=plus_id,
+        minus_id=minus_id,
+        directions_2d=directions_2d,
+        eps=eps,
+    )
+
+
 class TempLoRARuntime:
     """
     Manages two in-memory LoRA slots for LOZO plus/minus perturbation.
@@ -242,6 +481,9 @@ class TempLoRARuntime:
         residency: str = "cpu",
         injection: str = "auto",
         llm: Any | None = None,
+        base_model_name: str = "facebook/opt-2.7b",
+        hidden_size: int = 2560,
+        ffn_dim: int = 10240,
     ):
         if residency not in {"cpu", "gpu"}:
             raise ValueError(f"unknown LoRA residency: {residency}")
@@ -263,6 +505,9 @@ class TempLoRARuntime:
         self.residency = residency
         self.injection = injection
         self.llm = llm
+        self.base_model_name = base_model_name
+        self.hidden_size = int(hidden_size)
+        self.ffn_dim = int(ffn_dim)
         self.plus_name = "lozo_plus"
         self.minus_name = "lozo_minus"
         self.last_update_info: dict[str, Any] = {}
@@ -307,11 +552,11 @@ class TempLoRARuntime:
                 
                 # Determine dimensions
                 if module_name == "fc1":
-                    out_features, in_features = 10240, HIDDEN_SIZE
+                    out_features, in_features = self.ffn_dim, self.hidden_size
                 elif module_name == "fc2":
-                    out_features, in_features = HIDDEN_SIZE, 10240
+                    out_features, in_features = self.hidden_size, self.ffn_dim
                 else:
-                    out_features, in_features = HIDDEN_SIZE, HIDDEN_SIZE
+                    out_features, in_features = self.hidden_size, self.hidden_size
                 
                 lora_A = torch.zeros(self.rank, in_features, dtype=torch.float16)
                 lora_B = torch.zeros(out_features, self.rank, dtype=torch.float16)
@@ -327,7 +572,7 @@ class TempLoRARuntime:
         return {
             "alpha_pattern": {},
             "auto_mapping": None,
-            "base_model_name_or_path": "facebook/opt-2.7b",
+            "base_model_name_or_path": self.base_model_name,
             "bias": "none",
             "exclude_modules": [],
             "fan_in_fan_out": False,
@@ -423,6 +668,25 @@ class TempLoRARuntime:
             plus_B=plus_B,
             minus_A=minus_A,
             minus_B=minus_B,
+        )
+        results = self.llm.apply_model(fn)
+        if not results:
+            raise RuntimeError("vLLM apply_model returned no results while updating LoRA")
+        return {"workers": results}
+
+    def _update_gpu_lora_slots_from_directions(
+        self,
+        directions_2d: Dict[str, Dict[str, torch.Tensor]],
+        eps: float,
+    ) -> dict:
+        if self.llm is None:
+            raise RuntimeError("GPU LoRA residency requires TempLoRARuntime(llm=...)")
+        fn = partial(
+            _update_lora_slots_from_directions_in_vllm_model,
+            plus_id=self.plus_id,
+            minus_id=self.minus_id,
+            directions_2d=directions_2d,
+            eps=eps,
         )
         results = self.llm.apply_model(fn)
         if not results:
@@ -578,9 +842,42 @@ class TempLoRARuntime:
                 minus_tensors,
             )
             self.last_update_info = {}
-        
+
         self._registered = True
-    
+
+    def update_plus_minus_from_directions(
+        self,
+        directions_2d: Dict[str, Dict[str, torch.Tensor]],
+        *,
+        eps: float,
+        step: int = 0,
+    ):
+        """Update plus/minus GPU slots directly from U/V directions."""
+        if self.residency != "gpu" or self.injection != "direct":
+            raise RuntimeError("direction slot update requires GPU direct injection")
+        old_plus_id = self.plus_id
+        old_minus_id = self.minus_id
+        self._set_ids_for_step(step)
+        if (
+            self._registered
+            and {old_plus_id, old_minus_id} != {self.plus_id, self.minus_id}
+        ):
+            self._remove_gpu_lora(old_plus_id)
+            self._remove_gpu_lora(old_minus_id)
+        if not self._registered:
+            config = self._build_config()
+            empty_tensors = self._build_empty_tensors()
+            self.last_update_info = self._load_gpu_lora_pair(
+                config,
+                empty_tensors,
+                empty_tensors.copy(),
+            )
+            self._registered = True
+        self.last_update_info = self._update_gpu_lora_slots_from_directions(
+            directions_2d,
+            eps,
+        )
+
     def get_plus_request_info(self) -> tuple[str, int, str]:
         """Get (name, id, path) for plus LoRA."""
         return self.plus_name, self.plus_id, self.plus_path

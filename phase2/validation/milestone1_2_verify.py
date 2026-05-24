@@ -20,7 +20,7 @@ from vllm.lora.request import LoRARequest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from phase2.core.memory_lora_loader import clear_all_memory_loras, register_memory_lora_cpu
+from zo_vllm.core.memory_lora_loader import clear_all_memory_loras, register_memory_lora_cpu
 
 
 MODEL_NAME = "facebook/opt-2.7b"

@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(project_root, "third_party", "LOZO", "large_mode
 
 from LOZOtrainer import LowRankTrainer
 from run_lozo import OurArguments
-from phase2.core.direction_digest import digest_named_uv
+from zo_vllm.core.direction_digest import digest_named_uv
 
 
 class SimpleDataset(Dataset):

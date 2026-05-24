@@ -43,8 +43,10 @@ side-by-side tests still enable digest hashing explicitly.
 
 - `third_party/vllm` — vLLM fork (local vendored copy)
 - `third_party/LOZO` — LOZO algorithm reference (submodule)
+- `zo_vllm` — shared LOZO/vLLM runtime library used by multiple phases
 - `phase1` — Phase 1 alignment scripts and generated Phase 1 outputs
-- `phase2` — Phase 2 core code, runners, validation scripts, and generated outputs
+- `phase2` — Phase 2 convergence runners, validation scripts, and generated outputs
+- `phase3` — Phase 3 performance runners, collectors, and status reports
 
 ## Phase 1: LOZO Perturbation Alignment (Initial)
 

@@ -99,10 +99,10 @@ Syntax check:
 
 ```bash
 .venv/bin/python -m py_compile \
-  phase2/core/lozo_controller.py \
-  phase2/core/temp_lora_runtime.py \
-  phase2/core/vllm_scorer.py \
-  phase2/core/weight_sync.py \
+  zo_vllm/core/lozo_controller.py \
+  zo_vllm/core/temp_lora_runtime.py \
+  zo_vllm/core/vllm_scorer.py \
+  zo_vllm/core/weight_sync.py \
   phase2/runners/run_baseline_helper.py \
   phase2/runners/train_convergence.py \
   phase2/runners/run_convergence_experiment.py \

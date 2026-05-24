@@ -49,6 +49,11 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 
 **重要经验**：利用vLLM的批量处理特性可以显著减少调度开销。预先准备所有adapter，一次性发送请求让vLLM自己调度。
 
+**Phase 3 性能实验经验**：速度 checkpoint 和收敛验收分开记录。`phase3/results/`
+只保存可复现实验输出并保持 git-ignore；提交代码时只提交 runner、collector 和状态文档。
+当 vLLM scoring 进入热路径时，优先使用 direct worker scoring 和固定 GPU LoRA slot，
+避免把完整 `generate(prompt_logprobs=1)` serving 包装当作最终训练路径。
+
 ## Phase 1 结论
 
 **vLLM fake-LoRA 路径在真实 LOZO 多层扰动场景下完全可靠。**
@@ -80,14 +85,16 @@ phase1/
 ├── persistent_test.py      # 主测试脚本（批量处理版本）
 └── results/                # Phase 1结果；脚本默认写这里
 
+zo_vllm/
+└── core/                    # 跨Phase共享的LOZO/vLLM runtime核心模块
+    ├── lozo_controller.py
+    ├── temp_lora_runtime.py
+    ├── vllm_scorer.py
+    ├── weight_sync.py
+    ├── memory_lora_loader.py
+    └── module_map.py
+
 phase2/
-├── core/                    # LOZO/vLLM runtime核心模块
-│   ├── lozo_controller.py
-│   ├── temp_lora_runtime.py
-│   ├── vllm_scorer.py
-│   ├── weight_sync.py
-│   ├── memory_lora_loader.py
-│   └── module_map.py
 ├── runners/                 # 训练、baseline和sweep入口
 │   ├── train_convergence.py
 │   ├── run_baseline_helper.py
@@ -103,6 +110,9 @@ phase2/
 ├── results/                 # Phase 2日志和结果；git忽略
 └── IMPLEMENTATION_NOTES.md  # 实现简化说明（1D/embedding跳过）
 ```
+
+阶段边界：`zo_vllm/core/` 是共享runtime，不归属于某个实验阶段；`phase1/2/3`
+目录只放各阶段特有的runner、validation、collector和文档。
 
 ## Phase 2 Milestone 1-2 完成 ✅
 
@@ -121,7 +131,7 @@ phase2/
 ### API
 
 ```python
-from phase2.core.memory_lora_loader import register_memory_lora_cpu
+from zo_vllm.core.memory_lora_loader import register_memory_lora_cpu
 from vllm.lora.request import LoRARequest
 
 # 注册内存LoRA

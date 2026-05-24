@@ -201,6 +201,7 @@ class WeightSync:
         lr: float,
         weight_decay: float = 0.0,
         precision: str = "float32",
+        sync_device: bool = True,
     ) -> None:
         """
         Apply the LOZO base-weight update directly inside the vLLM worker.
@@ -291,6 +292,7 @@ class WeightSync:
                     precision=precision,
                 )
 
-            torch.cuda.synchronize()
+            if sync_device:
+                torch.cuda.synchronize()
 
         self.llm.collective_rpc(update_weights_on_worker)
