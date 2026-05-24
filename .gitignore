@@ -21,6 +21,7 @@ phase1*_results.json
 phase1/artifacts/
 phase2/artifacts/
 phase2/results/
+phase3/results/
 
 # Logs and results
 logs/
