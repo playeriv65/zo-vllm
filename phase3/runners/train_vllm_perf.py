@@ -1,5 +1,6 @@
 import argparse
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import json
 import os
 import sys
@@ -64,6 +65,18 @@ def summarize(values):
     }
 
 
+@contextmanager
+def nvtx_range(name, enabled):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
 def tokenize_prompts(tokenizer, prompts):
     return [tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts]
 
@@ -110,7 +123,7 @@ def score_direct_worker_plus_minus_detailed(
     )
     score_s = time.perf_counter() - score_t0
     loss_plus, loss_minus = split_direct_worker_losses(result, len(prompt_token_ids))
-    return loss_plus, loss_minus, {
+    detail = {
         "score_direct_worker_s": score_s,
         "score_num_outputs": int(result["num_reqs"]),
         "score_num_prompt_positions": int(result["num_prompt_tokens"]),
@@ -119,7 +132,93 @@ def score_direct_worker_plus_minus_detailed(
         "score_num_active_loras": int(result["num_active_loras"]),
         "score_cudagraph_mode": str(result["cudagraph_mode"]),
         "score_loss_impl": str(result.get("loss_impl", loss_impl)),
+        "score_cache_hit": bool(result.get("cache_hit", False)),
     }
+    for key, value in result.get("profile_s", {}).items():
+        detail[f"score_worker_{key}"] = float(value)
+    for key, value in result.get("profile_cuda_ms", {}).items():
+        detail[f"score_worker_cuda_{key}"] = float(value)
+    return loss_plus, loss_minus, detail
+
+
+def _update_lora_slots_and_score_on_worker(
+    worker,
+    *,
+    prompt_token_ids,
+    lora_ids,
+    plus_id,
+    minus_id,
+    directions_2d,
+    eps,
+    max_logits_tokens,
+    loss_impl,
+):
+    from zo_vllm.core.temp_lora_runtime import (
+        _update_lora_slots_from_directions_in_vllm_model,
+    )
+
+    _update_lora_slots_from_directions_in_vllm_model(
+        worker.model_runner.model,
+        plus_id=plus_id,
+        minus_id=minus_id,
+        directions_2d=directions_2d,
+        eps=eps,
+    )
+    return worker.model_runner.zo_score_prompt_token_ids(
+        prompt_token_ids,
+        lora_ids=lora_ids,
+        max_logits_tokens=max_logits_tokens,
+        loss_impl=loss_impl,
+    )
+
+
+def score_direct_worker_update_lora_plus_minus_detailed(
+    llm,
+    prompt_token_ids,
+    *,
+    temp_lora,
+    directions_2d,
+    eps,
+    max_logits_tokens,
+    loss_impl,
+):
+    batch_token_ids = prompt_token_ids + prompt_token_ids
+    lora_ids = [temp_lora.plus_id] * len(prompt_token_ids) + [
+        temp_lora.minus_id
+    ] * len(prompt_token_ids)
+    score_t0 = time.perf_counter()
+    result = llm.llm_engine.model_executor.collective_rpc(
+        _update_lora_slots_and_score_on_worker,
+        kwargs={
+            "prompt_token_ids": batch_token_ids,
+            "lora_ids": lora_ids,
+            "plus_id": temp_lora.plus_id,
+            "minus_id": temp_lora.minus_id,
+            "directions_2d": directions_2d,
+            "eps": eps,
+            "max_logits_tokens": max_logits_tokens,
+            "loss_impl": loss_impl,
+        },
+        single_value=True,
+    )
+    score_s = time.perf_counter() - score_t0
+    loss_plus, loss_minus = split_direct_worker_losses(result, len(prompt_token_ids))
+    detail = {
+        "score_direct_worker_s": score_s,
+        "score_num_outputs": int(result["num_reqs"]),
+        "score_num_prompt_positions": int(result["num_prompt_tokens"]),
+        "score_num_loss_tokens": int(result["num_tokens"]),
+        "score_num_tokens_padded": int(result["num_tokens_padded"]),
+        "score_num_active_loras": int(result["num_active_loras"]),
+        "score_cudagraph_mode": str(result["cudagraph_mode"]),
+        "score_loss_impl": str(result.get("loss_impl", loss_impl)),
+        "score_cache_hit": bool(result.get("cache_hit", False)),
+    }
+    for key, value in result.get("profile_s", {}).items():
+        detail[f"score_worker_{key}"] = float(value)
+    for key, value in result.get("profile_cuda_ms", {}).items():
+        detail[f"score_worker_cuda_{key}"] = float(value)
+    return loss_plus, loss_minus, detail
 
 
 def score_direct_worker_base_detailed(
@@ -143,7 +242,7 @@ def score_direct_worker_base_detailed(
     score_s = time.perf_counter() - score_t0
     total_nll = float(sum(result["request_nll_sums"]))
     total_tokens = int(sum(result["request_num_tokens"]))
-    return total_nll / total_tokens, {
+    detail = {
         "score_direct_worker_s": score_s,
         "score_num_outputs": int(result["num_reqs"]),
         "score_num_prompt_positions": int(result["num_prompt_tokens"]),
@@ -152,7 +251,13 @@ def score_direct_worker_base_detailed(
         "score_num_active_loras": int(result["num_active_loras"]),
         "score_cudagraph_mode": str(result["cudagraph_mode"]),
         "score_loss_impl": str(result.get("loss_impl", loss_impl)),
+        "score_cache_hit": bool(result.get("cache_hit", False)),
     }
+    for key, value in result.get("profile_s", {}).items():
+        detail[f"score_worker_{key}"] = float(value)
+    for key, value in result.get("profile_cuda_ms", {}).items():
+        detail[f"score_worker_cuda_{key}"] = float(value)
+    return total_nll / total_tokens, detail
 
 
 def main():
@@ -168,13 +273,15 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--direction-sampling", choices=["exact", "flat"], default="exact")
     parser.add_argument("--train-scope", choices=["lora_only"], default="lora_only")
     parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
-    parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
+    parser.add_argument("--enforce-eager", choices=["0", "1"], default="0")
     parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
     parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
     parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
+    parser.add_argument("--qkv-weight-update", choices=["separate", "batched"], default="separate")
     parser.add_argument("--sync-weight-update", choices=["0", "1"], default="1")
     parser.add_argument("--scoring-backend", choices=["generate", "direct_worker"], default="generate")
     parser.add_argument("--direct-worker-max-logits-tokens", type=int, default=8192)
@@ -182,6 +289,7 @@ def main():
     parser.add_argument("--slot-pipeline", choices=["0", "1"], default="0")
     parser.add_argument("--base-eval-mode", choices=["generate", "direct_worker", "skip"], default="generate")
     parser.add_argument("--profile-mode", choices=["minimal", "detailed"], default="minimal")
+    parser.add_argument("--fuse-lora-score", choices=["0", "1"], default="0")
     parser.add_argument("--direction-digest", action="store_true")
     parser.add_argument("--record-history", action="store_true")
     parser.add_argument("--trace-step-events", action="store_true")
@@ -209,6 +317,7 @@ def main():
             "--scoring-backend direct_worker requires GPU residency and direct LoRA injection"
         )
     slot_pipeline = bool(int(args.slot_pipeline))
+    fuse_lora_score = bool(int(args.fuse_lora_score))
     if slot_pipeline and args.scoring_backend != "direct_worker":
         raise SystemExit("--slot-pipeline requires --scoring-backend direct_worker")
     direct_lora_from_directions = bool(int(args.direct_lora_from_directions))
@@ -218,6 +327,25 @@ def main():
         raise SystemExit(
             "--direct-lora-from-directions requires GPU residency and direct LoRA injection"
         )
+    if fuse_lora_score and (
+        args.scoring_backend != "direct_worker"
+        or not direct_lora_from_directions
+        or slot_pipeline
+    ):
+        raise SystemExit(
+            "--fuse-lora-score requires direct_worker, "
+            "--direct-lora-from-directions 1, and --slot-pipeline 0"
+        )
+    step_nvtx_enabled = os.environ.get("VLLM_ZO_STEP_NVTX", "0") == "1"
+    step_nvtx_skip = int(os.environ.get("VLLM_ZO_STEP_NVTX_SKIP", "0"))
+    step_nvtx_limit = int(os.environ.get("VLLM_ZO_STEP_NVTX_LIMIT", "0"))
+
+    def should_emit_step_nvtx(measured_index):
+        if not step_nvtx_enabled:
+            return False
+        if measured_index <= step_nvtx_skip:
+            return False
+        return step_nvtx_limit <= 0 or measured_index <= step_nvtx_skip + step_nvtx_limit
 
     from vllm import LLM
     from zo_vllm.core.vllm_scorer import VLLMScorer
@@ -237,8 +365,12 @@ def main():
         f"lr={args.lr} eps={args.eps} profile_mode={args.profile_mode} "
         f"enforce_eager={args.enforce_eager} scoring_backend={args.scoring_backend} "
         f"sync_weight_update={args.sync_weight_update} slot_pipeline={args.slot_pipeline} "
+        f"qkv_weight_update={args.qkv_weight_update} "
+        f"fuse_lora_score={args.fuse_lora_score} "
         f"direct_worker_loss_impl={args.direct_worker_loss_impl} "
         f"direct_lora_from_directions={args.direct_lora_from_directions} "
+        f"direction_sampling={args.direction_sampling} "
+        f"step_nvtx={int(step_nvtx_enabled)} "
         f"model_name={model_name}",
         flush=True,
     )
@@ -266,6 +398,7 @@ def main():
         master_device="cuda" if torch.cuda.is_available() else "cpu",
         random_device=args.zo_random_device,
         train_scope=args.train_scope,
+        direction_sampling=args.direction_sampling,
     )
     controller = LOZOController(hf_model, config)
     temp_loras = [
@@ -348,6 +481,7 @@ def main():
         "score_postprocess_s": [],
         "score_direct_worker_s": [],
         "prep_launch_s": [],
+        "prep_wait_s": [],
     }
 
     prep_stream = torch.cuda.Stream() if slot_pipeline and torch.cuda.is_available() else None
@@ -368,6 +502,13 @@ def main():
             t0 = time.perf_counter()
             if direct_lora_from_directions:
                 build_lora_s = 0.0
+                if slot_pipeline:
+                    # Each double-buffered slot pair must receive A/V at least
+                    # once for the current V cache generation. The simplest
+                    # safe training path writes A together with B for pipeline
+                    # mode; this is still cheap enough to overlap with scoring.
+                    for direction in directions_2d.values():
+                        direction["v_refreshed"] = True
                 runtime.update_plus_minus_from_directions(
                     directions_2d,
                     eps=config.eps,
@@ -406,185 +547,257 @@ def main():
     step = 0
     measured_train_t0 = None
     measured_train_t1 = None
-    pipelined_state = None
+    prep_executor = ThreadPoolExecutor(max_workers=1) if slot_pipeline else None
+    pipelined_future = None
     if slot_pipeline:
-        pipelined_state = prepare_lora_state(
-            temp_loras[0], 0, 1, np.random.randint(1000000000)
+        pipelined_future = prep_executor.submit(
+            prepare_lora_state,
+            temp_loras[0],
+            0,
+            1,
+            np.random.randint(1000000000),
         )
-    for _epoch in range(total_target_steps // len(prompt_batches) + 2):
-        for batch_prompts, batch_token_ids in zip(prompt_batches, prompt_token_id_batches):
+    try:
+        for _epoch in range(total_target_steps // len(prompt_batches) + 2):
+            for batch_prompts, batch_token_ids in zip(prompt_batches, prompt_token_id_batches):
+                if step >= total_target_steps:
+                    break
+                step += 1
+                measured_step = step > args.warmup_steps
+                measured_index = step - args.warmup_steps
+                if measured_step and measured_train_t0 is None:
+                    measured_train_t0 = time.perf_counter()
+
+                def record_timing(key, value):
+                    if measured_step:
+                        timing[key].append(value)
+
+                step_t0 = time.perf_counter()
+                emit_step_nvtx = measured_step and should_emit_step_nvtx(measured_index)
+                step_total_nvtx_pushed = emit_step_nvtx and torch.cuda.is_available()
+                if step_total_nvtx_pushed:
+                    torch.cuda.nvtx.range_push("zo_step.total")
+                if slot_pipeline:
+                    if pipelined_future is None:
+                        raise RuntimeError("slot pipeline state was not submitted")
+                    wait_t0 = time.perf_counter()
+                    pipelined_state = pipelined_future.result()
+                    record_timing("prep_wait_s", time.perf_counter() - wait_t0)
+                    if pipelined_state["ready_event"] is not None:
+                        torch.cuda.current_stream().wait_event(pipelined_state["ready_event"])
+                    temp_lora = pipelined_state["runtime"]
+                    random_seed = pipelined_state["random_seed"]
+                    directions_2d = pipelined_state["directions_2d"]
+                    directions_1d = pipelined_state["directions_1d"]
+                    direction_digest = pipelined_state["direction_digest"]
+                    record_timing("direction_s", pipelined_state["direction_s"])
+                    record_timing("build_lora_s", pipelined_state["build_lora_s"])
+                    record_timing("lora_update_s", pipelined_state["lora_update_s"])
+                    record_timing("prep_launch_s", pipelined_state["prep_launch_s"])
+                    if args.profile_mode == "detailed" and measured_step:
+                        for worker_info in temp_lora.last_update_info.get("workers", []):
+                            for key, value in worker_info.get("profile_s", {}).items():
+                                timing.setdefault(f"lora_worker_{key}_s", []).append(
+                                    float(value)
+                                )
+                    pipelined_future = None
+                    if step < total_target_steps:
+                        next_slot_idx = 1 - int(pipelined_state["slot_idx"])
+                        pipelined_future = prep_executor.submit(
+                            prepare_lora_state,
+                            temp_loras[next_slot_idx],
+                            next_slot_idx,
+                            step + 1,
+                            np.random.randint(1000000000),
+                        )
+                else:
+                    record_timing("prep_wait_s", 0.0)
+                    random_seed = np.random.randint(1000000000)
+
+                    if args.trace_step_events:
+                        print(f"[trace] step={step} direction_start", flush=True)
+                    t0 = time.perf_counter()
+                    with nvtx_range("zo_step.direction", emit_step_nvtx):
+                        directions_2d, directions_1d = controller.sample_direction(random_seed)
+                        direction_digest = None
+                        if args.direction_digest:
+                            direction_digest = digest_named_uv(
+                                (name, item["U"], item["V"]) for name, item in directions_2d.items()
+                            )
+                    record_timing("direction_s", time.perf_counter() - t0)
+                    if args.trace_step_events:
+                        print(f"[trace] step={step} direction_done", flush=True)
+
+                    t0 = time.perf_counter()
+                    if direct_lora_from_directions:
+                        record_timing("build_lora_s", 0.0)
+                        if fuse_lora_score:
+                            record_timing("lora_update_s", 0.0)
+                            if args.trace_step_events:
+                                print(f"[trace] step={step} lora_update_fused", flush=True)
+                        else:
+                            if args.trace_step_events:
+                                print(f"[trace] step={step} lora_update_from_directions_start", flush=True)
+                            with nvtx_range("zo_step.lora_update", emit_step_nvtx):
+                                temp_lora.update_plus_minus_from_directions(
+                                    directions_2d,
+                                    eps=config.eps,
+                                    step=step,
+                                )
+                    else:
+                        if args.trace_step_events:
+                            print(f"[trace] step={step} build_lora_start", flush=True)
+                        lora_device = "cuda" if args.lora_residency == "gpu" else "cpu"
+                        with nvtx_range("zo_step.build_lora", emit_step_nvtx):
+                            plus_A, plus_B, minus_A, minus_B = controller.build_temp_lora_pair_tensors(
+                                directions_2d, output_device=lora_device
+                            )
+                        record_timing("build_lora_s", time.perf_counter() - t0)
+                        t0 = time.perf_counter()
+                        if args.trace_step_events:
+                            print(f"[trace] step={step} lora_update_start", flush=True)
+                        with nvtx_range("zo_step.lora_update", emit_step_nvtx):
+                            temp_lora.update_plus_minus(plus_A, plus_B, minus_A, minus_B, step=step)
+                    if not (direct_lora_from_directions and fuse_lora_score):
+                        record_timing("lora_update_s", time.perf_counter() - t0)
+                        if args.profile_mode == "detailed" and measured_step:
+                            for worker_info in temp_lora.last_update_info.get("workers", []):
+                                for key, value in worker_info.get("profile_s", {}).items():
+                                    timing.setdefault(f"lora_worker_{key}_s", []).append(
+                                        float(value)
+                                    )
+                    if args.trace_step_events:
+                        print(f"[trace] step={step} lora_update_done", flush=True)
+                    record_timing("prep_launch_s", 0.0)
+
+                if args.trace_step_events:
+                    print(f"[trace] step={step} score_start", flush=True)
+                t0 = time.perf_counter()
+                if emit_step_nvtx and torch.cuda.is_available():
+                    torch.cuda.nvtx.range_push("zo_step.score")
+                if args.scoring_backend == "direct_worker":
+                    if fuse_lora_score:
+                        loss_plus, loss_minus, score_detail = (
+                            score_direct_worker_update_lora_plus_minus_detailed(
+                                llm,
+                                batch_token_ids,
+                                temp_lora=temp_lora,
+                                directions_2d=directions_2d,
+                                eps=config.eps,
+                                max_logits_tokens=args.direct_worker_max_logits_tokens,
+                                loss_impl=args.direct_worker_loss_impl,
+                            )
+                        )
+                    else:
+                        loss_plus, loss_minus, score_detail = score_direct_worker_plus_minus_detailed(
+                            llm,
+                            batch_token_ids,
+                            plus_id=temp_lora.plus_id,
+                            minus_id=temp_lora.minus_id,
+                            max_logits_tokens=args.direct_worker_max_logits_tokens,
+                            loss_impl=args.direct_worker_loss_impl,
+                        )
+                    if args.profile_mode == "detailed" and measured_step:
+                        timing["score_direct_worker_s"].append(
+                            score_detail["score_direct_worker_s"]
+                        )
+                        for key, value in score_detail.items():
+                            if key.startswith("score_worker_"):
+                                timing.setdefault(key, []).append(float(value))
+                elif args.profile_mode == "detailed":
+                    loss_plus, loss_minus, score_detail = scorer.score_plus_minus_detailed(
+                        batch_prompts, temp_lora
+                    )
+                    record_timing("score_request_build_s", score_detail["score_request_build_s"])
+                    record_timing("score_generate_s", score_detail["score_generate_s"])
+                    record_timing("score_postprocess_s", score_detail["score_postprocess_s"])
+                else:
+                    loss_plus, loss_minus = scorer.score_plus_minus(batch_prompts, temp_lora)
+                if emit_step_nvtx and torch.cuda.is_available():
+                    torch.cuda.nvtx.range_pop()
+                record_timing("score_s", time.perf_counter() - t0)
+                if args.trace_step_events:
+                    print(f"[trace] step={step} score_done", flush=True)
+
+                c = controller.compute_c(loss_plus, loss_minus)
+
+                if args.trace_step_events:
+                    print(f"[trace] step={step} weight_update_start", flush=True)
+                t0 = time.perf_counter()
+                with nvtx_range("zo_step.weight_update", emit_step_nvtx):
+                    if args.weight_update == "copy":
+                        updated_weights = controller.apply_update_to_master(
+                            directions_2d, directions_1d, c
+                        )
+                        weight_sync.sync(updated_weights)
+                    else:
+                        weight_sync.apply_lozo_update(
+                            directions_2d,
+                            directions_1d,
+                            c=c,
+                            lr=config.lr,
+                            weight_decay=config.weight_decay,
+                            precision=args.weight_update_precision,
+                            sync_device=bool(int(args.sync_weight_update)),
+                            qkv_update_mode=args.qkv_weight_update,
+                        )
+                record_timing("weight_update_s", time.perf_counter() - t0)
+                if args.profile_mode == "detailed" and measured_step:
+                    for worker_info in weight_sync.last_update_info.get("workers", []):
+                        if not worker_info:
+                            continue
+                        for key, value in worker_info.get("profile_s", {}).items():
+                            timing.setdefault(f"weight_worker_{key}_s", []).append(
+                                float(value)
+                            )
+                if args.trace_step_events:
+                    print(f"[trace] step={step} weight_update_done", flush=True)
+                if step_total_nvtx_pushed:
+                    torch.cuda.nvtx.range_pop()
+                if measured_step:
+                    timing["step_s"].append(time.perf_counter() - step_t0)
+                    measured_train_t1 = time.perf_counter()
+
+                    if args.record_history:
+                        history.append({
+                            "step": measured_index,
+                            "raw_step": step,
+                            "seed": int(random_seed),
+                            "loss_plus": float(loss_plus),
+                            "loss_minus": float(loss_minus),
+                            "c": float(c),
+                            "direction_digest": direction_digest,
+                            "step_s": float(timing["step_s"][-1]),
+                        })
+
+                    if args.progress_interval > 0 and measured_index % args.progress_interval == 0:
+                        print(
+                            f"[vLLM] step={measured_index} plus={loss_plus:.6f} minus={loss_minus:.6f} "
+                            f"c={c:.6f} step_s={timing['step_s'][-1]:.6f}",
+                            flush=True,
+                        )
+
+                    if args.eval_interval > 0 and measured_index % args.eval_interval == 0:
+                        if args.base_eval_mode == "skip":
+                            print(f"[vLLM] step={measured_index} eval_loss=skipped", flush=True)
+                        elif args.base_eval_mode == "direct_worker":
+                            val_loss, _ = score_direct_worker_base_detailed(
+                                llm,
+                                eval_token_ids,
+                                max_logits_tokens=args.direct_worker_max_logits_tokens,
+                                loss_impl=args.direct_worker_loss_impl,
+                            )
+                            eval_losses.append({"step": measured_index, "loss": float(val_loss)})
+                            print(f"[vLLM] step={measured_index} eval_loss={val_loss:.6f}", flush=True)
+                        else:
+                            val_loss = scorer.score_base(eval_prompts)
+                            eval_losses.append({"step": measured_index, "loss": float(val_loss)})
+                            print(f"[vLLM] step={measured_index} eval_loss={val_loss:.6f}", flush=True)
             if step >= total_target_steps:
                 break
-            step += 1
-            measured_step = step > args.warmup_steps
-            measured_index = step - args.warmup_steps
-            if measured_step and measured_train_t0 is None:
-                measured_train_t0 = time.perf_counter()
-
-            def record_timing(key, value):
-                if measured_step:
-                    timing[key].append(value)
-
-            step_t0 = time.perf_counter()
-            if slot_pipeline:
-                if pipelined_state is None:
-                    raise RuntimeError("slot pipeline state was not prepared")
-                if pipelined_state["ready_event"] is not None:
-                    torch.cuda.current_stream().wait_event(pipelined_state["ready_event"])
-                temp_lora = pipelined_state["runtime"]
-                random_seed = pipelined_state["random_seed"]
-                directions_2d = pipelined_state["directions_2d"]
-                directions_1d = pipelined_state["directions_1d"]
-                direction_digest = pipelined_state["direction_digest"]
-                record_timing("direction_s", pipelined_state["direction_s"])
-                record_timing("build_lora_s", pipelined_state["build_lora_s"])
-                record_timing("lora_update_s", pipelined_state["lora_update_s"])
-                record_timing("prep_launch_s", pipelined_state["prep_launch_s"])
-                next_state = None
-                if step < total_target_steps:
-                    next_slot_idx = 1 - int(pipelined_state["slot_idx"])
-                    next_state = prepare_lora_state(
-                        temp_loras[next_slot_idx],
-                        next_slot_idx,
-                        step + 1,
-                        np.random.randint(1000000000),
-                    )
-            else:
-                random_seed = np.random.randint(1000000000)
-
-                if args.trace_step_events:
-                    print(f"[trace] step={step} direction_start", flush=True)
-                t0 = time.perf_counter()
-                directions_2d, directions_1d = controller.sample_direction(random_seed)
-                direction_digest = None
-                if args.direction_digest:
-                    direction_digest = digest_named_uv(
-                        (name, item["U"], item["V"]) for name, item in directions_2d.items()
-                    )
-                record_timing("direction_s", time.perf_counter() - t0)
-                if args.trace_step_events:
-                    print(f"[trace] step={step} direction_done", flush=True)
-
-                t0 = time.perf_counter()
-                if direct_lora_from_directions:
-                    record_timing("build_lora_s", 0.0)
-                    if args.trace_step_events:
-                        print(f"[trace] step={step} lora_update_from_directions_start", flush=True)
-                    temp_lora.update_plus_minus_from_directions(
-                        directions_2d,
-                        eps=config.eps,
-                        step=step,
-                    )
-                else:
-                    if args.trace_step_events:
-                        print(f"[trace] step={step} build_lora_start", flush=True)
-                    lora_device = "cuda" if args.lora_residency == "gpu" else "cpu"
-                    plus_A, plus_B, minus_A, minus_B = controller.build_temp_lora_pair_tensors(
-                        directions_2d, output_device=lora_device
-                    )
-                    record_timing("build_lora_s", time.perf_counter() - t0)
-                    t0 = time.perf_counter()
-                    if args.trace_step_events:
-                        print(f"[trace] step={step} lora_update_start", flush=True)
-                    temp_lora.update_plus_minus(plus_A, plus_B, minus_A, minus_B, step=step)
-                record_timing("lora_update_s", time.perf_counter() - t0)
-                if args.trace_step_events:
-                    print(f"[trace] step={step} lora_update_done", flush=True)
-                record_timing("prep_launch_s", 0.0)
-
-            if args.trace_step_events:
-                print(f"[trace] step={step} score_start", flush=True)
-            t0 = time.perf_counter()
-            if args.scoring_backend == "direct_worker":
-                loss_plus, loss_minus, score_detail = score_direct_worker_plus_minus_detailed(
-                    llm,
-                    batch_token_ids,
-                    plus_id=temp_lora.plus_id,
-                    minus_id=temp_lora.minus_id,
-                    max_logits_tokens=args.direct_worker_max_logits_tokens,
-                    loss_impl=args.direct_worker_loss_impl,
-                )
-                if args.profile_mode == "detailed" and measured_step:
-                    timing["score_direct_worker_s"].append(
-                        score_detail["score_direct_worker_s"]
-                    )
-            elif args.profile_mode == "detailed":
-                loss_plus, loss_minus, score_detail = scorer.score_plus_minus_detailed(
-                    batch_prompts, temp_lora
-                )
-                record_timing("score_request_build_s", score_detail["score_request_build_s"])
-                record_timing("score_generate_s", score_detail["score_generate_s"])
-                record_timing("score_postprocess_s", score_detail["score_postprocess_s"])
-            else:
-                loss_plus, loss_minus = scorer.score_plus_minus(batch_prompts, temp_lora)
-            record_timing("score_s", time.perf_counter() - t0)
-            if args.trace_step_events:
-                print(f"[trace] step={step} score_done", flush=True)
-
-            c = controller.compute_c(loss_plus, loss_minus)
-
-            if args.trace_step_events:
-                print(f"[trace] step={step} weight_update_start", flush=True)
-            t0 = time.perf_counter()
-            if args.weight_update == "copy":
-                updated_weights = controller.apply_update_to_master(directions_2d, directions_1d, c)
-                weight_sync.sync(updated_weights)
-            else:
-                weight_sync.apply_lozo_update(
-                    directions_2d,
-                    directions_1d,
-                    c=c,
-                    lr=config.lr,
-                    weight_decay=config.weight_decay,
-                    precision=args.weight_update_precision,
-                    sync_device=bool(int(args.sync_weight_update)),
-                )
-            record_timing("weight_update_s", time.perf_counter() - t0)
-            if args.trace_step_events:
-                print(f"[trace] step={step} weight_update_done", flush=True)
-            if measured_step:
-                timing["step_s"].append(time.perf_counter() - step_t0)
-                measured_train_t1 = time.perf_counter()
-            if slot_pipeline:
-                pipelined_state = next_state
-
-            if args.record_history and measured_step:
-                history.append({
-                    "step": measured_index,
-                    "raw_step": step,
-                    "seed": int(random_seed),
-                    "loss_plus": float(loss_plus),
-                    "loss_minus": float(loss_minus),
-                    "c": float(c),
-                    "direction_digest": direction_digest,
-                    "step_s": float(timing["step_s"][-1]),
-                })
-
-            if args.progress_interval > 0 and measured_step and measured_index % args.progress_interval == 0:
-                print(
-                    f"[vLLM] step={measured_index} plus={loss_plus:.6f} minus={loss_minus:.6f} "
-                    f"c={c:.6f} step_s={timing['step_s'][-1]:.6f}",
-                    flush=True,
-                )
-
-            if args.eval_interval > 0 and measured_step and measured_index % args.eval_interval == 0:
-                if args.base_eval_mode == "skip":
-                    print(f"[vLLM] step={measured_index} eval_loss=skipped", flush=True)
-                elif args.base_eval_mode == "direct_worker":
-                    val_loss, _ = score_direct_worker_base_detailed(
-                        llm,
-                        eval_token_ids,
-                        max_logits_tokens=args.direct_worker_max_logits_tokens,
-                        loss_impl=args.direct_worker_loss_impl,
-                    )
-                    eval_losses.append({"step": measured_index, "loss": float(val_loss)})
-                    print(f"[vLLM] step={measured_index} eval_loss={val_loss:.6f}", flush=True)
-                else:
-                    val_loss = scorer.score_base(eval_prompts)
-                    eval_losses.append({"step": measured_index, "loss": float(val_loss)})
-                    print(f"[vLLM] step={measured_index} eval_loss={val_loss:.6f}", flush=True)
-        if step >= total_target_steps:
-            break
+    finally:
+        if prep_executor is not None:
+            prep_executor.shutdown(wait=True)
 
     total_s = 0.0 if measured_train_t0 is None else measured_train_t1 - measured_train_t0
     if args.base_eval_mode == "skip":
@@ -625,17 +838,7 @@ def main():
             "history": history,
             "timing": {
                 "total_s": float(total_s),
-                "step_s": summarize(timing["step_s"]),
-                "direction_s": summarize(timing["direction_s"]),
-                "build_lora_s": summarize(timing["build_lora_s"]),
-                "lora_update_s": summarize(timing["lora_update_s"]),
-                "score_s": summarize(timing["score_s"]),
-                "weight_update_s": summarize(timing["weight_update_s"]),
-                "score_request_build_s": summarize(timing["score_request_build_s"]),
-                "score_generate_s": summarize(timing["score_generate_s"]),
-                "score_postprocess_s": summarize(timing["score_postprocess_s"]),
-                "score_direct_worker_s": summarize(timing["score_direct_worker_s"]),
-                "prep_launch_s": summarize(timing["prep_launch_s"]),
+                **{key: summarize(value) for key, value in timing.items()},
             },
         }, f, indent=2)
 

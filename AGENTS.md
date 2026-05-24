@@ -21,7 +21,7 @@ VLLM_BATCH_INVARIANT=0          # 训练默认关闭；专门做batch不变性�
 # vLLM引擎参数
 gpu_memory_utilization=0.5      # GPU内存利用率
 max_lora_rank=16                # LoRA最大rank
-enforce_eager=1                 # 默认保留eager；长跑吞吐实验可设为0
+enforce_eager=0                 # Phase 3默认使用vLLM compile/CUDA graph路径；eager仅作消融
 
 # LOZO参数
 eps=1e-3                        # 扰动步长（论文对齐）
@@ -53,6 +53,10 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 只保存可复现实验输出并保持 git-ignore；提交代码时只提交 runner、collector 和状态文档。
 当 vLLM scoring 进入热路径时，优先使用 direct worker scoring 和固定 GPU LoRA slot，
 避免把完整 `generate(prompt_logprobs=1)` serving 包装当作最终训练路径。
+Phase 3 速度统计用外层 wall-clock step 作为主指标，不能用子步骤相加替代总步时；
+OPT-1.3B/2.7B 的运行目录 slug 使用 `opt1p3b`/`opt2p7b`，避免省略小数点造成歧义。
+vLLM direct-score cache 只能缓存已验证不会跨 batch 失效的输入派生张量；不要跨不相邻
+batch 缓存可变 attention metadata。
 
 ## Phase 1 结论
 
@@ -252,7 +256,7 @@ Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍�
 
 短验证结果：
 - vLLM CPU mock vs GPU residency：3/3 steps 的 seed、U/V digest、loss_plus/loss_minus、`c` 完全一致
-- 默认训练配置（GPU residency, batch_invariant=0, enforce_eager=1）3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.007089`，`max_loss_minus_diff=0.001356`，`max_c_diff=2.866773`
+- 旧eager验收配置（GPU residency, batch_invariant=0, enforce_eager=1）3-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`max_loss_plus_diff=0.007089`，`max_loss_minus_diff=0.001356`，`max_c_diff=2.866773`
 - batch=2短跑速度：CPU mock `step_s_mean=0.276578`，GPU residency `step_s_mean=0.238013`
 - direct slot updater 20-step side-by-side vs LOZO baseline：`direction_digest_mismatch_steps=[]`，`sign_fail_steps=[]`，`max_loss_plus_diff=0.009428`，`max_loss_minus_diff=0.009200`，`max_c_diff=6.066894`
 - direct vs manager 20-step：`lora_update_s_mean` `0.010747` vs `0.014718`（direct快 `1.37x`），`step_s_mean` `0.209159` vs `0.214355`（整体快 `1.03x`）
@@ -295,12 +299,14 @@ W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
 
 | batch_invariant | enforce_eager | total_s | step_s_mean | tail10_step_s_mean | 结论 |
 |---:|---:|---:|---:|---:|---|
-| 0 | 1 | 4.6126 | 0.2273 | 0.2106 | 推荐默认；启动轻，稳态接近最快 |
+| 0 | 1 | 4.6126 | 0.2273 | 0.2106 | 旧eager消融；启动轻 |
 | 0 | 0 | 4.2308 | 0.2092 | 0.2001 | 训练loop最快，但有torch.compile/CUDA graph启动成本 |
 | 1 | 1 | 4.5978 | 0.2257 | 0.2188 | 旧验收路径 |
 | 1 | 0 | 4.5380 | 0.2235 | 0.2142 | batch invariant抵消了大部分compile收益 |
 
-所有组合的 step seed 和 U/V digest 完全一致。`enforce_eager=0` 在一次缓存命中的短跑里仍有约 `23s` vLLM引擎初始化成本；300-step 以内总 wall-clock 通常不划算，长跑才考虑。
+所有组合的 step seed 和 U/V digest 完全一致。Phase 3测速默认使用
+`enforce_eager=0`，即vLLM真实默认的 compile/CUDA graph路径；`enforce_eager=1`
+只作为旧验收或消融口径。
 
 ## Phase 2 Milestone 4: 梯度对齐验证 完成 ✅
 

@@ -11,18 +11,20 @@ fixing several obvious q=1 throughput problems:
 - direct worker scoring for prompt token IDs
 - direct plus/minus LoRA slot writes from U/V directions
 - optional warmup steps excluded from measured timing
-- OPT-1.3B / OPT-2.7B scaling sweep against LOZO at batch 16, 32, 64, and 128
+- corrected LOZO wall-clock step timing that includes update overhead
+- flat GPU direction sampling and batched packed-QKV weight updates
 
-Latest formal scaling artifacts are under:
+Latest formal checkpoint artifacts are under:
 
 ```text
-phase3/results/phase3_scaling_opt13b_opt27b_b16_32_64_128_s1000_w5_20260523/
+local ignored vLLM run ending in 20260524_123159
+local ignored LOZO run ending in 20260524_121646
 ```
 
 The result directory is git-ignored; the key summary is recorded in
-`phase3/STATUS.md`. This run uses `base_eval_mode=skip` for the vLLM side, so it
-is a speed-scaling benchmark rather than a Phase 2-style convergence acceptance
-run.
+`phase3/STATUS.md`. These speed runs use `base_eval_mode=skip` on the vLLM side,
+so they are throughput checkpoints rather than Phase 2-style convergence
+acceptance runs. New `facebook/opt-1.3b` runs should use the `opt1p3b` slug.
 
 ## Scope
 
@@ -59,10 +61,10 @@ The first Phase 3 question is whether vLLM remains faster than LOZO after both
 sides remove avoidable debug overhead, while keeping the perturbation count at
 `q=1`.
 
-The controlled configuration is:
+The controlled profiling configuration is:
 
 ```text
-model=facebook/opt-2.7b
+model=facebook/opt-1.3b or facebook/opt-2.7b
 dataset=GLUE SST-2 train subset
 steps=1000
 batch_size=16
@@ -84,14 +86,15 @@ lora_injection=direct
 weight_update=direct
 weight_update_precision=param
 batch_invariant=0
+enforce_eager=0
 direction_digest=off
 ```
 
 ## Current q=1 Results
 
-The latest speed checkpoint is the scaling sweep summarized in
-`phase3/STATUS.md`. The older q=1 results below are retained because they
-document the bottleneck that motivated direct worker scoring.
+The latest speed checkpoint is summarized in `phase3/STATUS.md`. The older q=1
+results below are retained because they document the bottleneck that motivated
+direct worker scoring.
 
 Formal q=1 speed runs use the same configuration above with `eval_interval=0`.
 Initial and final losses are still computed outside the timed training loop.
@@ -99,11 +102,35 @@ Initial and final losses are still computed outside the timed training loop.
 Run artifacts:
 
 ```text
+local ignored vLLM run ending in 20260524_123159
+local ignored LOZO run ending in 20260524_121646
 phase3/results/phase3_q1_speed_noeval_b16_s1000_20260523_185158/
 phase3/results/phase3_q1_detailed_noeval_b16_s1000_20260523_185514/
 phase3/results/phase3_q1_speed_noeval_b16_s1000_20260523_rerun/
 phase3/results/phase3_q1_batch_sweep_b16-32-64-128_s1000_20260523_live/
 ```
+
+Latest OPT-1.3B batch-16 checkpoint:
+
+| backend | total s/step | speedup vs LOZO | notes |
+|---|---:|---:|---|
+| LOZO minimal | 0.051668 | 1.00x | corrected full wall-clock step |
+| vLLM detailed | 0.017034 | 3.03x | direct worker score, direct slot/update path |
+
+Latest vLLM breakdown:
+
+| component | mean s/step |
+|---|---:|
+| score | 0.013325 |
+| weight_update | 0.002672 |
+| direction | 0.000795 |
+| lora_update | 0.000213 |
+| build_lora | 0.000000 |
+
+The current checkpoint is not done: sampled vLLM GPU utilization is still about
+72% mean in the training window, below the active target. The next profiling
+work should focus on direct worker scoring idle time, not on multiple
+perturbation directions.
 
 Accepted batch sweep:
 
@@ -328,7 +355,7 @@ CUDA_VISIBLE_DEVICES=<GPU> .venv/bin/python -u \
   --num-samples 1000 \
   --steps 200 \
   --warmup-steps 5 \
-  --enforce-eager 1 \
+  --enforce-eager 0 \
   --modes base,static_lora,rewrite_lora_only,score_with_rewrite \
   --output-dir phase3/results/<run_id>/microbench_b16
 ```
@@ -403,8 +430,8 @@ CUDA_VISIBLE_DEVICES=<GPU> VLLM_ENABLE_V1_MULTIPROCESSING=0 \
   --eps 1e-3 \
   --step-interval 50 \
   --eval-interval 100 \
-  --enforce-eager 1 \
-  --output-dir phase3/results/<run_id>/vllm_minimal_eager1
+  --enforce-eager 0 \
+  --output-dir phase3/results/<run_id>/vllm_minimal_eager0
 ```
 
 ## Acceptance Gates

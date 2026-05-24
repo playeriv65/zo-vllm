@@ -22,6 +22,7 @@ class LOZOConfig:
     master_device: str = "cpu"
     random_device: str = "cpu"
     train_scope: str = "lora_only"
+    direction_sampling: str = "exact"
 
 
 class LOZOController:
@@ -54,9 +55,14 @@ class LOZOController:
     ):
         self.hf_model = hf_model
         self.config = config
+        if self.config.direction_sampling not in {"exact", "flat"}:
+            raise ValueError(
+                f"unknown direction_sampling: {self.config.direction_sampling}"
+            )
         
         self.master: Dict[str, torch.Tensor] = {}
         self.v_cache: Dict[str, torch.Tensor] = {}
+        self.vt_cache: Dict[str, torch.Tensor] = {}
         self.step = 0
         
         self._init_master_weights()
@@ -125,6 +131,18 @@ class LOZOController:
             dtype=dtype,
             device=self._sample_device_for(target_device),
         ).to(target_device)
+
+    def _randn_flat(
+        self,
+        numel: int,
+        target_device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.randn(
+            (numel,),
+            dtype=dtype,
+            device=self._sample_device_for(target_device),
+        ).to(target_device)
     
     def get_trainable_2d_params(self) -> List[str]:
         """Get names of 2D trainable parameters."""
@@ -163,29 +181,121 @@ class LOZOController:
         directions_2d = {}
         directions_1d = {}
         
-        # Sample for all parameters (2D + 1D) in the SAME order as they appear in master
-        # This preserves the randn call sequence to match baseline
+        # The exact path samples per parameter in the SAME order as baseline,
+        # preserving the randn call sequence for step-by-step alignment. The
+        # flat path is a Phase 3 performance mode: it preserves distribution
+        # and deterministic seeding but not the baseline's per-call RNG digest.
         try:
-            for name, W in self.master.items():
-                if W.ndim >= 2:
-                    out_features, in_features = W.shape
+            if self.config.direction_sampling == "flat":
+                params_2d = [
+                    (name, W)
+                    for name, W in self.master.items()
+                    if W.ndim >= 2
+                ]
+                params_1d = [
+                    (name, W)
+                    for name, W in self.master.items()
+                    if W.ndim == 1
+                ]
+                v_refreshed = self.step % self.config.step_interval == 0
+                if params_2d:
+                    sample_device = params_2d[0][1].device
+                    sample_dtype = params_2d[0][1].dtype
+                    if any(
+                        W.device != sample_device or W.dtype != sample_dtype
+                        for _, W in params_2d
+                    ):
+                        raise RuntimeError(
+                            "flat direction sampling requires uniform 2D parameter "
+                            "device and dtype"
+                        )
+                    if v_refreshed:
+                        total_v = sum(
+                            W.shape[1] * self.config.rank for _, W in params_2d
+                        )
+                        flat_v = self._randn_flat(total_v, sample_device, sample_dtype)
+                        offset = 0
+                        for name, W in params_2d:
+                            in_features = W.shape[1]
+                            numel = in_features * self.config.rank
+                            V = flat_v[offset : offset + numel].view(
+                                in_features, self.config.rank
+                            )
+                            self.v_cache[name] = V
+                            self.vt_cache[name] = V.T.contiguous()
+                            offset += numel
 
-                # V cache logic aligned with baseline:
-                # - First step (self.step=0): initialize V (0 % step_interval == 0)
-                # - step % step_interval == 0: refresh V
-                # - Otherwise: reuse cached V
-                    if self.step % self.config.step_interval == 0:
-                        V = self._randn((in_features, self.config.rank), W.device, W.dtype)
-                        self.v_cache[name] = V
-                    else:
-                        V = self.v_cache[name]
+                    total_u = sum(
+                        W.shape[0] * self.config.rank for _, W in params_2d
+                    )
+                    flat_u = self._randn_flat(total_u, sample_device, sample_dtype)
+                    offset = 0
+                    for name, W in params_2d:
+                        out_features = W.shape[0]
+                        numel = out_features * self.config.rank
+                        U = flat_u[offset : offset + numel].view(
+                            out_features, self.config.rank
+                        )
+                        directions_2d[name] = {
+                            "U": U,
+                            "V": self.v_cache[name],
+                            "V_T": self.vt_cache[name],
+                            "v_refreshed": v_refreshed,
+                        }
+                        offset += numel
 
-                    # U: freshly sampled every step
-                    U = self._randn((out_features, self.config.rank), W.device, W.dtype)
+                if params_1d:
+                    sample_device = params_1d[0][1].device
+                    sample_dtype = params_1d[0][1].dtype
+                    if any(
+                        W.device != sample_device or W.dtype != sample_dtype
+                        for _, W in params_1d
+                    ):
+                        raise RuntimeError(
+                            "flat direction sampling requires uniform 1D parameter "
+                            "device and dtype"
+                        )
+                    total_z = sum(W.numel() for _, W in params_1d)
+                    flat_z = self._randn_flat(total_z, sample_device, sample_dtype)
+                    offset = 0
+                    for name, W in params_1d:
+                        numel = W.numel()
+                        directions_1d[name] = flat_z[offset : offset + numel].view_as(W)
+                        offset += numel
+            else:
+                for name, W in self.master.items():
+                    if W.ndim >= 2:
+                        out_features, in_features = W.shape
 
-                    directions_2d[name] = {"U": U, "V": V}
-                elif W.ndim == 1:
-                    directions_1d[name] = self._randn(tuple(W.shape), W.device, W.dtype)
+                        # V cache logic aligned with baseline:
+                        # - First step (self.step=0): initialize V (0 % step_interval == 0)
+                        # - step % step_interval == 0: refresh V
+                        # - Otherwise: reuse cached V
+                        v_refreshed = self.step % self.config.step_interval == 0
+                        if v_refreshed:
+                            V = self._randn(
+                                (in_features, self.config.rank), W.device, W.dtype
+                            )
+                            self.v_cache[name] = V
+                            self.vt_cache[name] = V.T.contiguous()
+                        else:
+                            V = self.v_cache[name]
+
+                        # U: freshly sampled every step
+                        U = self._randn(
+                            (out_features, self.config.rank), W.device, W.dtype
+                        )
+
+                        directions_2d[name] = {
+                            "U": U,
+                            "V": V,
+                            "V_T": self.vt_cache[name],
+                            "v_refreshed": v_refreshed,
+                        }
+                    elif W.ndim == 1:
+                        directions_1d[name] = self._randn(
+                            tuple(W.shape), W.device, W.dtype
+                        )
         finally:
             # Restore global RNG state
             self._restore_rng_state(rng_state)

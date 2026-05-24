@@ -8,6 +8,8 @@ Note: vLLM LoRA wrapper modules (e.g., MergedQKVParallelLinearWithLoRA)
       don't have weight_loader. We need to access base_layer.weight directly.
 """
 
+import os
+import time
 from typing import Dict
 import torch
 
@@ -66,6 +68,60 @@ def apply_lowrank_update_to_weight_(
     raise ValueError(f"unknown update precision: {precision}")
 
 
+def apply_qkv_lowrank_update_to_weight_(
+    target: torch.Tensor,
+    q_direction: dict[str, torch.Tensor],
+    k_direction: dict[str, torch.Tensor],
+    v_direction: dict[str, torch.Tensor],
+    *,
+    c: float,
+    lr: float,
+    weight_decay: float,
+    precision: str,
+) -> bool:
+    """Apply packed q/k/v updates with one batched matmul when possible."""
+    if precision != "param":
+        return False
+    if target.dim() != 2 or target.shape[0] % 3 != 0:
+        return False
+    hidden_size = target.shape[0] // 3
+    if target.shape[1] != hidden_size:
+        return False
+
+    directions = [q_direction, k_direction, v_direction]
+    u_tensors = [item["U"] for item in directions]
+    vt_tensors = [item.get("V_T") for item in directions]
+    if any(v_t is None for v_t in vt_tensors):
+        vt_tensors = [item["V"].T for item in directions]
+    if any(tuple(u.shape) != (hidden_size, u_tensors[0].shape[1]) for u in u_tensors):
+        return False
+    if any(tuple(v_t.shape) != (u_tensors[0].shape[1], hidden_size) for v_t in vt_tensors):
+        return False
+
+    beta = 1.0 - lr * weight_decay
+    u_batch = torch.stack(
+        [
+            u.to(device=target.device, dtype=target.dtype, non_blocking=True)
+            for u in u_tensors
+        ],
+        dim=0,
+    )
+    vt_batch = torch.stack(
+        [
+            v_t.to(device=target.device, dtype=target.dtype, non_blocking=True)
+            for v_t in vt_tensors
+        ],
+        dim=0,
+    )
+    target.view(3, hidden_size, hidden_size).baddbmm_(
+        u_batch,
+        vt_batch,
+        beta=beta,
+        alpha=-lr * c,
+    )
+    return True
+
+
 class WeightSync:
     """
     Sync weights from external trainer (LOZO controller) to vLLM engine.
@@ -78,6 +134,7 @@ class WeightSync:
         self.llm = llm
         self.num_layers = num_layers
         self.hf_to_vllm_mapping = self._build_mapping()
+        self.last_update_info = {}
     
     def _build_mapping(self) -> Dict[str, str]:
         """
@@ -202,6 +259,7 @@ class WeightSync:
         weight_decay: float = 0.0,
         precision: str = "float32",
         sync_device: bool = True,
+        qkv_update_mode: str = "separate",
     ) -> None:
         """
         Apply the LOZO base-weight update directly inside the vLLM worker.
@@ -212,13 +270,17 @@ class WeightSync:
         """
         if precision not in {"float32", "param"}:
             raise ValueError(f"unknown update precision: {precision}")
+        if qkv_update_mode not in {"separate", "batched"}:
+            raise ValueError(f"unknown qkv_update_mode: {qkv_update_mode}")
         if directions_1d:
             raise ValueError(
                 "direct vLLM weight update only supports 2D LoRA-compatible "
                 "parameters; use --weight-update copy for 1D/full scope"
             )
+        profile_enabled = os.environ.get("VLLM_ZO_WEIGHT_PROFILE", "0") == "1"
 
         def update_weights_on_worker(worker):
+            profile_t0 = time.perf_counter()
             model = worker.model_runner.model
 
             qkv_directions = {}
@@ -244,6 +306,7 @@ class WeightSync:
                     qkv_directions[vllm_name][proj_key] = (hf_name, direction)
                 else:
                     other_directions[vllm_name] = (hf_name, direction)
+            profile_after_group = time.perf_counter()
 
             for vllm_name, proj_dict in qkv_directions.items():
                 module_path = vllm_name.replace(".weight", "")
@@ -251,6 +314,27 @@ class WeightSync:
                 base_layer = unwrap_lora_module(module)
                 param = base_layer.weight
                 hidden_size = param.data.shape[0] // 3
+
+                if (
+                    qkv_update_mode == "batched"
+                    and all(key in proj_dict for key in ("q", "k", "v"))
+                ):
+                    q_name, q_direction = proj_dict["q"]
+                    _k_name, k_direction = proj_dict["k"]
+                    _v_name, v_direction = proj_dict["v"]
+                    if apply_qkv_lowrank_update_to_weight_(
+                        param.data,
+                        q_direction,
+                        k_direction,
+                        v_direction,
+                        c=c,
+                        lr=lr,
+                        weight_decay=(
+                            weight_decay if should_apply_weight_decay(q_name) else 0.0
+                        ),
+                        precision=precision,
+                    ):
+                        continue
 
                 for proj_key, (hf_name, direction) in proj_dict.items():
                     if proj_key == "q":
@@ -274,6 +358,7 @@ class WeightSync:
                         precision=precision,
                     )
 
+            profile_after_qkv = time.perf_counter()
             for vllm_name, (hf_name, direction) in other_directions.items():
                 module_path = vllm_name.replace(".weight", "")
                 module = model.get_submodule(module_path)
@@ -292,7 +377,24 @@ class WeightSync:
                     precision=precision,
                 )
 
+            profile_after_other = time.perf_counter()
             if sync_device:
                 torch.cuda.synchronize()
+            profile_after_sync = time.perf_counter()
+            if profile_enabled:
+                return {
+                    "profile_s": {
+                        "group": profile_after_group - profile_t0,
+                        "qkv_update": profile_after_qkv - profile_after_group,
+                        "other_update": profile_after_other - profile_after_qkv,
+                        "sync": profile_after_sync - profile_after_other,
+                        "total_worker": profile_after_sync - profile_t0,
+                    },
+                    "num_qkv_modules": int(len(qkv_directions)),
+                    "num_other_modules": int(len(other_directions)),
+                }
+            return None
 
-        self.llm.collective_rpc(update_weights_on_worker)
+        results = self.llm.collective_rpc(update_weights_on_worker)
+        self.last_update_info = {"workers": results} if profile_enabled else {}
+        return self.last_update_info

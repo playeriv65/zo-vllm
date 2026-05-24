@@ -11,22 +11,25 @@ q=1 performance blockers found after the initial batch sweep:
   `generate(prompt_logprobs=1)` serving loop
 - run warmup steps before timing so one-time Triton/LoRA JIT does not pollute
   measured step time
-- collect OPT model and batch scaling against the LOZO baseline
+- time LOZO with a direct wall-clock step metric that includes `lowrank_zo_update`
+  and optimizer update overhead
+- keep `q=1`; multi-direction batching is still out of scope for this checkpoint
 
-Latest scaling run:
+Latest q=1 OPT-1.3B checkpoint:
 
 ```text
-phase3/results/phase3_scaling_opt13b_opt27b_b16_32_64_128_s1000_w5_20260523/
+vLLM: local ignored run ending in 20260524_123159
+LOZO: local ignored run ending in 20260524_121646
 ```
+
+New OPT-1.3B runs should use the `opt1p3b` slug.
 
 Configuration:
 
 ```text
-models=facebook/opt-1.3b,facebook/opt-2.7b
-batch_sizes=16,32,64,128
-steps=1000
-warmup_steps=5
-num_samples=1000
+model=facebook/opt-1.3b
+batch_size=16
+num_samples=1024
 rank=8
 lr=3e-7
 eps=1e-3
@@ -34,21 +37,42 @@ q=1
 scoring_backend=direct_worker
 direct_lora_from_directions=1
 base_eval_mode=skip
+enforce_eager=0
+direction_sampling=flat
+qkv_weight_update=batched
+sync_weight_update=0
 ```
 
-Latest speed result:
+Latest speed result, using `total_s / measured_steps` as the cross-backend
+metric:
 
-| model | batch 16 | batch 32 | batch 64 | batch 128 |
-|---|---:|---:|---:|---:|
-| OPT-1.3B speedup vs LOZO | 1.4773x | 1.7523x | 2.3718x | 2.5608x |
-| OPT-2.7B speedup vs LOZO | 2.0004x | 2.4910x | 2.9083x | 2.8765x |
-| OPT-1.3B vLLM GPU util mean | 43.17% | 56.26% | 77.79% | 86.93% |
-| OPT-2.7B vLLM GPU util mean | 54.44% | 71.33% | 87.93% | 91.72% |
+| backend | total s/step | notes |
+|---|---:|---|
+| LOZO minimal | 0.051668 | includes ZO step and update |
+| vLLM detailed | 0.017034 | direct worker score, direct slot/update path |
+| vLLM speedup | 3.03x | relative to corrected LOZO wall-clock step |
 
-This is a speed-scaling checkpoint, not a convergence claim. vLLM base loss
-evaluation was skipped during the scaling run to keep the benchmark focused on
-training-step throughput; LOZO loss drop is still recorded by the baseline
-runner. Use Phase 2 results for accepted convergence evidence.
+Latest vLLM detailed step breakdown:
+
+| component | mean s/step |
+|---|---:|
+| score | 0.013325 |
+| weight_update | 0.002672 |
+| direction | 0.000795 |
+| lora_update | 0.000213 |
+| build_lora | 0.000000 |
+
+The same run's sampled vLLM GPU utilization is about 72% mean in the training
+window, so the active utilization target is not yet met. The remaining hotspot
+is direct worker scoring, especially model forward and end-of-score
+synchronization. Failed or inconclusive branches are not accepted as results:
+fused LoRA+score was marginal, slot pipelining was slower, fused score+weight
+update was slower, and caching mutable direct-score attention state across
+non-adjacent batches caused a CUDA illegal memory access and was reverted.
+
+This is a speed checkpoint, not a convergence claim. vLLM base loss evaluation
+was skipped during the speed runs to keep the benchmark focused on training-step
+throughput. Use Phase 2 results for accepted convergence evidence.
 
 The previous q=1 batch sweep below remains useful as the baseline that exposed
 the original under-utilization problem.
@@ -221,7 +245,7 @@ CUDA_VISIBLE_DEVICES=<GPU> .venv/bin/python -u \
   --num-samples 1000 \
   --steps 200 \
   --warmup-steps 5 \
-  --enforce-eager 1 \
+  --enforce-eager 0 \
   --modes base,static_lora,rewrite_lora_only,score_with_rewrite \
   --output-dir phase3/results/<run_id>/microbench_b16
 ```

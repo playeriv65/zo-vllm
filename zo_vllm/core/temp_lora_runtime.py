@@ -8,6 +8,7 @@ Supports all 2D trainable parameters (Linear layers).
 """
 
 from functools import partial
+import time
 from typing import Any, Dict, List
 import torch
 
@@ -195,17 +196,19 @@ def _copy_direction_to_slot(
     U: torch.Tensor,
     V: torch.Tensor,
     scale: float,
+    V_T: torch.Tensor | None = None,
+    write_a: bool = True,
 ) -> bool:
     target_a = module.lora_a_stacked[slice_idx][index, 0]
     target_b = module.lora_b_stacked[slice_idx][index, 0]
-    lora_a = V.T
+    lora_a = V_T if V_T is not None else V.T
     if tuple(lora_a.shape) != tuple(target_a.shape):
         return False
     if tuple(U.shape) != tuple(target_b.shape):
         return False
-    target_a.copy_(lora_a, non_blocking=True)
-    target_b.copy_(U, non_blocking=True)
-    target_b.mul_(scale)
+    if write_a:
+        target_a.copy_(lora_a, non_blocking=True)
+    torch.mul(U, scale, out=target_b)
     return True
 
 
@@ -220,6 +223,8 @@ def _write_direction_to_plus_minus(
 ) -> bool:
     U = direction["U"]
     V = direction["V"]
+    V_T = direction.get("V_T")
+    write_a = bool(direction.get("v_refreshed", True))
     return _copy_direction_to_slot(
         module,
         index=plus_index,
@@ -227,6 +232,8 @@ def _write_direction_to_plus_minus(
         U=U,
         V=V,
         scale=eps,
+        V_T=V_T,
+        write_a=write_a,
     ) and _copy_direction_to_slot(
         module,
         index=minus_index,
@@ -234,20 +241,98 @@ def _write_direction_to_plus_minus(
         U=U,
         V=V,
         scale=-eps,
+        V_T=V_T,
+        write_a=write_a,
     )
 
 
-def _write_plus_minus_slots_from_directions(
+def _queue_direction_to_plus_minus(
+    module,
+    *,
+    plus_index: int,
+    minus_index: int,
+    slice_idx: int,
+    direction: dict[str, torch.Tensor],
+    plus_a_targets: list[torch.Tensor],
+    minus_a_targets: list[torch.Tensor],
+    a_sources: list[torch.Tensor],
+    plus_b_targets: list[torch.Tensor],
+    minus_b_targets: list[torch.Tensor],
+    u_sources: list[torch.Tensor],
+) -> bool:
+    U = direction["U"]
+    V = direction["V"]
+    V_T = direction.get("V_T")
+    lora_a = V_T if V_T is not None else V.T
+
+    plus_a = module.lora_a_stacked[slice_idx][plus_index, 0]
+    minus_a = module.lora_a_stacked[slice_idx][minus_index, 0]
+    plus_b = module.lora_b_stacked[slice_idx][plus_index, 0]
+    minus_b = module.lora_b_stacked[slice_idx][minus_index, 0]
+
+    if tuple(lora_a.shape) != tuple(plus_a.shape):
+        return False
+    if tuple(lora_a.shape) != tuple(minus_a.shape):
+        return False
+    if tuple(U.shape) != tuple(plus_b.shape):
+        return False
+    if tuple(U.shape) != tuple(minus_b.shape):
+        return False
+
+    if bool(direction.get("v_refreshed", True)):
+        plus_a_targets.append(plus_a)
+        minus_a_targets.append(minus_a)
+        a_sources.append(lora_a)
+    plus_b_targets.append(plus_b)
+    minus_b_targets.append(minus_b)
+    u_sources.append(U)
+    return True
+
+
+def _direction_slot_entry(
+    module,
+    *,
+    plus_index: int,
+    minus_index: int,
+    slice_idx: int,
+    direction_key: str,
+    direction: dict[str, torch.Tensor],
+) -> dict[str, Any] | None:
+    U = direction["U"]
+    V = direction["V"]
+    V_T = direction.get("V_T")
+    lora_a = V_T if V_T is not None else V.T
+
+    plus_a = module.lora_a_stacked[slice_idx][plus_index, 0]
+    minus_a = module.lora_a_stacked[slice_idx][minus_index, 0]
+    plus_b = module.lora_b_stacked[slice_idx][plus_index, 0]
+    minus_b = module.lora_b_stacked[slice_idx][minus_index, 0]
+
+    if tuple(lora_a.shape) != tuple(plus_a.shape):
+        return None
+    if tuple(lora_a.shape) != tuple(minus_a.shape):
+        return None
+    if tuple(U.shape) != tuple(plus_b.shape):
+        return None
+    if tuple(U.shape) != tuple(minus_b.shape):
+        return None
+    return {
+        "direction_key": direction_key,
+        "plus_a": plus_a,
+        "minus_a": minus_a,
+        "plus_b": plus_b,
+        "minus_b": minus_b,
+    }
+
+
+def _build_direction_slot_plan(
     manager,
     *,
-    plus_id: int,
-    minus_id: int,
+    plus_index: int,
+    minus_index: int,
     directions_2d: Dict[str, Dict[str, torch.Tensor]],
-    eps: float,
-) -> dict:
-    """Write plus/minus slots directly from LOZO U/V directions."""
-    plus_index = _lora_slot_index(manager, plus_id)
-    minus_index = _lora_slot_index(manager, minus_id)
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
     modules_written = 0
     packed_written = 0
     missing: list[str] = []
@@ -262,21 +347,24 @@ def _write_plus_minus_slots_from_directions(
             wrote_any = False
             ok = True
             for slice_idx, replacement in enumerate(replacements):
-                direction = directions_2d.get(f"{replacement}.weight")
+                direction_key = f"{replacement}.weight"
+                direction = directions_2d.get(direction_key)
                 if direction is None:
                     ok = False
                     break
                 wrote_any = True
-                if not _write_direction_to_plus_minus(
+                entry = _direction_slot_entry(
                     module,
                     plus_index=plus_index,
                     minus_index=minus_index,
                     slice_idx=slice_idx,
+                    direction_key=direction_key,
                     direction=direction,
-                    eps=eps,
-                ):
+                )
+                if entry is None:
                     ok = False
                     break
+                entries.append(entry)
             if ok and wrote_any:
                 packed_written += 1
             elif wrote_any:
@@ -287,7 +375,8 @@ def _write_plus_minus_slots_from_directions(
                 missing.append(module_name)
             continue
 
-        direction = directions_2d.get(f"{module_name}.weight")
+        direction_key = f"{module_name}.weight"
+        direction = directions_2d.get(direction_key)
         if direction is None:
             module.reset_lora(plus_index)
             module.reset_lora(minus_index)
@@ -296,31 +385,139 @@ def _write_plus_minus_slots_from_directions(
         if len(module.lora_a_stacked) != 1:
             fallback_required.append(module_name)
             continue
-        if _write_direction_to_plus_minus(
+        entry = _direction_slot_entry(
             module,
             plus_index=plus_index,
             minus_index=minus_index,
             slice_idx=0,
+            direction_key=direction_key,
             direction=direction,
-            eps=eps,
-        ):
-            modules_written += 1
-        else:
+        )
+        if entry is None:
             fallback_required.append(module_name)
+        else:
+            entries.append(entry)
+            modules_written += 1
 
     if fallback_required:
         raise RuntimeError(
             "direct direction slot update does not support modules: "
             + ", ".join(fallback_required[:8])
         )
+    return {
+        "entries": entries,
+        "modules_written": int(modules_written),
+        "packed_written": int(packed_written),
+        "missing": missing,
+    }
+
+
+def _flush_queued_direction_writes(
+    *,
+    eps: float,
+    plus_a_targets: list[torch.Tensor],
+    minus_a_targets: list[torch.Tensor],
+    a_sources: list[torch.Tensor],
+    plus_b_targets: list[torch.Tensor],
+    minus_b_targets: list[torch.Tensor],
+    u_sources: list[torch.Tensor],
+) -> None:
+    if a_sources:
+        torch._foreach_copy_(plus_a_targets, a_sources)
+        torch._foreach_copy_(minus_a_targets, a_sources)
+    if u_sources:
+        torch._foreach_copy_(plus_b_targets, u_sources)
+        torch._foreach_mul_(plus_b_targets, eps)
+        torch._foreach_copy_(minus_b_targets, u_sources)
+        torch._foreach_mul_(minus_b_targets, -eps)
+
+
+def _write_plus_minus_slots_from_directions(
+    manager,
+    *,
+    plus_id: int,
+    minus_id: int,
+    directions_2d: Dict[str, Dict[str, torch.Tensor]],
+    eps: float,
+) -> dict:
+    """Write plus/minus slots directly from LOZO U/V directions."""
+    profile_t0 = time.perf_counter()
+    plus_index = _lora_slot_index(manager, plus_id)
+    minus_index = _lora_slot_index(manager, minus_id)
+    profile_after_index = time.perf_counter()
+    plus_a_targets: list[torch.Tensor] = []
+    minus_a_targets: list[torch.Tensor] = []
+    a_sources: list[torch.Tensor] = []
+    plus_b_targets: list[torch.Tensor] = []
+    minus_b_targets: list[torch.Tensor] = []
+    u_sources: list[torch.Tensor] = []
+
+    cache_key = (int(plus_index), int(minus_index), int(len(directions_2d)))
+    cache = getattr(manager, "_zo_direction_slot_plan_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(manager, "_zo_direction_slot_plan_cache", cache)
+    plan = cache.get(cache_key)
+    plan_cache_hit = plan is not None
+    if plan is None:
+        plan = _build_direction_slot_plan(
+            manager,
+            plus_index=plus_index,
+            minus_index=minus_index,
+            directions_2d=directions_2d,
+        )
+        cache[cache_key] = plan
+
+    missing_direction_keys: list[str] = []
+    for entry in plan["entries"]:
+        direction = directions_2d.get(entry["direction_key"])
+        if direction is None:
+            missing_direction_keys.append(entry["direction_key"])
+            continue
+        U = direction["U"]
+        V = direction["V"]
+        V_T = direction.get("V_T")
+        lora_a = V_T if V_T is not None else V.T
+        if bool(direction.get("v_refreshed", True)):
+            plus_a_targets.append(entry["plus_a"])
+            minus_a_targets.append(entry["minus_a"])
+            a_sources.append(lora_a)
+        plus_b_targets.append(entry["plus_b"])
+        minus_b_targets.append(entry["minus_b"])
+        u_sources.append(U)
+
+    if missing_direction_keys:
+        cache.pop(cache_key, None)
+        raise RuntimeError(
+            "cached direct direction slot plan is stale; missing directions: "
+            + ", ".join(missing_direction_keys[:8])
+        )
+    profile_after_traversal = time.perf_counter()
+    _flush_queued_direction_writes(
+        eps=eps,
+        plus_a_targets=plus_a_targets,
+        minus_a_targets=minus_a_targets,
+        a_sources=a_sources,
+        plus_b_targets=plus_b_targets,
+        minus_b_targets=minus_b_targets,
+        u_sources=u_sources,
+    )
+    profile_after_flush = time.perf_counter()
 
     return {
         "plus": {"lora_id": int(plus_id), "slot_index": int(plus_index)},
         "minus": {"lora_id": int(minus_id), "slot_index": int(minus_index)},
-        "modules_written": int(modules_written),
-        "packed_written": int(packed_written),
-        "missing": missing,
+        "modules_written": int(plan["modules_written"]),
+        "packed_written": int(plan["packed_written"]),
+        "missing": list(plan["missing"]),
         "source": "directions",
+        "profile_s": {
+            "index": profile_after_index - profile_t0,
+            "traversal": profile_after_traversal - profile_after_index,
+            "flush": profile_after_flush - profile_after_traversal,
+            "total_worker": profile_after_flush - profile_t0,
+            "plan_cache_hit": float(plan_cache_hit),
+        },
     }
 
 

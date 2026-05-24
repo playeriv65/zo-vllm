@@ -701,7 +701,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cuda"], default="cuda")
     parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
-    parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
+    parser.add_argument("--enforce-eager", choices=["0", "1"], default="0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--gpu-monitor-interval", type=float, default=0.0)
     parser.add_argument("--monitor-gpu", default=default_monitor_gpu())

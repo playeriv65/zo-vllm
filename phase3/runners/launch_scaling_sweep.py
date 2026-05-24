@@ -167,6 +167,12 @@ def build_lozo_command(args, model: str, batch_size: int, base_dir: Path) -> str
         "--output-dir",
         str(output_dir),
     ]
+    if args.lozo_torch_compile:
+        cmd.extend([
+            "--torch-compile",
+            "--torch-compile-mode",
+            args.lozo_torch_compile_mode,
+        ])
     return monitored_body(
         {"CUDA_VISIBLE_DEVICES": args.lozo_gpu},
         cmd,
@@ -302,6 +308,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--direct-worker-max-logits-tokens", type=int, default=8192)
+    parser.add_argument("--lozo-torch-compile", action="store_true")
+    parser.add_argument("--lozo-torch-compile-mode", default="default")
     parser.add_argument("--backend", choices=["both", "lozo", "vllm"], default="both")
     parser.add_argument("--resume-existing", action="store_true")
     parser.add_argument("--allow-non-numeric-gpu", action="store_true")
@@ -366,6 +374,8 @@ def main() -> None:
         "vllm_path": "direct_worker+direct_lora_from_directions+direct_weight_update",
         "vllm_enforce_eager": int(args.enforce_eager),
         "vllm_gpu_memory_utilization": args.gpu_memory_utilization,
+        "lozo_torch_compile": bool(args.lozo_torch_compile),
+        "lozo_torch_compile_mode": args.lozo_torch_compile_mode,
         "backend": args.backend,
         "resume_existing": args.resume_existing,
     }
