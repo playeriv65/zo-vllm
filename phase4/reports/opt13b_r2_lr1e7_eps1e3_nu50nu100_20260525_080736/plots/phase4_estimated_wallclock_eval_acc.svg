@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="580" viewBox="0 0 1040 580">
+<rect width="100%" height="100%" fill="white"/>
+<text x="520.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="600">Phase4 Eval Accuracy vs Estimated Wall-Clock</text>
+<text x="520.0" y="54" text-anchor="middle" font-family="Arial" font-size="12" fill="#666">Estimated wall-clock assumes constant measured mean step time per run</text>
+<line x1="88" y1="498.0" x2="1010" y2="498.0" stroke="#ddd"/>
+<text x="78" y="502.0" text-anchor="end" font-family="Arial" font-size="12">0.799</text>
+<line x1="88" y1="410.8" x2="1010" y2="410.8" stroke="#ddd"/>
+<text x="78" y="414.8" text-anchor="end" font-family="Arial" font-size="12">0.826</text>
+<line x1="88" y1="323.6" x2="1010" y2="323.6" stroke="#ddd"/>
+<text x="78" y="327.6" text-anchor="end" font-family="Arial" font-size="12">0.853</text>
+<line x1="88" y1="236.4" x2="1010" y2="236.4" stroke="#ddd"/>
+<text x="78" y="240.4" text-anchor="end" font-family="Arial" font-size="12">0.881</text>
+<line x1="88" y1="149.2" x2="1010" y2="149.2" stroke="#ddd"/>
+<text x="78" y="153.2" text-anchor="end" font-family="Arial" font-size="12">0.908</text>
+<line x1="88" y1="62.0" x2="1010" y2="62.0" stroke="#ddd"/>
+<text x="78" y="66.0" text-anchor="end" font-family="Arial" font-size="12">0.935</text>
+<line x1="88.0" y1="62" x2="88.0" y2="498" stroke="#eee"/>
+<text x="88.0" y="522" text-anchor="middle" font-family="Arial" font-size="12">0</text>
+<line x1="241.7" y1="62" x2="241.7" y2="498" stroke="#eee"/>
+<text x="241.7" y="522" text-anchor="middle" font-family="Arial" font-size="12">9</text>
+<line x1="395.3" y1="62" x2="395.3" y2="498" stroke="#eee"/>
+<text x="395.3" y="522" text-anchor="middle" font-family="Arial" font-size="12">18</text>
+<line x1="549.0" y1="62" x2="549.0" y2="498" stroke="#eee"/>
+<text x="549.0" y="522" text-anchor="middle" font-family="Arial" font-size="12">27</text>
+<line x1="702.7" y1="62" x2="702.7" y2="498" stroke="#eee"/>
+<text x="702.7" y="522" text-anchor="middle" font-family="Arial" font-size="12">36</text>
+<line x1="856.3" y1="62" x2="856.3" y2="498" stroke="#eee"/>
+<text x="856.3" y="522" text-anchor="middle" font-family="Arial" font-size="12">45</text>
+<line x1="1010.0" y1="62" x2="1010.0" y2="498" stroke="#eee"/>
+<text x="1010.0" y="522" text-anchor="middle" font-family="Arial" font-size="12">54</text>
+<line x1="88" y1="498" x2="1010" y2="498" stroke="#333"/>
+<line x1="88" y1="62" x2="88" y2="498" stroke="#333"/>
+<text x="520.0" y="554" text-anchor="middle" font-family="Arial" font-size="15">Estimated elapsed time (minutes)</text>
+<text x="22" y="290.0" transform="rotate(-90 22 290.0)" text-anchor="middle" font-family="Arial" font-size="15">eval accuracy</text>
+<path d="M270.8,467.9 L453.5,308.7 L636.3,194.0 L819.0,162.1 L1001.8,149.4" fill="none" stroke="#2ca02c" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="1001.8" cy="149.4" r="4" fill="#2ca02c"/>
+<text x="1007.8" y="143.4" font-family="Arial" font-size="11" fill="#2ca02c">20000</text>
+<line x1="710" y1="78" x2="740" y2="78" stroke="#2ca02c" stroke-width="3"/>
+<text x="748" y="82" font-family="Arial" font-size="13">vLLM lora_only nu50</text>
+<path d="M272.4,448.8 L456.8,276.8 L641.2,168.5 L825.6,155.8 L1010.0,92.1" fill="none" stroke="#d62728" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="1010.0" cy="92.1" r="4" fill="#d62728"/>
+<text x="1016.0" y="86.1" font-family="Arial" font-size="11" fill="#d62728">20000</text>
+<line x1="710" y1="101" x2="740" y2="101" stroke="#d62728" stroke-width="3"/>
+<text x="748" y="105" font-family="Arial" font-size="13">vLLM lora_only nu100</text>
+</svg>

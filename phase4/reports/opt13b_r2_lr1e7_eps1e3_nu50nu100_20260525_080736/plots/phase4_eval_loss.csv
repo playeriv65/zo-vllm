@@ -1,0 +1,13 @@
+series,step,eval_loss
+LOZO full nu50,4000,0.4130859375
+LOZO lora_only nu50,4000,0.428466796875
+vLLM lora_only nu50,4000,0.399084
+vLLM lora_only nu50,8000,0.321895
+vLLM lora_only nu50,12000,0.263713
+vLLM lora_only nu50,16000,0.243588
+vLLM lora_only nu50,20000,0.231142
+vLLM lora_only nu100,4000,0.40144
+vLLM lora_only nu100,8000,0.300538
+vLLM lora_only nu100,12000,0.2445
+vLLM lora_only nu100,16000,0.21644
+vLLM lora_only nu100,20000,0.205974

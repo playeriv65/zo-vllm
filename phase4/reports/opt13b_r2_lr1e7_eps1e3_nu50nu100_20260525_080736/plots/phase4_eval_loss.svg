@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560">
+<rect width="100%" height="100%" fill="white"/>
+<text x="500.0" y="30" text-anchor="middle" font-family="Arial" font-size="22" font-weight="600">Phase4 OPT-13B SST-2 Eval Loss</text>
+<line x1="82" y1="482.0" x2="972" y2="482.0" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="486.0" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.188</text>
+<line x1="82" y1="397.2" x2="972" y2="397.2" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="401.2" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.240</text>
+<line x1="82" y1="312.4" x2="972" y2="312.4" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="316.4" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.291</text>
+<line x1="82" y1="227.6" x2="972" y2="227.6" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="231.6" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.343</text>
+<line x1="82" y1="142.8" x2="972" y2="142.8" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="146.8" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.395</text>
+<line x1="82" y1="58.0" x2="972" y2="58.0" stroke="#ddd" stroke-width="1"/>
+<text x="72" y="62.0" text-anchor="end" font-family="Arial" font-size="12" fill="#333">0.446</text>
+<line x1="82.0" y1="58" x2="82.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="82.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">0</text>
+<line x1="260.0" y1="58" x2="260.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="260.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">4000</text>
+<line x1="438.0" y1="58" x2="438.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="438.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">8000</text>
+<line x1="616.0" y1="58" x2="616.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="616.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">12000</text>
+<line x1="794.0" y1="58" x2="794.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="794.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">16000</text>
+<line x1="972.0" y1="58" x2="972.0" y2="482" stroke="#eee" stroke-width="1"/>
+<text x="972.0" y="506" text-anchor="middle" font-family="Arial" font-size="12" fill="#333">20000</text>
+<line x1="82" y1="482" x2="972" y2="482" stroke="#333"/>
+<line x1="82" y1="58" x2="82" y2="482" stroke="#333"/>
+<text x="500.0" y="536" text-anchor="middle" font-family="Arial" font-size="15">Training step</text>
+<text x="20" y="280.0" transform="rotate(-90 20 280.0)" text-anchor="middle" font-family="Arial" font-size="15">eval loss</text>
+<path d="M260.0,112.5" fill="none" stroke="#1f77b4" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="260.0" cy="112.5" r="4" fill="#1f77b4"/>
+<line x1="690" y1="58" x2="718" y2="58" stroke="#1f77b4" stroke-width="3"/>
+<text x="726" y="62" font-family="Arial" font-size="13" fill="#222">LOZO full nu50</text>
+<path d="M260.0,87.2" fill="none" stroke="#ff7f0e" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="260.0" cy="87.2" r="4" fill="#ff7f0e"/>
+<line x1="690" y1="80" x2="718" y2="80" stroke="#ff7f0e" stroke-width="3"/>
+<text x="726" y="84" font-family="Arial" font-size="13" fill="#222">LOZO lora_only nu50</text>
+<path d="M260.0,135.5 L438.0,262.3 L616.0,357.9 L794.0,391.0 L972.0,411.4" fill="none" stroke="#2ca02c" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="972.0" cy="411.4" r="4" fill="#2ca02c"/>
+<line x1="690" y1="102" x2="718" y2="102" stroke="#2ca02c" stroke-width="3"/>
+<text x="726" y="106" font-family="Arial" font-size="13" fill="#222">vLLM lora_only nu50</text>
+<path d="M260.0,131.6 L438.0,297.4 L616.0,389.5 L794.0,435.6 L972.0,452.8" fill="none" stroke="#d62728" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="972.0" cy="452.8" r="4" fill="#d62728"/>
+<line x1="690" y1="124" x2="718" y2="124" stroke="#d62728" stroke-width="3"/>
+<text x="726" y="128" font-family="Arial" font-size="13" fill="#222">vLLM lora_only nu100</text>
+</svg>

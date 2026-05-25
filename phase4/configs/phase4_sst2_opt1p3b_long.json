@@ -1,0 +1,44 @@
+{
+  "wandb": {
+    "project": "lozo-vllm-phase4",
+    "entity": "playeriv65-university-of-minnesota"
+  },
+  "defaults": {
+    "model_name": "facebook/opt-1.3b",
+    "task_name": "SST2",
+    "steps": 20000,
+    "warmup_steps": 20,
+    "batch_size": 16,
+    "num_samples": 1000,
+    "eval_interval": 4000,
+    "save_interval": 4000,
+    "save_total_limit": 3,
+    "eval_accuracy_samples": 512,
+    "seed": 42,
+    "rank": 8,
+    "lr": 1e-7,
+    "eps": 1e-3,
+    "step_interval": 100,
+    "zo_random_device": "cuda"
+  },
+  "jobs": [
+    {
+      "job_id": "lozo_lora_only",
+      "backend": "lozo",
+      "train_scope": "lora_only",
+      "notes": "baseline default LoRA-compatible scope"
+    },
+    {
+      "job_id": "lozo_full_scope",
+      "backend": "lozo",
+      "train_scope": "full",
+      "notes": "baseline ablation: embedding + 1D perturbation enabled together"
+    },
+    {
+      "job_id": "vllm_lora_only",
+      "backend": "vllm",
+      "train_scope": "lora_only",
+      "notes": "optimized LoZO-vLLM path"
+    }
+  ]
+}

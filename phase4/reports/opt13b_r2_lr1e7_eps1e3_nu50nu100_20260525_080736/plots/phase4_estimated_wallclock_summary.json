@@ -1,0 +1,18 @@
+{
+  "LOZO full nu50": {
+    "mean_step_s": 0.80805,
+    "projected_20k_min": 269.35
+  },
+  "LOZO lora_only nu50": {
+    "mean_step_s": 0.721883,
+    "projected_20k_min": 240.6276666666667
+  },
+  "vLLM lora_only nu50": {
+    "mean_step_s": 0.159806,
+    "projected_20k_min": 53.26866666666667
+  },
+  "vLLM lora_only nu100": {
+    "mean_step_s": 0.161248,
+    "projected_20k_min": 53.74933333333333
+  }
+}

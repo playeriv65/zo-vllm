@@ -58,6 +58,12 @@ OPT-1.3B/2.7B 的运行目录 slug 使用 `opt1p3b`/`opt2p7b`，避免省略小�
 vLLM direct-score cache 只能缓存已验证不会跨 batch 失效的输入派生张量；不要跨不相邻
 batch 缓存可变 attention metadata。
 
+**Phase 4 收敛记录经验**：官方 LOZO 训练日志里的 `loss` 是
+`loss(theta + eps * direction)` 的 plus-perturbation probe，不是 clean
+training objective。长程收敛判断以 clean `eval_loss`、`eval_acc` 和最终
+full-eval accuracy 为主；training loss 只作为 noisy debug 信号。若需要按
+wall-clock 画收敛曲线，必须明确区分真实 timestamp 与按平均 step time 估算的曲线。
+
 ## Phase 1 结论
 
 **vLLM fake-LoRA 路径在真实 LOZO 多层扰动场景下完全可靠。**

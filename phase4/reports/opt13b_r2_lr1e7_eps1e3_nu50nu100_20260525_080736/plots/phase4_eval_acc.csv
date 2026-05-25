@@ -1,0 +1,11 @@
+series,step,eval_acc
+vLLM lora_only nu50,4000,0.808
+vLLM lora_only nu50,8000,0.858
+vLLM lora_only nu50,12000,0.894
+vLLM lora_only nu50,16000,0.904
+vLLM lora_only nu50,20000,0.908
+vLLM lora_only nu100,4000,0.814
+vLLM lora_only nu100,8000,0.868
+vLLM lora_only nu100,12000,0.902
+vLLM lora_only nu100,16000,0.906
+vLLM lora_only nu100,20000,0.926
