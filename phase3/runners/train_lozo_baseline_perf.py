@@ -8,67 +8,68 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset, SequentialSampler
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DataCollatorForTokenClassification,
-)
+from torch.utils.data import DataLoader, SequentialSampler
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE_ROOT = os.path.join(PROJECT_ROOT, ".cache", "hf")
-os.environ.setdefault("HF_HOME", os.path.join(CACHE_ROOT, "home"))
-os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(CACHE_ROOT, "datasets"))
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_ROOT, "hub"))
-os.environ.setdefault("HF_XET_CACHE", os.path.join(CACHE_ROOT, "xet"))
-os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(CACHE_ROOT, "transformers"))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "third_party", "LOZO", "large_models"))
 
+from zo_vllm.experiment.env import configure_hf_cache  # noqa: E402
+
+configure_hf_cache(PROJECT_ROOT)
+
 from LOZOtrainer import LowRankTrainer  # noqa: E402
 from run_lozo import OurArguments  # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+from utils import DataCollatorWithPaddingAndNesting, forward_wrap_with_option_len  # noqa: E402
 from zo_vllm.core.direction_digest import digest_named_uv  # noqa: E402
+from zo_vllm.experiment.sst2_official import (  # noqa: E402
+    SST2ClassificationDataset,
+    configure_opt_tokenizer,
+    hf_classification_loss,
+    sample_sst2_train_dev,
+    sample_sst2_validation,
+    sst2_stem,
+)
 
 
-class SimpleDataset(Dataset):
-    def __init__(self, prompts, tokenizer):
-        self.items = []
-        for prompt in prompts:
-            inputs = tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs["input_ids"][0]
-            self.items.append({"input_ids": input_ids, "labels": input_ids.clone()})
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        return self.items[idx]
+def _single_token_id(tokenizer, text):
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) != 1:
+        raise ValueError(f"verbalizer must be single token, got {text!r} -> {token_ids}")
+    return int(token_ids[0])
 
 
-def mask_padding_labels(inputs, tokenizer):
-    labels = inputs["input_ids"].clone()
-    if "attention_mask" in inputs:
-        labels[inputs["attention_mask"] == 0] = -100
-    elif tokenizer.pad_token_id is not None:
-        labels[labels == tokenizer.pad_token_id] = -100
-    inputs["labels"] = labels
-    return inputs
+def evaluate_sst2_accuracy(model, tokenizer, eval_rows, batch_size=64):
+    pos_id = _single_token_id(tokenizer, " great")
+    neg_id = _single_token_id(tokenizer, " terrible")
+    correct = 0
+    total = len(eval_rows)
+    if total == 0:
+        return None
 
-
-def prepare_sst2_prompts(seed, num_samples=1000):
-    np.random.seed(seed)
-    dataset = load_dataset("glue", "sst2", split="train")
-    if num_samples < len(dataset):
-        indices = np.random.choice(len(dataset), num_samples, replace=False)
-        dataset = dataset.select(indices)
-    return [f"{item['sentence']} It was" for item in dataset]
+    with torch.inference_mode():
+        for start in range(0, total, batch_size):
+            batch = eval_rows[start : start + batch_size]
+            prompts = [sst2_stem(row) for row in batch]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            outputs = model(**inputs)
+            logits = outputs.logits
+            last_idx = inputs["attention_mask"].sum(dim=1) - 1
+            batch_idx = torch.arange(logits.size(0), device=logits.device)
+            next_logits = logits[batch_idx, last_idx, :]
+            pred = (next_logits[:, pos_id] > next_logits[:, neg_id]).long()
+            labels = torch.tensor([row["label"] for row in batch], device=logits.device)
+            correct += int((pred == labels).sum().item())
+    return float(correct / total)
 
 
 class PerfLOZOTrainer(LowRankTrainer):
     def __init__(
         self,
-        eval_batch,
+        eval_loss_dataset,
+        eval_loss_collator,
         profile_mode,
         progress_interval,
         warmup_steps,
@@ -76,7 +77,8 @@ class PerfLOZOTrainer(LowRankTrainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.eval_batch = eval_batch
+        self.eval_loss_dataset = eval_loss_dataset
+        self.eval_loss_collator = eval_loss_collator
         self.profile_mode = profile_mode
         self.progress_interval = progress_interval
         self.warmup_steps = warmup_steps
@@ -86,6 +88,7 @@ class PerfLOZOTrainer(LowRankTrainer):
         self.zo_step_times = []
         self.update_times = []
         self.detailed_times = []
+        self.eval_metrics = []
         self.step_count = 0
         self.measured_train_t0 = None
         self.measured_train_t1 = None
@@ -311,8 +314,14 @@ class PerfLOZOTrainer(LowRankTrainer):
                     flush=True,
                 )
         if eval_interval > 0 and measured_step and measured_index % eval_interval == 0:
-            eval_loss = self.zo_forward(self.model, self.eval_batch).item()
+            eval_loss = hf_classification_loss(
+                self.model,
+                self.eval_loss_dataset,
+                self.eval_loss_collator,
+                batch_size=self.args.per_device_train_batch_size,
+            )
             self.eval_losses.append({"step": measured_index, "loss": float(eval_loss)})
+            self.eval_metrics.append({"step": measured_index, "loss": float(eval_loss)})
             print(f"[LOZO] step={measured_index} eval_loss={eval_loss:.6f}", flush=True)
 
 
@@ -326,6 +335,7 @@ def main():
     parser.add_argument("--step-interval", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-samples", type=int, default=1000)
+    parser.add_argument("--num-dev", type=int, default=500)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
@@ -335,6 +345,9 @@ def main():
     parser.add_argument("--model-name", default="facebook/opt-2.7b")
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--torch-compile-mode", default="default")
+    parser.add_argument("--save-interval", type=int, default=0)
+    parser.add_argument("--save-total-limit", type=int, default=2)
+    parser.add_argument("--eval-accuracy-samples", type=int, default=512)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
@@ -352,14 +365,23 @@ def main():
     if args.num_samples < args.batch_size:
         raise SystemExit("--num-samples must be greater than or equal to --batch-size")
 
-    prompts = prepare_sst2_prompts(seed=args.seed, num_samples=args.num_samples)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    train_rows, dev_rows = sample_sst2_train_dev(
+        seed=args.seed,
+        num_train=args.num_samples,
+        num_dev=args.num_dev,
+    )
+    eval_rows = sample_sst2_validation(seed=args.seed, num_eval=args.eval_accuracy_samples)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    configure_opt_tokenizer(tokenizer, model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         device_map="auto",
     )
     model.eval()
+    tokenizer.padding_side = "left"
+    model.original_forward = model.forward
+    model.forward = forward_wrap_with_option_len.__get__(model, type(model))
     if args.torch_compile:
         print(
             f"[LOZO] torch_compile_forward=true mode={args.torch_compile_mode}",
@@ -372,14 +394,19 @@ def main():
             dynamic=False,
         )
 
-    dataset = SimpleDataset(prompts, tokenizer)
-    eval_batch = mask_padding_labels(
-        dict(tokenizer(prompts[: args.batch_size], return_tensors="pt", padding=True)),
-        tokenizer,
+    dataset = SST2ClassificationDataset(train_rows, tokenizer)
+    eval_dataset = SST2ClassificationDataset(dev_rows, tokenizer)
+    collator = DataCollatorWithPaddingAndNesting(tokenizer, pad_to_multiple_of=8)
+    initial_loss = hf_classification_loss(
+        model,
+        eval_dataset,
+        collator,
+        batch_size=args.batch_size,
     )
-    with torch.inference_mode():
-        initial_loss = model(**{k: v.to(model.device) for k, v in eval_batch.items()}).loss.item()
+    initial_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
     print(f"[LOZO] initial_loss={initial_loss:.6f}", flush=True)
+    if initial_acc is not None:
+        print(f"[LOZO] initial_acc={initial_acc:.6f}", flush=True)
 
     np.random.seed(args.seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -408,10 +435,12 @@ def main():
         max_steps=total_target_steps,
         num_train_epochs=max_epochs,
         evaluation_strategy="no",
-        save_strategy="no",
+        save_strategy="steps" if args.save_interval > 0 else "no",
+        save_steps=max(1, int(args.save_interval)) if args.save_interval > 0 else 500,
+        save_total_limit=int(args.save_total_limit),
         load_float16=True,
         only_train_option=False,
-        train_as_classification=False,
+        train_as_classification=True,
         remove_unused_columns=False,
         lr_scheduler_type="constant",
         dataloader_drop_last=True,
@@ -421,17 +450,20 @@ def main():
         our_args.report_to = []
 
     trainer = PerfLOZOTrainer(
-        eval_batch=eval_batch,
+        eval_loss_dataset=eval_dataset,
+        eval_loss_collator=collator,
         profile_mode=args.profile_mode,
         progress_interval=args.progress_interval,
         warmup_steps=args.warmup_steps,
         model=model,
         args=our_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
-        data_collator=DataCollatorForTokenClassification(tokenizer),
+        data_collator=collator,
     )
     trainer.eval_losses.append({"step": 0, "loss": float(initial_loss)})
+    trainer.eval_metrics.append({"step": 0, "loss": float(initial_loss), "accuracy": initial_acc})
 
     trainer.train()
     total_s = (
@@ -440,11 +472,22 @@ def main():
         else trainer.measured_train_t1 - trainer.measured_train_t0
     )
 
-    with torch.inference_mode():
-        final_loss = model(**{k: v.to(model.device) for k, v in eval_batch.items()}).loss.item()
+    final_loss = hf_classification_loss(
+        model,
+        eval_dataset,
+        collator,
+        batch_size=args.batch_size,
+    )
+    final_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
     if not trainer.eval_losses or trainer.eval_losses[-1]["step"] != args.steps:
         trainer.eval_losses.append({"step": args.steps, "loss": float(final_loss)})
+    if not trainer.eval_metrics or trainer.eval_metrics[-1]["step"] != args.steps:
+        trainer.eval_metrics.append(
+            {"step": args.steps, "loss": float(final_loss), "accuracy": final_acc}
+        )
     print(f"[LOZO] final_loss={final_loss:.6f}", flush=True)
+    if final_acc is not None:
+        print(f"[LOZO] final_acc={final_acc:.6f}", flush=True)
 
     output_file = os.path.join(output_dir, f"lozo_perf_{args.profile_mode}_{timestamp}.json")
     step_times = trainer.step_times
@@ -458,6 +501,12 @@ def main():
         }
         for key in detail_keys
     }
+    saved_checkpoints = sorted(
+        p for p in os.listdir(trainer_output_dir)
+        if p.startswith("checkpoint-")
+    ) if os.path.isdir(trainer_output_dir) else []
+    checkpoint_paths = [os.path.join(trainer_output_dir, p) for p in saved_checkpoints]
+
     with open(output_file, "w") as f:
         json.dump({
             "config": vars(args) | {"model": model_name, "backend": "lozo"},
@@ -465,6 +514,10 @@ def main():
             "final_loss": float(final_loss),
             "loss_change": float(final_loss - initial_loss),
             "eval_losses": trainer.eval_losses,
+            "eval_metrics": trainer.eval_metrics,
+            "initial_accuracy": initial_acc,
+            "final_accuracy": final_acc,
+            "checkpoints": checkpoint_paths,
             "history": trainer.history,
             "timing": {
                 "total_s": float(total_s),
@@ -480,11 +533,12 @@ def main():
             "detailed_timing": detail_summary,
         }, f, indent=2)
 
-    shutil.rmtree(trainer_output_dir, ignore_errors=True)
-    try:
-        os.rmdir(os.path.dirname(trainer_output_dir))
-    except OSError:
-        pass
+    if args.save_interval <= 0:
+        shutil.rmtree(trainer_output_dir, ignore_errors=True)
+        try:
+            os.rmdir(os.path.dirname(trainer_output_dir))
+        except OSError:
+            pass
     print(f"[LOZO] saved={output_file}", flush=True)
 
 

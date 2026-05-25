@@ -12,6 +12,7 @@ import wandb
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from zo_vllm.experiment.env import configure_hf_cache
 from zo_vllm.experiment.paths import project_root, resolve_path
 from zo_vllm.experiment.io import load_json, write_json
 from zo_vllm.experiment.run_state import (
@@ -22,7 +23,6 @@ from zo_vllm.experiment.run_state import (
 
 
 PROJECT_ROOT = project_root()
-CACHE_ROOT = PROJECT_ROOT / ".cache" / "hf"
 
 
 def newest(pattern: str) -> str | None:
@@ -340,11 +340,12 @@ def main():
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     env["VLLM_BATCH_INVARIANT"] = "0"
-    env["HF_HOME"] = str(CACHE_ROOT / "home")
-    env["HF_DATASETS_CACHE"] = str(CACHE_ROOT / "datasets")
-    env["HF_HUB_CACHE"] = str(CACHE_ROOT / "hub")
-    env["HF_XET_CACHE"] = str(CACHE_ROOT / "xet")
-    env["TRANSFORMERS_CACHE"] = str(CACHE_ROOT / "transformers")
+    cache_root = configure_hf_cache(PROJECT_ROOT)
+    env["HF_HOME"] = str(cache_root / "home")
+    env["HF_DATASETS_CACHE"] = str(cache_root / "datasets")
+    env["HF_HUB_CACHE"] = str(cache_root / "hub")
+    env["HF_XET_CACHE"] = str(cache_root / "xet")
+    env["TRANSFORMERS_CACHE"] = str(cache_root / "transformers")
     env["WANDB_PROJECT"] = args.wandb_project
     env["WANDB_ENTITY"] = args.wandb_entity
     env["WANDB_MODE"] = env.get("WANDB_MODE", "online")

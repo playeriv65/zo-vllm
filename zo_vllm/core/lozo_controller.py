@@ -25,6 +25,18 @@ class LOZOConfig:
     direction_sampling: str = "exact"
 
 
+@dataclass(frozen=True)
+class ParamMetadata:
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+
 class LOZOController:
     """
     LOZO trainer that maintains master weights and computes updates.
@@ -52,6 +64,7 @@ class LOZOController:
         self,
         hf_model,
         config: LOZOConfig,
+        param_metadata: Optional[Dict[str, ParamMetadata]] = None,
     ):
         self.hf_model = hf_model
         self.config = config
@@ -60,12 +73,17 @@ class LOZOController:
                 f"unknown direction_sampling: {self.config.direction_sampling}"
             )
         
-        self.master: Dict[str, torch.Tensor] = {}
+        self.master: Dict[str, torch.Tensor | ParamMetadata] = {}
         self.v_cache: Dict[str, torch.Tensor] = {}
         self.vt_cache: Dict[str, torch.Tensor] = {}
         self.step = 0
-        
-        self._init_master_weights()
+
+        if param_metadata is not None:
+            self.master.update(param_metadata)
+        elif hf_model is not None:
+            self._init_master_weights()
+        else:
+            raise ValueError("LOZOController requires hf_model or param_metadata")
     
     def _init_master_weights(self):
         """

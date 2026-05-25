@@ -3,41 +3,27 @@ import json
 import os
 import shlex
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TMUX_SESSION = "zo-vllm"
-
-
-def shell_join(parts: list[str]) -> str:
-    return " ".join(shlex.quote(str(part)) for part in parts)
-
-
-def env_prefix(env: dict[str, str]) -> str:
-    return " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-
-
-def parse_csv(value: str) -> list[str]:
-    items = [item.strip() for item in value.split(",") if item.strip()]
-    if not items:
-        raise argparse.ArgumentTypeError("at least one item is required")
-    return items
+from zo_vllm.experiment.launch import (
+    DEFAULT_TMUX_SESSION,
+    ensure_run_dir_available,
+    ensure_tmux_session,
+    monitored_body,
+    parse_csv,
+    parse_int_csv,
+    run_preflight,
+    sequential_body,
+    shell_join,
+    tmux_new_window_command,
+    write_job_script,
+)
+from zo_vllm.experiment.manifest import append_launch_record, load_manifest, write_manifest
+from zo_vllm.experiment.naming import safe_model_name, timestamp_now
+from zo_vllm.experiment.paths import project_root
 
 
-def parse_int_csv(value: str) -> list[int]:
-    values = []
-    for item in parse_csv(value):
-        parsed = int(item)
-        if parsed <= 0:
-            raise argparse.ArgumentTypeError("values must be positive integers")
-        values.append(parsed)
-    return values
-
-
-def safe_model_name(model: str) -> str:
-    return model.replace("/", "__").replace(":", "_")
+PROJECT_ROOT = project_root()
 
 
 def model_batch_dir(base_dir: Path, model: str, batch_size: int) -> Path:
@@ -51,91 +37,6 @@ def has_backend_result(base_dir: Path, model: str, batch_size: int, backend: str
     if backend == "vllm":
         return any((run_dir / "vllm_optimized").glob("vllm_perf_*.json"))
     raise ValueError(f"unknown backend: {backend}")
-
-
-def ensure_tmux_session(session: str) -> bool:
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode == 0:
-        return False
-    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
-    return True
-
-
-def ensure_run_dir_available(base_dir: Path) -> None:
-    if base_dir.exists():
-        raise SystemExit(f"run directory already exists: {base_dir}")
-
-
-def tmux_new_window_command(session: str, window: str, body: str) -> list[str]:
-    return ["tmux", "new-window", "-t", session, "-n", window, body]
-
-
-def write_job_script(base_dir: Path, window: str, body: str) -> Path:
-    scripts_dir = base_dir / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    script_path = scripts_dir / f"{window}.sh"
-    script_path.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        f"{body}\n"
-    )
-    script_path.chmod(0o755)
-    return script_path
-
-
-def write_manifest(path: Path, manifest: dict) -> None:
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-
-def run_preflight(gpus: list[str], allow_non_numeric_gpu: bool) -> dict:
-    errors = []
-    if not allow_non_numeric_gpu:
-        for gpu in gpus:
-            if not gpu.isdigit():
-                errors.append(f"non-numeric GPU id requires --allow-non-numeric-gpu: {gpu}")
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            cwd=PROJECT_ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        gpu_rows = result.stdout.strip().splitlines()
-    except Exception as exc:
-        return {"ok": False, "errors": [f"nvidia-smi failed: {exc}"], "gpu_rows": []}
-
-    numeric = {row.split(",")[0].strip(): row for row in gpu_rows if row.strip()}
-    for gpu in gpus:
-        if gpu.isdigit() and gpu not in numeric:
-            errors.append(f"GPU {gpu} not found in nvidia-smi output")
-    return {"ok": not errors, "errors": errors, "gpu_rows": gpu_rows}
-
-
-def monitoring_prefix(gpu_csv: Path) -> str:
-    return (
-        f"(while true; do nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used "
-        f"--format=csv,noheader,nounits >> {shlex.quote(str(gpu_csv))}; "
-        "sleep 1; done) & mon=$!; "
-    )
-
-
-def monitored_body(env: dict[str, str], cmd: list[str], log_file: Path, gpu_csv: Path) -> str:
-    return (
-        f"set -o pipefail; cd {shlex.quote(str(PROJECT_ROOT))}; "
-        f"{monitoring_prefix(gpu_csv)}"
-        f"{env_prefix(env)} {shell_join(cmd)} 2>&1 | tee {shlex.quote(str(log_file))}; "
-        "status=${PIPESTATUS[0]}; kill $mon 2>/dev/null || true; exit $status"
-    )
 
 
 def build_lozo_command(args, model: str, batch_size: int, base_dir: Path) -> str:
@@ -200,6 +101,7 @@ def build_lozo_command(args, model: str, batch_size: int, base_dir: Path) -> str
         cmd,
         log_file,
         gpu_csv,
+        project_root=PROJECT_ROOT,
     )
 
 
@@ -296,11 +198,8 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         cmd,
         log_file,
         gpu_csv,
+        project_root=PROJECT_ROOT,
     )
-
-
-def sequential_body(commands: list[str]) -> str:
-    return " && ".join(f"({command})" for command in commands)
 
 
 def parse_args() -> argparse.Namespace:
@@ -351,7 +250,7 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("set --vllm-gpu or PHASE3_VLLM_GPU")
     if args.num_samples < max(args.batch_sizes):
         raise SystemExit("--num-samples must cover the largest --batch-sizes value")
-    args.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.timestamp = timestamp_now()
     if args.run_id is None:
         model_text = "-".join(safe_model_name(model).removeprefix("facebook__opt-") for model in args.models)
         batch_text = "-".join(str(batch) for batch in args.batch_sizes)
@@ -432,6 +331,7 @@ def main() -> None:
             preflight_report = run_preflight(
                 [args.lozo_gpu, args.vllm_gpu],
                 args.allow_non_numeric_gpu,
+                cwd=PROJECT_ROOT,
             )
             print("preflight_report=" + json.dumps(preflight_report, sort_keys=True), flush=True)
             if not preflight_report.get("ok", False):
@@ -460,13 +360,7 @@ def main() -> None:
         manifest_path = base_dir / "manifest.json"
         manifest = {}
         if args.resume_existing and manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text())
-        launch_record = {
-            "timestamp": args.timestamp,
-            "backend": args.backend,
-            "preflight_report": preflight_report,
-            "tmux_commands": [shell_join(command) for command in tmux_commands],
-        }
+            manifest = load_manifest(manifest_path)
         manifest.update({
             "run_id": args.run_id,
             "run_dir": str(base_dir.relative_to(PROJECT_ROOT)),
@@ -477,10 +371,19 @@ def main() -> None:
             "preflight_report": preflight_report,
             "collect_command": collect_command,
         })
-        manifest.setdefault("launch_records", []).append(launch_record)
+        manifest = append_launch_record(
+            manifest,
+            backend=args.backend,
+            run_id=args.run_id,
+            tmux_commands=tmux_commands,
+            config={
+                "preflight_report": preflight_report,
+                "experiment_parameters": experiment_parameters,
+            },
+        )
         write_manifest(manifest_path, manifest)
         created_session = ensure_tmux_session(args.tmux_session)
-        manifest = json.loads(manifest_path.read_text())
+        manifest = load_manifest(manifest_path)
         manifest["tmux_session_created_by_launcher"] = created_session
         write_manifest(manifest_path, manifest)
         if created_session:

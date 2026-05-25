@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from zo_vllm.experiment.launch import ensure_tmux_session, parse_csv, shell_join
 from zo_vllm.experiment.manifest import append_launch_record, load_manifest, write_manifest
 from zo_vllm.experiment.naming import timestamp_now
 from zo_vllm.experiment.paths import project_root, resolve_path
@@ -16,10 +17,6 @@ from zo_vllm.experiment.run_state import read_run_state
 
 PROJECT_ROOT = project_root()
 DEFAULT_TMUX_SESSION = "zo-vllm"
-
-
-def parse_csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def parse_gpu_pairs(value: str) -> list[tuple[str, str]]:
@@ -34,26 +31,9 @@ def parse_gpu_pairs(value: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def shell_join(parts: list[str]) -> str:
-    return " ".join(shlex.quote(str(p)) for p in parts)
-
-
 def load_config(path: Path) -> dict:
     with path.open() as f:
         return json.load(f)
-
-
-def ensure_tmux_session(session: str) -> bool:
-    has = subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if has.returncode == 0:
-        return False
-    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
-    return True
 
 
 def should_skip_job(run_dir: Path, job_id: str, resume_existing: bool) -> tuple[bool, bool]:

@@ -6,43 +6,21 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from zo_vllm.experiment.launch import (
+    ensure_run_dir_available,
+    ensure_tmux_session,
+    env_prefix,
+    shell_join,
+    tmux_new_window_command,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TMUX_SESSION = "zo-vllm"
 
 
-def shell_join(parts: list[str]) -> str:
-    return " ".join(shlex.quote(str(part)) for part in parts)
-
-
-def env_prefix(env: dict[str, str]) -> str:
-    return " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-
-
-def tmux_new_window_command(session: str, window: str, body: str) -> list[str]:
-    return ["tmux", "new-window", "-t", session, "-n", window, body]
-
-
-def ensure_tmux_session(session: str) -> bool:
-    has_session = subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if has_session.returncode == 0:
-        return False
-    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
-    return True
-
-
 def write_manifest(path: Path, manifest: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-
-def ensure_run_dir_available(base_dir: Path) -> None:
-    if base_dir.exists():
-        raise SystemExit(f"run directory already exists: {base_dir}")
 
 
 def run_preflight(command: list[str]) -> dict:

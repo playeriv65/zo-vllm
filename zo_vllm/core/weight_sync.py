@@ -13,6 +13,8 @@ import time
 from typing import Dict
 import torch
 
+from zo_vllm.core.lozo_controller import ParamMetadata
+
 
 def unwrap_lora_module(module):
     """
@@ -166,6 +168,59 @@ class WeightSync:
                 mapping[hf_name] = hf_name
         
         return mapping
+
+    def get_hf_param_metadata(self) -> Dict[str, ParamMetadata]:
+        """
+        Read LoRA-compatible parameter metadata from the vLLM worker.
+
+        This avoids loading a second HF model just to discover tensor shapes.
+        For OPT q/k/v weights, vLLM stores one packed qkv_proj tensor, so the
+        returned HF-style metadata exposes each slice with the unpacked shape.
+        """
+        ordered_hf_names = list(self.hf_to_vllm_mapping.keys())
+
+        def read_metadata_on_worker(worker):
+            model = worker.model_runner.model
+            metadata = []
+            for hf_name in ordered_hf_names:
+                vllm_name = self.hf_to_vllm_mapping[hf_name]
+                module_path = vllm_name.replace(".weight", "")
+                module = model.get_submodule(module_path)
+                base_layer = unwrap_lora_module(module)
+                param = base_layer.weight
+                if "qkv_proj.weight" in vllm_name:
+                    hidden_size = param.data.shape[0] // 3
+                    shape = (hidden_size, param.data.shape[1])
+                else:
+                    shape = tuple(param.data.shape)
+                metadata.append(
+                    {
+                        "name": hf_name,
+                        "shape": tuple(int(dim) for dim in shape),
+                        "dtype": str(param.data.dtype).replace("torch.", ""),
+                        "device": str(param.data.device),
+                    }
+                )
+            return metadata
+
+        worker_results = self.llm.collective_rpc(read_metadata_on_worker)
+        if not worker_results:
+            raise RuntimeError("vLLM worker returned no parameter metadata")
+        if len(worker_results) != 1:
+            raise RuntimeError(
+                "metadata-only LOZO controller currently expects one vLLM worker"
+            )
+
+        metadata = {}
+        for item in worker_results[0]:
+            dtype = getattr(torch, item["dtype"])
+            metadata[item["name"]] = ParamMetadata(
+                name=item["name"],
+                shape=tuple(item["shape"]),
+                dtype=dtype,
+                device=torch.device(item["device"]),
+            )
+        return metadata
     
     def sync(self, updated_weights_hf_names: Dict[str, torch.Tensor]):
         """

@@ -63,6 +63,8 @@ batch 缓存可变 attention metadata。
 training objective。长程收敛判断以 clean `eval_loss`、`eval_acc` 和最终
 full-eval accuracy 为主；training loss 只作为 noisy debug 信号。若需要按
 wall-clock 画收敛曲线，必须明确区分真实 timestamp 与按平均 step time 估算的曲线。
+Launcher 中的 tmux/shell/preflight 逻辑优先复用 `zo_vllm/experiment/` 公共模块，
+避免在 Phase runner 内复制实现导致行为分叉。
 
 ## Phase 1 结论
 

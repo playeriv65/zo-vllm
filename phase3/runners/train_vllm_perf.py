@@ -8,22 +8,17 @@ import time
 from datetime import datetime
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE_ROOT = os.path.join(PROJECT_ROOT, ".cache", "hf")
-os.environ.setdefault("HF_HOME", os.path.join(CACHE_ROOT, "home"))
-os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(CACHE_ROOT, "datasets"))
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_ROOT, "hub"))
-os.environ.setdefault("HF_XET_CACHE", os.path.join(CACHE_ROOT, "xet"))
-os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(CACHE_ROOT, "transformers"))
-os.environ.setdefault("VLLM_BATCH_INVARIANT", "0")
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-os.environ.setdefault("WANDB_MODE", "offline")
 sys.path.insert(0, PROJECT_ROOT)
+
+from zo_vllm.experiment.env import configure_hf_cache, configure_vllm_training_env
+
+configure_hf_cache(PROJECT_ROOT)
+configure_vllm_training_env()
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from zo_vllm.core.direction_digest import digest_named_uv
 from zo_vllm.core.lozo_controller import LOZOConfig, LOZOController
@@ -125,7 +120,7 @@ def eval_sst2_accuracy_direct_worker(
     *,
     max_logits_tokens,
     loss_impl,
-    max_prompts_per_call=64,
+    max_prompts_per_call=32,
 ):
     if not rows:
         return None
@@ -286,6 +281,15 @@ def main():
     parser.add_argument("--progress-interval", type=int, default=50)
     parser.add_argument("--train-loss-interval", type=int, default=0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
+    parser.add_argument("--kv-cache-memory-bytes", type=int, default=None)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument(
+        "--direct-controller-source",
+        choices=["vllm_metadata", "hf_master"],
+        default="vllm_metadata",
+    )
     parser.add_argument("--model-name", default="facebook/opt-2.7b")
     parser.add_argument("--direct-lora-from-directions", choices=["0", "1"], default="0")
     parser.add_argument("--save-interval", type=int, default=0)
@@ -373,21 +377,36 @@ def main():
         flush=True,
     )
 
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map="cpu",
-    )
+    model_config = AutoConfig.from_pretrained(model_name)
+    hf_model = None
+    if args.weight_update == "copy" or args.direct_controller_source == "hf_master":
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="cpu",
+        )
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     configure_opt_tokenizer(tokenizer, model_name)
+    llm_kwargs = {
+        "model": model_name,
+        "enforce_eager": bool(int(args.enforce_eager)),
+        "enable_lora": True,
+        "max_lora_rank": args.rank,
+        "max_loras": 4 if slot_pipeline else 2,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
+    if args.kv_cache_memory_bytes is not None:
+        llm_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
     llm = LLM(
-        model=model_name,
-        enforce_eager=bool(int(args.enforce_eager)),
-        enable_lora=True,
-        max_lora_rank=args.rank,
-        max_loras=4 if slot_pipeline else 2,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        **llm_kwargs,
     )
+    weight_sync = WeightSync(llm, num_layers=model_config.num_hidden_layers)
 
     config = LOZOConfig(
         rank=args.rank,
@@ -399,41 +418,42 @@ def main():
         train_scope=args.train_scope,
         direction_sampling=args.direction_sampling,
     )
-    controller = LOZOController(hf_model, config)
+    param_metadata = None
+    if args.weight_update == "direct" and args.direct_controller_source == "vllm_metadata":
+        param_metadata = weight_sync.get_hf_param_metadata()
+    controller = LOZOController(hf_model, config, param_metadata=param_metadata)
     temp_loras = [
         TempLoRARuntime(
             rank=args.rank,
-            num_layers=hf_model.config.num_hidden_layers,
+            num_layers=model_config.num_hidden_layers,
             plus_id=9001,
             minus_id=9002,
             residency=args.lora_residency,
             injection=lora_injection,
             llm=llm,
             base_model_name=model_name,
-            hidden_size=hf_model.config.hidden_size,
-            ffn_dim=hf_model.config.ffn_dim,
+            hidden_size=model_config.hidden_size,
+            ffn_dim=model_config.ffn_dim,
         )
     ]
     if slot_pipeline:
         temp_loras.append(
             TempLoRARuntime(
                 rank=args.rank,
-                num_layers=hf_model.config.num_hidden_layers,
+                num_layers=model_config.num_hidden_layers,
                 plus_id=9003,
                 minus_id=9004,
                 residency=args.lora_residency,
                 injection=lora_injection,
                 llm=llm,
                 base_model_name=model_name,
-                hidden_size=hf_model.config.hidden_size,
-                ffn_dim=hf_model.config.ffn_dim,
+                hidden_size=model_config.hidden_size,
+                ffn_dim=model_config.ffn_dim,
             )
         )
     for runtime in temp_loras:
         runtime.register_slots()
     temp_lora = temp_loras[0]
-    weight_sync = WeightSync(llm, num_layers=hf_model.config.num_hidden_layers)
-
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -598,6 +618,8 @@ def main():
     step = 0
     measured_train_t0 = None
     measured_train_t1 = None
+    last_progress_time = None
+    last_progress_step = 0
     train_loss_window_sum = 0.0
     train_loss_window_count = 0
     prep_executor = ThreadPoolExecutor(max_workers=1) if slot_pipeline else None
@@ -819,12 +841,28 @@ def main():
                             train_loss_window_count = 0
 
                     if args.progress_interval > 0 and measured_index % args.progress_interval == 0:
+                        progress_now = time.perf_counter()
+                        cumulative_s = (
+                            0.0
+                            if measured_train_t0 is None
+                            else progress_now - measured_train_t0
+                        )
+                        window_s = (
+                            cumulative_s
+                            if last_progress_time is None
+                            else progress_now - last_progress_time
+                        )
+                        window_steps = measured_index - last_progress_step
                         print(
                             f"[vLLM] step={measured_index} seed={int(random_seed)} "
                             f"plus={loss_plus:.6f} minus={loss_minus:.6f} "
-                            f"c={c:.6f} step_s={timing['step_s'][-1]:.6f}",
+                            f"c={c:.6f} step_s={timing['step_s'][-1]:.6f} "
+                            f"window_steps={window_steps} window_s={window_s:.6f} "
+                            f"cumulative_s={cumulative_s:.6f}",
                             flush=True,
                         )
+                        last_progress_time = progress_now
+                        last_progress_step = measured_index
 
                     if args.eval_interval > 0 and measured_index % args.eval_interval == 0:
                         if args.base_eval_mode == "skip":
