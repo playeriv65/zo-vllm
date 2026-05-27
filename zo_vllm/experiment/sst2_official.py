@@ -42,6 +42,13 @@ def sst2_verbalized(row: SST2Row, candidate: int) -> str:
     return f"{sst2_stem(row)} {verbalizer[candidate]}"
 
 
+def single_token_id(tokenizer: PreTrainedTokenizerBase, text: str) -> int:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) != 1:
+        raise ValueError(f"verbalizer must be single token, got {text!r} -> {token_ids}")
+    return int(token_ids[0])
+
+
 def load_sst2_rows(split: str) -> list[SST2Row]:
     dataset = load_dataset("glue", "sst2", split=split)
     return [
@@ -156,7 +163,8 @@ def hf_classification_loss(
     with torch.inference_mode():
         for batch in loader:
             batch = {k: v.to(model.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            loss = model(**batch).loss
+            outputs = model(**batch)
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             bsz = int(batch["labels"].numel() // int(batch["num_options"][0]))
             total += float(loss.item()) * bsz
             count += bsz

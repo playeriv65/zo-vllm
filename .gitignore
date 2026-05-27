@@ -13,6 +13,7 @@ build/
 # Environments
 .venv/
 .venv312/
+.vscode/
 
 # Generated artifacts
 adapters*/
@@ -22,6 +23,8 @@ phase1/artifacts/
 phase2/artifacts/
 phase2/results/
 phase3/results/
+preprint_package/
+preprint_package.zip
 
 # Logs and results
 logs/

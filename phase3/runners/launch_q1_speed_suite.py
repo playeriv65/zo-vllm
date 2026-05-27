@@ -78,6 +78,8 @@ def build_lozo_command(args, base_dir: Path) -> str:
         str(args.step_interval),
         "--eval-interval",
         str(args.eval_interval),
+        "--accuracy-eval-mode",
+        "skip",
         "--seed",
         str(args.seed),
         "--zo-random-device",
@@ -145,6 +147,12 @@ def build_vllm_command(args, base_dir: Path, profile_mode: str) -> str:
         "direct",
         "--weight-update-precision",
         "param",
+        "--direct-update-mode",
+        args.direct_update_mode,
+        "--base-eval-mode",
+        "skip",
+        "--accuracy-eval-mode",
+        "skip",
         "--progress-interval",
         str(args.progress_interval),
         "--gpu-memory-utilization",
@@ -192,6 +200,7 @@ def parse_args():
     parser.add_argument("--progress-interval", type=int, default=100)
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
+    parser.add_argument("--direct-update-mode", choices=["immediate", "accumulate"], default="accumulate")
     parser.add_argument(
         "--allow-non-numeric-gpu",
         action="store_true",
@@ -250,6 +259,7 @@ def main() -> None:
         "vllm_lora_injection": "direct",
         "vllm_weight_update": "direct",
         "vllm_weight_update_precision": "param",
+        "vllm_direct_update_mode": args.direct_update_mode,
         "vllm_gpu_memory_utilization": args.gpu_memory_utilization,
         "include_detailed": args.include_detailed,
         "wandb": "disabled",

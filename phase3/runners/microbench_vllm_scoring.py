@@ -37,6 +37,7 @@ from zo_vllm.core.vllm_scorer import (
     VLLMScorer,
     compute_nll_from_prompt_logprobs_detailed,
 )
+from zo_vllm.experiment.stats import summarize
 
 
 MODE_CHOICES = (
@@ -92,18 +93,6 @@ def summarize_prompt_token_lengths(prompt_token_ids: list[list[int]]) -> dict[st
         **summary,
         "sum": int(sum(lengths)),
         "count": int(len(lengths)),
-    }
-
-
-def summarize(values: list[float]) -> dict[str, float]:
-    if not values:
-        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-    arr = np.asarray(values, dtype=np.float64)
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std()),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
     }
 
 

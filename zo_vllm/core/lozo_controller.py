@@ -23,6 +23,7 @@ class LOZOConfig:
     random_device: str = "cpu"
     train_scope: str = "lora_only"
     direction_sampling: str = "exact"
+    direction_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ class LOZOController:
                             "V": self.v_cache[name],
                             "V_T": self.vt_cache[name],
                             "v_refreshed": v_refreshed,
+                            "scale": float(self.config.direction_scale),
                         }
                         offset += numel
 
@@ -309,6 +311,7 @@ class LOZOController:
                             "V": V,
                             "V_T": self.vt_cache[name],
                             "v_refreshed": v_refreshed,
+                            "scale": float(self.config.direction_scale),
                         }
                     elif W.ndim == 1:
                         directions_1d[name] = self._randn(
@@ -349,7 +352,8 @@ class LOZOController:
                 # 2D: low-rank perturbation u @ v.T
                 U = directions_2d[name]["U"]
                 V = directions_2d[name]["V"]
-                delta_W = (U @ V.T) * self.config.eps
+                scale = float(directions_2d[name].get("scale", self.config.direction_scale))
+                delta_W = (U @ V.T) * (self.config.eps * scale)
                 perturbed[name] = W + scaling_factor * delta_W
             elif name in directions_1d:
                 # 1D: full-rank perturbation z
@@ -401,9 +405,10 @@ class LOZOController:
             
             U = d["U"]
             V = d["V"]
+            scale = float(d.get("scale", self.config.direction_scale))
             
             lora_A = V.T.contiguous().half()
-            lora_B = (sign * self.config.eps * U).contiguous().half()
+            lora_B = (sign * self.config.eps * scale * U).contiguous().half()
             if output_device is not None:
                 lora_A = lora_A.to(output_device).contiguous()
                 lora_B = lora_B.to(output_device).contiguous()
@@ -441,8 +446,9 @@ class LOZOController:
 
             U = d["U"]
             V = d["V"]
+            scale = float(d.get("scale", self.config.direction_scale))
             lora_A = V.T.contiguous().half()
-            lora_B = (self.config.eps * U).contiguous().half()
+            lora_B = (self.config.eps * scale * U).contiguous().half()
             if output_device is not None:
                 lora_A = lora_A.to(output_device).contiguous()
                 lora_B = lora_B.to(output_device).contiguous()
@@ -493,7 +499,8 @@ class LOZOController:
                 U = directions_2d[name]["U"].float()
                 V = directions_2d[name]["V"].float()
                 
-                delta = (U @ V.T)
+                scale = float(directions_2d[name].get("scale", self.config.direction_scale))
+                delta = (U @ V.T) * scale
                 
                 # Check if apply weight_decay
                 if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:

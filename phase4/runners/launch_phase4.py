@@ -105,6 +105,10 @@ def build_job_cmd(job: dict, defaults: dict, wandb_cfg: dict, run_dir: Path, gpu
         str(merged.get("save_total_limit", 3)),
         "--eval-accuracy-samples",
         str(merged.get("eval_accuracy_samples", 512)),
+        "--direct-update-mode",
+        str(merged.get("direct_update_mode", "accumulate")),
+        "--gpu-memory-utilization",
+        str(merged.get("gpu_memory_utilization", 0.8)),
     ]
     if resumed:
         cmd.append("--resume")

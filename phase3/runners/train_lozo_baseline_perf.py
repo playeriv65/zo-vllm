@@ -29,20 +29,15 @@ from zo_vllm.experiment.sst2_official import (  # noqa: E402
     hf_classification_loss,
     sample_sst2_train_dev,
     sample_sst2_validation,
+    single_token_id,
     sst2_stem,
 )
-
-
-def _single_token_id(tokenizer, text):
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    if len(token_ids) != 1:
-        raise ValueError(f"verbalizer must be single token, got {text!r} -> {token_ids}")
-    return int(token_ids[0])
+from zo_vllm.experiment.stats import summarize, summarize_tail  # noqa: E402
 
 
 def evaluate_sst2_accuracy(model, tokenizer, eval_rows, batch_size=64):
-    pos_id = _single_token_id(tokenizer, " great")
-    neg_id = _single_token_id(tokenizer, " terrible")
+    pos_id = single_token_id(tokenizer, " great")
+    neg_id = single_token_id(tokenizer, " terrible")
     correct = 0
     total = len(eval_rows)
     if total == 0:
@@ -60,7 +55,7 @@ def evaluate_sst2_accuracy(model, tokenizer, eval_rows, batch_size=64):
             batch_idx = torch.arange(logits.size(0), device=logits.device)
             next_logits = logits[batch_idx, last_idx, :]
             pred = (next_logits[:, pos_id] > next_logits[:, neg_id]).long()
-            labels = torch.tensor([row["label"] for row in batch], device=logits.device)
+            labels = torch.tensor([int(row.label) for row in batch], device=logits.device)
             correct += int((pred == labels).sum().item())
     return float(correct / total)
 
@@ -348,6 +343,7 @@ def main():
     parser.add_argument("--save-interval", type=int, default=0)
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--eval-accuracy-samples", type=int, default=512)
+    parser.add_argument("--accuracy-eval-mode", choices=["full", "skip"], default="full")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
@@ -403,9 +399,14 @@ def main():
         collator,
         batch_size=args.batch_size,
     )
-    initial_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
+    if args.accuracy_eval_mode == "skip":
+        initial_acc = None
+    else:
+        initial_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
     print(f"[LOZO] initial_loss={initial_loss:.6f}", flush=True)
-    if initial_acc is not None:
+    if args.accuracy_eval_mode == "skip":
+        print("[LOZO] initial_acc=skipped", flush=True)
+    elif initial_acc is not None:
         print(f"[LOZO] initial_acc={initial_acc:.6f}", flush=True)
 
     np.random.seed(args.seed)
@@ -478,7 +479,10 @@ def main():
         collator,
         batch_size=args.batch_size,
     )
-    final_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
+    if args.accuracy_eval_mode == "skip":
+        final_acc = None
+    else:
+        final_acc = evaluate_sst2_accuracy(model, tokenizer, eval_rows)
     if not trainer.eval_losses or trainer.eval_losses[-1]["step"] != args.steps:
         trainer.eval_losses.append({"step": args.steps, "loss": float(final_loss)})
     if not trainer.eval_metrics or trainer.eval_metrics[-1]["step"] != args.steps:
@@ -486,13 +490,16 @@ def main():
             {"step": args.steps, "loss": float(final_loss), "accuracy": final_acc}
         )
     print(f"[LOZO] final_loss={final_loss:.6f}", flush=True)
-    if final_acc is not None:
+    if args.accuracy_eval_mode == "skip":
+        print("[LOZO] final_acc=skipped", flush=True)
+    elif final_acc is not None:
         print(f"[LOZO] final_acc={final_acc:.6f}", flush=True)
 
     output_file = os.path.join(output_dir, f"lozo_perf_{args.profile_mode}_{timestamp}.json")
     step_times = trainer.step_times
     zo_step_times = trainer.zo_step_times
     update_times = trainer.update_times
+
     detail_keys = sorted({key for item in trainer.detailed_times for key in item})
     detail_summary = {
         key: {
@@ -521,6 +528,9 @@ def main():
             "history": trainer.history,
             "timing": {
                 "total_s": float(total_s),
+                "step_s": summarize(step_times),
+                "zo_step_s": summarize(zo_step_times),
+                "update_s": summarize(update_times),
                 "step_s_mean": float(np.mean(step_times)) if step_times else 0.0,
                 "step_s_std": float(np.std(step_times)) if step_times else 0.0,
                 "step_s_min": float(np.min(step_times)) if step_times else 0.0,
@@ -529,6 +539,11 @@ def main():
                 "zo_step_s_std": float(np.std(zo_step_times)) if zo_step_times else 0.0,
                 "update_s_mean": float(np.mean(update_times)) if update_times else 0.0,
                 "update_s_std": float(np.std(update_times)) if update_times else 0.0,
+                "tail_100": {
+                    "step_s": summarize_tail(step_times, 100),
+                    "zo_step_s": summarize_tail(zo_step_times, 100),
+                    "update_s": summarize_tail(update_times, 100),
+                },
             },
             "detailed_timing": detail_summary,
         }, f, indent=2)

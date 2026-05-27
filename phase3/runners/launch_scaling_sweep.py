@@ -78,6 +78,8 @@ def build_lozo_command(args, model: str, batch_size: int, base_dir: Path) -> str
         str(args.step_interval),
         "--eval-interval",
         str(args.eval_interval),
+        "--accuracy-eval-mode",
+        "skip",
         "--seed",
         str(args.seed),
         "--zo-random-device",
@@ -125,7 +127,7 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         "--model-name",
         model,
         "--profile-mode",
-        "detailed",
+        "minimal",
         "--steps",
         str(args.steps),
         "--warmup-steps",
@@ -144,6 +146,8 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         str(args.step_interval),
         "--eval-interval",
         str(args.eval_interval),
+        "--train-objective",
+        "sst2_classification",
         "--seed",
         str(args.seed),
         "--zo-random-device",
@@ -164,6 +168,8 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         "direct",
         "--weight-update-precision",
         "param",
+        "--direct-update-mode",
+        args.direct_update_mode,
         "--qkv-weight-update",
         args.qkv_weight_update,
         "--sync-weight-update",
@@ -180,8 +186,12 @@ def build_vllm_command(args, model: str, batch_size: int, base_dir: Path) -> str
         "0",
         "--base-eval-mode",
         "skip",
+        "--accuracy-eval-mode",
+        "skip",
         "--progress-interval",
         str(args.progress_interval),
+        "--train-loss-interval",
+        "0",
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
         "--output-dir",
@@ -234,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--direct-worker-max-logits-tokens", type=int, default=8192)
     parser.add_argument("--direction-sampling", choices=["exact", "flat"], default="flat")
+    parser.add_argument("--direct-update-mode", choices=["immediate", "accumulate"], default="accumulate")
     parser.add_argument("--qkv-weight-update", choices=["separate", "batched"], default="batched")
     parser.add_argument("--lozo-torch-compile", action="store_true")
     parser.add_argument("--lozo-torch-compile-mode", default="default")
@@ -305,6 +316,7 @@ def main() -> None:
         "lozo_gpu": args.lozo_gpu,
         "vllm_gpu": args.vllm_gpu,
         "vllm_path": "direct_worker+direct_lora_from_directions+direct_weight_update",
+        "vllm_direct_update_mode": args.direct_update_mode,
         "vllm_enforce_eager": int(args.enforce_eager),
         "vllm_gpu_memory_utilization": args.gpu_memory_utilization,
         "vllm_direction_sampling": args.direction_sampling,

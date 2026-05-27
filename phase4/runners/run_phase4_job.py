@@ -1,5 +1,4 @@
 import argparse
-import glob
 import os
 import shlex
 import subprocess
@@ -14,7 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from zo_vllm.experiment.env import configure_hf_cache
 from zo_vllm.experiment.paths import project_root, resolve_path
-from zo_vllm.experiment.io import load_json, write_json
+from zo_vllm.experiment.io import load_json, load_json_line, newest_path, write_json
 from zo_vllm.experiment.run_state import (
     mark_run_completed,
     mark_run_failed,
@@ -25,14 +24,10 @@ from zo_vllm.experiment.run_state import (
 PROJECT_ROOT = project_root()
 
 
-def newest(pattern: str) -> str | None:
-    matches = sorted(glob.glob(pattern))
-    return matches[-1] if matches else None
-
-
 def build_lozo_cmd(args, artifact_dir: Path) -> list[str]:
     output_dir = artifact_dir / "official_output"
     result_file = artifact_dir / "official_metrics.json"
+    eval_metrics_file = artifact_dir / "lozo_eval_metrics.jsonl"
     train_set_seed = args.seed if args.train_set_seed is None else args.train_set_seed
     cmd = [
         "third_party/LOZO/large_models/.venv/bin/python",
@@ -91,6 +86,10 @@ def build_lozo_cmd(args, artifact_dir: Path) -> list[str]:
         args.train_scope,
         "--result_file",
         str(result_file),
+        "--eval_at_start",
+        "--eval_accuracy_during_training",
+        "--eval_metrics_file",
+        str(eval_metrics_file),
         "--overwrite_output_dir",
     ]
     if args.dataloader_seed is not None:
@@ -154,6 +153,8 @@ def build_vllm_cmd(args, artifact_dir: Path) -> list[str]:
         "direct",
         "--weight-update-precision",
         args.weight_update_precision,
+        "--direct-update-mode",
+        args.direct_update_mode,
         "--qkv-weight-update",
         args.qkv_weight_update,
         "--sync-weight-update",
@@ -175,7 +176,7 @@ def build_vllm_cmd(args, artifact_dir: Path) -> list[str]:
         "--train-loss-interval",
         str(args.logging_steps),
         "--gpu-memory-utilization",
-        "0.5",
+        str(args.gpu_memory_utilization),
         "--output-dir",
         str(artifact_dir),
         "--save-interval",
@@ -191,7 +192,8 @@ def result_json(backend: str, artifact_dir: Path) -> Path:
     if backend == "lozo":
         candidate = str(artifact_dir / "official_metrics.json")
     else:
-        candidate = newest(str(artifact_dir / "vllm_perf_*.json"))
+        candidate_path = newest_path(str(artifact_dir / "vllm_perf_*.json"))
+        candidate = str(candidate_path) if candidate_path is not None else None
     if candidate is None or not Path(candidate).exists():
         raise FileNotFoundError(f"result json not found in {artifact_dir}")
     return Path(candidate)
@@ -208,6 +210,22 @@ def load_backend_result(backend: str, artifact_dir: Path, train_scope: str | Non
     metrics = load_json(official_metrics_file)
 
     eval_metrics = []
+    phase_eval_file = artifact_dir / "lozo_eval_metrics.jsonl"
+    if phase_eval_file.exists():
+        with phase_eval_file.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = load_json_line(line)
+                if "step" not in row:
+                    continue
+                item = {"step": int(row["step"])}
+                if "loss" in row:
+                    item["loss"] = float(row["loss"])
+                if "accuracy" in row:
+                    item["accuracy"] = float(row["accuracy"])
+                eval_metrics.append(item)
     for state_file in sorted(official_output_dir.glob("checkpoint-*/trainer_state.json")):
         state = load_json(state_file)
         for row in state.get("log_history", []):
@@ -247,6 +265,7 @@ def load_backend_result(backend: str, artifact_dir: Path, train_scope: str | Non
             "train_scope": f"official_{train_scope or 'unknown'}",
             "official_metrics_file": str(official_metrics_file),
             "official_output_dir": str(official_output_dir),
+            "phase_eval_metrics_file": str(phase_eval_file),
         },
         "initial_loss": initial_loss,
         "final_loss": final_loss,
@@ -311,7 +330,9 @@ def parse_args():
     parser.add_argument("--train-sampler", choices=["sequential", "hf_random"], default="sequential")
     parser.add_argument("--dataloader-seed", type=int, default=None)
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
+    parser.add_argument("--direct-update-mode", choices=["immediate", "accumulate"], default="accumulate")
     parser.add_argument("--qkv-weight-update", choices=["separate", "batched"], default="batched")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--progress-interval", type=int, default=200)
     parser.add_argument("--save-interval", type=int, default=0)
     parser.add_argument("--save-total-limit", type=int, default=3)
@@ -322,6 +343,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.save_interval > 0 and args.save_total_limit == 1:
+        print(
+            "[phase4] save_total_limit=1 would delete the previous checkpoint; "
+            "using save_total_limit=2 to keep current and previous checkpoints.",
+            flush=True,
+        )
+        args.save_total_limit = 2
     run_dir = resolve_path(args.run_dir)
     job_dir = run_dir / "jobs" / args.job_id
     artifacts_dir = job_dir / "artifacts"
@@ -380,7 +408,9 @@ def main():
             "train_sampler": args.train_sampler,
             "dataloader_seed": args.dataloader_seed,
             "weight_update_precision": args.weight_update_precision,
+            "direct_update_mode": args.direct_update_mode,
             "qkv_weight_update": args.qkv_weight_update,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
             "progress_interval": args.progress_interval,
             "save_interval": args.save_interval,
             "save_total_limit": args.save_total_limit,
@@ -418,7 +448,9 @@ def main():
         "train_sampler": args.train_sampler,
         "dataloader_seed": args.dataloader_seed,
         "weight_update_precision": args.weight_update_precision,
+        "direct_update_mode": args.direct_update_mode,
         "qkv_weight_update": args.qkv_weight_update,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "progress_interval": args.progress_interval,
         "gpu": args.gpu,
         "command": cmd,

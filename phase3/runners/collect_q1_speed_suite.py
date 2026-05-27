@@ -18,6 +18,9 @@ def load_result(path: Path) -> dict:
 
 def step_mean(data: dict) -> float:
     timing = data.get("timing", {})
+    tail_100 = timing.get("tail_100", {})
+    if isinstance(tail_100, dict) and isinstance(tail_100.get("step_s"), dict):
+        return float(tail_100["step_s"].get("mean", 0.0))
     if isinstance(timing.get("step_s"), dict):
         return float(timing["step_s"].get("mean", 0.0))
     return float(timing.get("step_s_mean", 0.0))
@@ -165,6 +168,7 @@ def build_summary(run_dirs: list[Path], json_paths: list[Path]) -> str:
             "score_postprocess_s",
             "lora_update_s",
             "weight_update_s",
+            "weight_fold_s",
             "build_lora_s",
             "direction_s",
         ]:

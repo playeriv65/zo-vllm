@@ -212,6 +212,57 @@ def _copy_direction_to_slot(
     return True
 
 
+def _copy_lora_b_to_slot(
+    module,
+    *,
+    index: int,
+    slice_idx: int,
+    B: torch.Tensor,
+    V: torch.Tensor,
+    V_T: torch.Tensor | None = None,
+    write_a: bool = True,
+) -> bool:
+    target_a = module.lora_a_stacked[slice_idx][index, 0]
+    target_b = module.lora_b_stacked[slice_idx][index, 0]
+    lora_a = V_T if V_T is not None else V.T
+    if tuple(lora_a.shape) != tuple(target_a.shape):
+        return False
+    if tuple(B.shape) != tuple(target_b.shape):
+        return False
+    if write_a:
+        target_a.copy_(lora_a, non_blocking=True)
+    target_b.copy_(B, non_blocking=True)
+    return True
+
+
+def _copy_accumulated_direction_to_slot(
+    module,
+    *,
+    index: int,
+    slice_idx: int,
+    U: torch.Tensor,
+    U_accum: torch.Tensor,
+    V: torch.Tensor,
+    scale: float,
+    V_T: torch.Tensor | None = None,
+    write_a: bool = True,
+) -> bool:
+    target_a = module.lora_a_stacked[slice_idx][index, 0]
+    target_b = module.lora_b_stacked[slice_idx][index, 0]
+    lora_a = V_T if V_T is not None else V.T
+    if tuple(lora_a.shape) != tuple(target_a.shape):
+        return False
+    if tuple(U.shape) != tuple(target_b.shape):
+        return False
+    if tuple(U_accum.shape) != tuple(target_b.shape):
+        return False
+    if write_a:
+        target_a.copy_(lora_a, non_blocking=True)
+    target_b.copy_(U_accum, non_blocking=True)
+    target_b.add_(U, alpha=scale)
+    return True
+
+
 def _write_direction_to_plus_minus(
     module,
     *,
@@ -225,6 +276,51 @@ def _write_direction_to_plus_minus(
     V = direction["V"]
     V_T = direction.get("V_T")
     write_a = bool(direction.get("v_refreshed", True))
+    U_accum = direction.get("U_accum")
+    if U_accum is not None:
+        return _copy_accumulated_direction_to_slot(
+            module,
+            index=plus_index,
+            slice_idx=slice_idx,
+            U=U,
+            U_accum=U_accum,
+            V=V,
+            scale=eps,
+            V_T=V_T,
+            write_a=write_a,
+        ) and _copy_accumulated_direction_to_slot(
+            module,
+            index=minus_index,
+            slice_idx=slice_idx,
+            U=U,
+            U_accum=U_accum,
+            V=V,
+            scale=-eps,
+            V_T=V_T,
+            write_a=write_a,
+        )
+    plus_b = direction.get("lora_B_plus")
+    minus_b = direction.get("lora_B_minus")
+    if plus_b is not None or minus_b is not None:
+        if plus_b is None or minus_b is None:
+            return False
+        return _copy_lora_b_to_slot(
+            module,
+            index=plus_index,
+            slice_idx=slice_idx,
+            B=plus_b,
+            V=V,
+            V_T=V_T,
+            write_a=write_a,
+        ) and _copy_lora_b_to_slot(
+            module,
+            index=minus_index,
+            slice_idx=slice_idx,
+            B=minus_b,
+            V=V,
+            V_T=V_T,
+            write_a=write_a,
+        )
     return _copy_direction_to_slot(
         module,
         index=plus_index,
@@ -259,6 +355,14 @@ def _queue_direction_to_plus_minus(
     plus_b_targets: list[torch.Tensor],
     minus_b_targets: list[torch.Tensor],
     u_sources: list[torch.Tensor],
+    custom_plus_b_targets: list[torch.Tensor],
+    custom_minus_b_targets: list[torch.Tensor],
+    plus_b_sources: list[torch.Tensor],
+    minus_b_sources: list[torch.Tensor],
+    accum_plus_b_targets: list[torch.Tensor],
+    accum_minus_b_targets: list[torch.Tensor],
+    accum_sources: list[torch.Tensor],
+    accum_u_sources: list[torch.Tensor],
 ) -> bool:
     U = direction["U"]
     V = direction["V"]
@@ -283,9 +387,25 @@ def _queue_direction_to_plus_minus(
         plus_a_targets.append(plus_a)
         minus_a_targets.append(minus_a)
         a_sources.append(lora_a)
-    plus_b_targets.append(plus_b)
-    minus_b_targets.append(minus_b)
-    u_sources.append(U)
+    custom_plus_b = direction.get("lora_B_plus")
+    custom_minus_b = direction.get("lora_B_minus")
+    U_accum = direction.get("U_accum")
+    if U_accum is not None:
+        accum_plus_b_targets.append(plus_b)
+        accum_minus_b_targets.append(minus_b)
+        accum_sources.append(U_accum)
+        accum_u_sources.append(U)
+    elif custom_plus_b is not None or custom_minus_b is not None:
+        if custom_plus_b is None or custom_minus_b is None:
+            return False
+        custom_plus_b_targets.append(plus_b)
+        custom_minus_b_targets.append(minus_b)
+        plus_b_sources.append(custom_plus_b)
+        minus_b_sources.append(custom_minus_b)
+    else:
+        plus_b_targets.append(plus_b)
+        minus_b_targets.append(minus_b)
+        u_sources.append(U)
     return True
 
 
@@ -421,6 +541,14 @@ def _flush_queued_direction_writes(
     plus_b_targets: list[torch.Tensor],
     minus_b_targets: list[torch.Tensor],
     u_sources: list[torch.Tensor],
+    custom_plus_b_targets: list[torch.Tensor],
+    custom_minus_b_targets: list[torch.Tensor],
+    plus_b_sources: list[torch.Tensor],
+    minus_b_sources: list[torch.Tensor],
+    accum_plus_b_targets: list[torch.Tensor],
+    accum_minus_b_targets: list[torch.Tensor],
+    accum_sources: list[torch.Tensor],
+    accum_u_sources: list[torch.Tensor],
 ) -> None:
     if a_sources:
         torch._foreach_copy_(plus_a_targets, a_sources)
@@ -430,6 +558,14 @@ def _flush_queued_direction_writes(
         torch._foreach_mul_(plus_b_targets, eps)
         torch._foreach_copy_(minus_b_targets, u_sources)
         torch._foreach_mul_(minus_b_targets, -eps)
+    if plus_b_sources:
+        torch._foreach_copy_(custom_plus_b_targets, plus_b_sources)
+        torch._foreach_copy_(custom_minus_b_targets, minus_b_sources)
+    if accum_sources:
+        torch._foreach_copy_(accum_plus_b_targets, accum_sources)
+        torch._foreach_add_(accum_plus_b_targets, accum_u_sources, alpha=eps)
+        torch._foreach_copy_(accum_minus_b_targets, accum_sources)
+        torch._foreach_add_(accum_minus_b_targets, accum_u_sources, alpha=-eps)
 
 
 def _write_plus_minus_slots_from_directions(
@@ -451,6 +587,14 @@ def _write_plus_minus_slots_from_directions(
     plus_b_targets: list[torch.Tensor] = []
     minus_b_targets: list[torch.Tensor] = []
     u_sources: list[torch.Tensor] = []
+    custom_plus_b_targets: list[torch.Tensor] = []
+    custom_minus_b_targets: list[torch.Tensor] = []
+    plus_b_sources: list[torch.Tensor] = []
+    minus_b_sources: list[torch.Tensor] = []
+    accum_plus_b_targets: list[torch.Tensor] = []
+    accum_minus_b_targets: list[torch.Tensor] = []
+    accum_sources: list[torch.Tensor] = []
+    accum_u_sources: list[torch.Tensor] = []
 
     cache_key = (int(plus_index), int(minus_index), int(len(directions_2d)))
     cache = getattr(manager, "_zo_direction_slot_plan_cache", None)
@@ -482,9 +626,26 @@ def _write_plus_minus_slots_from_directions(
             plus_a_targets.append(entry["plus_a"])
             minus_a_targets.append(entry["minus_a"])
             a_sources.append(lora_a)
-        plus_b_targets.append(entry["plus_b"])
-        minus_b_targets.append(entry["minus_b"])
-        u_sources.append(U)
+        custom_plus_b = direction.get("lora_B_plus")
+        custom_minus_b = direction.get("lora_B_minus")
+        U_accum = direction.get("U_accum")
+        if U_accum is not None:
+            accum_plus_b_targets.append(entry["plus_b"])
+            accum_minus_b_targets.append(entry["minus_b"])
+            accum_sources.append(U_accum)
+            accum_u_sources.append(U)
+        elif custom_plus_b is not None or custom_minus_b is not None:
+            if custom_plus_b is None or custom_minus_b is None:
+                cache.pop(cache_key, None)
+                raise RuntimeError("direction provides only one custom LoRA B tensor")
+            custom_plus_b_targets.append(entry["plus_b"])
+            custom_minus_b_targets.append(entry["minus_b"])
+            plus_b_sources.append(custom_plus_b)
+            minus_b_sources.append(custom_minus_b)
+        else:
+            plus_b_targets.append(entry["plus_b"])
+            minus_b_targets.append(entry["minus_b"])
+            u_sources.append(U)
 
     if missing_direction_keys:
         cache.pop(cache_key, None)
@@ -501,6 +662,14 @@ def _write_plus_minus_slots_from_directions(
         plus_b_targets=plus_b_targets,
         minus_b_targets=minus_b_targets,
         u_sources=u_sources,
+        custom_plus_b_targets=custom_plus_b_targets,
+        custom_minus_b_targets=custom_minus_b_targets,
+        plus_b_sources=plus_b_sources,
+        minus_b_sources=minus_b_sources,
+        accum_plus_b_targets=accum_plus_b_targets,
+        accum_minus_b_targets=accum_minus_b_targets,
+        accum_sources=accum_sources,
+        accum_u_sources=accum_u_sources,
     )
     profile_after_flush = time.perf_counter()
 

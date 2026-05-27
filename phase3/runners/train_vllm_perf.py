@@ -17,22 +17,28 @@ configure_vllm_training_env()
 
 import numpy as np
 import torch
+from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from zo_vllm.core.direction_digest import digest_named_uv
+from zo_vllm.core.direct_worker_scorer import (
+    eval_sst2_accuracy_direct_worker,
+    score_prompt_nll_plus_minus_direct_worker,
+    score_sst2_classification_direct_worker,
+    score_sst2_classification_plus_minus_direct_worker,
+)
 from zo_vllm.core.lozo_controller import LOZOConfig, LOZOController
 from zo_vllm.core.memory_lora_loader import install_mocks
 from zo_vllm.core.temp_lora_runtime import TempLoRARuntime
 from zo_vllm.core.weight_sync import WeightSync
+from zo_vllm.experiment.batching import make_batches
 from zo_vllm.experiment.sst2_official import (
-    accuracy_from_nll,
-    classification_loss_from_nll,
     configure_opt_tokenizer,
-    encode_sst2_vllm_prompts,
     sample_sst2_train_dev,
     sample_sst2_validation,
 )
+from zo_vllm.experiment.stats import summarize, summarize_tail
 
 
 class RowDataset(Dataset):
@@ -46,16 +52,28 @@ class RowDataset(Dataset):
         return self.rows[idx]
 
 
-def summarize(values):
-    if not values:
-        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-    arr = np.asarray(values, dtype=np.float64)
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std()),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
-    }
+class PromptDataset(Dataset):
+    def __init__(self, prompts):
+        self.prompts = prompts
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, idx):
+        return self.prompts[idx]
+
+
+def prepare_prompt_nll_sst2_data(seed, num_samples=1000):
+    np.random.seed(seed)
+    dataset = load_dataset("glue", "sst2", split="train")
+    if num_samples < len(dataset):
+        indices = np.random.choice(len(dataset), num_samples, replace=False)
+        dataset = dataset.select(indices)
+    return PromptDataset([f"{item['sentence']} It was" for item in dataset])
+
+
+def tokenize_prompts(tokenizer, prompts):
+    return [tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts]
 
 
 @contextmanager
@@ -70,181 +88,16 @@ def nvtx_range(name, enabled):
         yield
 
 
-def make_batches(items, batch_size, *, sampler="sequential", seed=None):
-    if sampler == "hf_random":
-        generator = torch.Generator()
-        generator.manual_seed(int(seed))
-        order = torch.randperm(len(items), generator=generator).tolist()
-        items = [items[idx] for idx in order]
-    elif sampler != "sequential":
-        raise ValueError(f"unknown train sampler: {sampler}")
-    num_batches = len(items) // batch_size
-    return [
-        items[idx * batch_size : (idx + 1) * batch_size]
-        for idx in range(num_batches)
-    ]
-
-
-def _score_token_id_groups(
-    llm,
-    token_id_groups,
-    *,
-    lora_ids,
-    max_logits_tokens,
-    loss_impl,
-):
-    result = llm.llm_engine.model_executor.collective_rpc(
-        "zo_score_prompt_token_ids",
-        kwargs={
-            "prompt_token_ids": token_id_groups,
-            "lora_ids": lora_ids,
-            "max_logits_tokens": max_logits_tokens,
-            "loss_impl": loss_impl,
-        },
-        single_value=True,
-    )
-    return result
-
-
-def _single_token_id(tokenizer, text):
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    if len(token_ids) != 1:
-        raise ValueError(f"verbalizer must be single token, got {text!r} -> {token_ids}")
-    return int(token_ids[0])
-
-
-def eval_sst2_accuracy_direct_worker(
-    llm,
-    tokenizer,
-    rows,
-    *,
-    max_logits_tokens,
-    loss_impl,
-    max_prompts_per_call=32,
-):
-    if not rows:
-        return None
-    _single_token_id(tokenizer, " terrible")
-    _single_token_id(tokenizer, " great")
-    correct = 0
-    total = len(rows)
-    for start in range(0, total, max_prompts_per_call):
-        sub_rows = rows[start : start + max_prompts_per_call]
-        stem_ids, neg_ids, pos_ids, labels = encode_sst2_vllm_prompts(
-            sub_rows,
-            tokenizer,
-        )
-        result = _score_token_id_groups(
-            llm,
-            stem_ids + neg_ids + pos_ids,
-            lora_ids=None,
-            max_logits_tokens=max_logits_tokens,
-            loss_impl=loss_impl,
-        )
-        n = len(sub_rows)
-        nll = result["request_nll_sums"]
-        correct += int(
-            accuracy_from_nll(nll[:n], nll[n : 2 * n], nll[2 * n : 3 * n], labels)
-            * n
-        )
-    return float(correct / total)
-
-
-def score_sst2_classification_direct_worker(
-    llm,
-    rows,
-    tokenizer,
-    *,
-    max_logits_tokens,
-    loss_impl,
-    lora_id=None,
-    max_rows_per_call=32,
-):
-    if not rows:
-        return None
-    total_loss = 0.0
-    total_count = 0
-    for start in range(0, len(rows), max_rows_per_call):
-        sub_rows = rows[start : start + max_rows_per_call]
-        stem_ids, neg_ids, pos_ids, labels = encode_sst2_vllm_prompts(
-            sub_rows,
-            tokenizer,
-        )
-        token_groups = stem_ids + neg_ids + pos_ids
-        lora_ids = None if lora_id is None else [int(lora_id)] * len(token_groups)
-        result = _score_token_id_groups(
-            llm,
-            token_groups,
-            lora_ids=lora_ids,
-            max_logits_tokens=max_logits_tokens,
-            loss_impl=loss_impl,
-        )
-        n = len(sub_rows)
-        loss = classification_loss_from_nll(
-            result["request_nll_sums"][:n],
-            result["request_nll_sums"][n : 2 * n],
-            result["request_nll_sums"][2 * n : 3 * n],
-            labels,
-        )
-        total_loss += loss * n
-        total_count += n
-    return total_loss / max(total_count, 1)
-
-
-def score_sst2_classification_plus_minus_direct_worker(
-    llm,
-    rows,
-    tokenizer,
-    *,
-    plus_id,
-    minus_id,
-    max_logits_tokens,
-    loss_impl,
-):
-    stem_ids, neg_ids, pos_ids, labels = encode_sst2_vllm_prompts(rows, tokenizer)
-    one_side = stem_ids + neg_ids + pos_ids
-    n = len(rows)
-    score_t0 = time.perf_counter()
-    result = _score_token_id_groups(
-        llm,
-        one_side + one_side,
-        lora_ids=[plus_id] * len(one_side) + [minus_id] * len(one_side),
-        max_logits_tokens=max_logits_tokens,
-        loss_impl=loss_impl,
-    )
-    score_s = time.perf_counter() - score_t0
-    nll = result["request_nll_sums"]
-    plus_loss = classification_loss_from_nll(
-        nll[:n],
-        nll[n : 2 * n],
-        nll[2 * n : 3 * n],
-        labels,
-    )
-    offset = len(one_side)
-    minus_loss = classification_loss_from_nll(
-        nll[offset : offset + n],
-        nll[offset + n : offset + 2 * n],
-        nll[offset + 2 * n : offset + 3 * n],
-        labels,
-    )
-    detail = {
-        "score_direct_worker_s": score_s,
-        "score_num_outputs": int(result["num_reqs"]),
-        "score_num_prompt_positions": int(result["num_prompt_tokens"]),
-        "score_num_loss_tokens": int(result["num_tokens"]),
-        "score_num_tokens_padded": int(result["num_tokens_padded"]),
-        "score_num_active_loras": int(result["num_active_loras"]),
-        "score_cudagraph_mode": str(result["cudagraph_mode"]),
-        "score_loss_impl": str(result.get("loss_impl", loss_impl)),
-        "score_cache_hit": bool(result.get("cache_hit", False)),
-    }
-    return plus_loss, minus_loss, detail
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=3e-7)
     parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument(
+        "--direction-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to U @ V.T directions; Phase 6 uses 1/sqrt(rank).",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--eps", type=float, default=1e-3)
@@ -257,6 +110,11 @@ def main():
     parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--train-sampler", choices=["sequential", "hf_random"], default="sequential")
     parser.add_argument("--dataloader-seed", type=int, default=None)
+    parser.add_argument(
+        "--train-objective",
+        choices=["sst2_classification", "prompt_nll"],
+        default="sst2_classification",
+    )
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--direction-sampling", choices=["exact", "flat"], default="exact")
     parser.add_argument("--train-scope", choices=["lora_only"], default="lora_only")
@@ -266,6 +124,7 @@ def main():
     parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
     parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
+    parser.add_argument("--direct-update-mode", choices=["immediate", "accumulate"], default="immediate")
     parser.add_argument("--qkv-weight-update", choices=["separate", "batched"], default="separate")
     parser.add_argument("--sync-weight-update", choices=["0", "1"], default="1")
     parser.add_argument("--scoring-backend", choices=["generate", "direct_worker"], default="generate")
@@ -295,9 +154,13 @@ def main():
     parser.add_argument("--save-interval", type=int, default=0)
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--eval-accuracy-samples", type=int, default=512)
+    parser.add_argument("--accuracy-eval-mode", choices=["auto", "full", "skip"], default="auto")
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
     data_seed = args.seed if args.data_seed is None else args.data_seed
+    accuracy_eval_mode = args.accuracy_eval_mode
+    if accuracy_eval_mode == "auto":
+        accuracy_eval_mode = "skip" if args.base_eval_mode == "skip" else "full"
 
     os.environ["VLLM_BATCH_INVARIANT"] = args.batch_invariant
     if args.lora_residency == "gpu" and not torch.cuda.is_available():
@@ -339,6 +202,16 @@ def main():
         raise SystemExit(
             "--fuse-lora-score is not supported for SST-2 classification loss alignment"
         )
+    use_accumulated_update = args.direct_update_mode == "accumulate"
+    if use_accumulated_update:
+        if args.weight_update != "direct":
+            raise SystemExit("--direct-update-mode accumulate requires --weight-update direct")
+        if args.weight_update_precision != "param":
+            raise SystemExit("--direct-update-mode accumulate requires --weight-update-precision param")
+        if not direct_lora_from_directions:
+            raise SystemExit("--direct-update-mode accumulate requires --direct-lora-from-directions 1")
+        if slot_pipeline:
+            raise SystemExit("--direct-update-mode accumulate does not support --slot-pipeline 1")
     step_nvtx_enabled = os.environ.get("VLLM_ZO_STEP_NVTX", "0") == "1"
     step_nvtx_skip = int(os.environ.get("VLLM_ZO_STEP_NVTX_SKIP", "0"))
     step_nvtx_limit = int(os.environ.get("VLLM_ZO_STEP_NVTX_LIMIT", "0"))
@@ -364,14 +237,17 @@ def main():
     print(
         f"[vLLM] steps={args.steps} warmup_steps={args.warmup_steps} "
         f"batch_size={args.batch_size} rank={args.rank} "
-        f"lr={args.lr} eps={args.eps} profile_mode={args.profile_mode} "
+        f"lr={args.lr} eps={args.eps} direction_scale={args.direction_scale} "
+        f"profile_mode={args.profile_mode} "
         f"enforce_eager={args.enforce_eager} scoring_backend={args.scoring_backend} "
         f"sync_weight_update={args.sync_weight_update} slot_pipeline={args.slot_pipeline} "
         f"qkv_weight_update={args.qkv_weight_update} "
+        f"direct_update_mode={args.direct_update_mode} "
         f"fuse_lora_score={args.fuse_lora_score} "
         f"direct_worker_loss_impl={args.direct_worker_loss_impl} "
         f"direct_lora_from_directions={args.direct_lora_from_directions} "
         f"direction_sampling={args.direction_sampling} "
+        f"train_objective={args.train_objective} "
         f"step_nvtx={int(step_nvtx_enabled)} "
         f"model_name={model_name} seed={args.seed} data_seed={data_seed}",
         flush=True,
@@ -417,6 +293,7 @@ def main():
         random_device=args.zo_random_device,
         train_scope=args.train_scope,
         direction_sampling=args.direction_sampling,
+        direction_scale=args.direction_scale,
     )
     param_metadata = None
     if args.weight_update == "direct" and args.direct_controller_source == "vllm_metadata":
@@ -458,19 +335,26 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    train_rows, dev_rows = sample_sst2_train_dev(
-        seed=data_seed,
-        num_train=args.num_samples,
-        num_dev=args.num_dev,
-    )
-    valid_rows_cls = sample_sst2_validation(
-        seed=data_seed,
-        num_eval=args.eval_accuracy_samples,
-    )
-    dataset = RowDataset(train_rows)
+    if args.train_objective == "prompt_nll":
+        dataset = prepare_prompt_nll_sst2_data(data_seed, num_samples=args.num_samples)
+        dev_rows = []
+        valid_rows_cls = []
+        train_items = tokenize_prompts(tokenizer, list(dataset.prompts))
+    else:
+        train_rows, dev_rows = sample_sst2_train_dev(
+            seed=data_seed,
+            num_train=args.num_samples,
+            num_dev=args.num_dev,
+        )
+        valid_rows_cls = sample_sst2_validation(
+            seed=data_seed,
+            num_eval=args.eval_accuracy_samples,
+        )
+        dataset = RowDataset(train_rows)
+        train_items = list(dataset.rows)
     dataloader_seed = args.seed if args.dataloader_seed is None else args.dataloader_seed
     row_batches = make_batches(
-        list(dataset.rows),
+        train_items,
         args.batch_size,
         sampler=args.train_sampler,
         seed=dataloader_seed,
@@ -480,7 +364,7 @@ def main():
     if args.base_eval_mode == "skip":
         initial_loss = None
         print("[vLLM] initial_loss=skipped", flush=True)
-    else:
+    elif args.train_objective == "sst2_classification":
         initial_loss = score_sst2_classification_direct_worker(
             llm,
             dev_rows,
@@ -489,27 +373,39 @@ def main():
             loss_impl=args.direct_worker_loss_impl,
         )
         print(f"[vLLM] initial_loss={initial_loss:.6f}", flush=True)
+    else:
+        initial_loss = None
+        print("[vLLM] initial_loss=skipped", flush=True)
 
     np.random.seed(args.seed)
     eval_losses = [] if initial_loss is None else [{"step": 0, "loss": float(initial_loss)}]
-    initial_dev_acc = eval_sst2_accuracy_direct_worker(
-        llm,
-        tokenizer,
-        dev_rows,
-        max_logits_tokens=args.direct_worker_max_logits_tokens,
-        loss_impl=args.direct_worker_loss_impl,
-    )
-    initial_valid_acc = eval_sst2_accuracy_direct_worker(
-        llm,
-        tokenizer,
-        valid_rows_cls,
-        max_logits_tokens=args.direct_worker_max_logits_tokens,
-        loss_impl=args.direct_worker_loss_impl,
-    )
-    if initial_dev_acc is not None:
-        print(f"[vLLM] initial_acc={initial_dev_acc:.6f}", flush=True)
-    if initial_valid_acc is not None:
-        print(f"[vLLM] initial_valid_acc={initial_valid_acc:.6f}", flush=True)
+    if accuracy_eval_mode == "skip":
+        initial_dev_acc = None
+        initial_valid_acc = None
+        print("[vLLM] initial_acc=skipped", flush=True)
+    elif args.train_objective == "sst2_classification":
+        initial_dev_acc = eval_sst2_accuracy_direct_worker(
+            llm,
+            tokenizer,
+            dev_rows,
+            max_logits_tokens=args.direct_worker_max_logits_tokens,
+            loss_impl=args.direct_worker_loss_impl,
+        )
+        initial_valid_acc = eval_sst2_accuracy_direct_worker(
+            llm,
+            tokenizer,
+            valid_rows_cls,
+            max_logits_tokens=args.direct_worker_max_logits_tokens,
+            loss_impl=args.direct_worker_loss_impl,
+        )
+        if initial_dev_acc is not None:
+            print(f"[vLLM] initial_acc={initial_dev_acc:.6f}", flush=True)
+        if initial_valid_acc is not None:
+            print(f"[vLLM] initial_valid_acc={initial_valid_acc:.6f}", flush=True)
+    else:
+        initial_dev_acc = None
+        initial_valid_acc = None
+        print("[vLLM] initial_acc=skipped", flush=True)
     eval_metrics = [] if initial_loss is None else [{
         "step": 0,
         "loss": float(initial_loss),
@@ -529,6 +425,7 @@ def main():
         "score_direct_worker_s": [],
         "prep_launch_s": [],
         "prep_wait_s": [],
+        "weight_fold_s": [],
     }
 
     prep_stream = torch.cuda.Stream() if slot_pipeline and torch.cuda.is_available() else None
@@ -536,6 +433,62 @@ def main():
     if args.save_interval > 0:
         os.makedirs(ckpt_root, exist_ok=True)
     ckpt_paths = []
+    accumulated_u: dict[str, torch.Tensor] = {}
+
+    def attach_accumulated_lora(directions_2d):
+        if not use_accumulated_update:
+            return
+        for name, direction in directions_2d.items():
+            U = direction["U"]
+            acc = accumulated_u.get(name)
+            if acc is None:
+                acc = torch.zeros_like(U)
+                accumulated_u[name] = acc
+            direction["U_accum"] = acc
+
+    def accumulate_step_update(directions_2d, c: float) -> None:
+        if not use_accumulated_update:
+            return
+        for name, direction in directions_2d.items():
+            acc = accumulated_u.get(name)
+            if acc is None:
+                acc = torch.zeros_like(direction["U"])
+                accumulated_u[name] = acc
+            scale = float(direction.get("scale", config.direction_scale))
+            acc.add_(direction["U"], alpha=-config.lr * c * scale)
+
+    def fold_accumulated_update_if_needed(force: bool = False) -> float:
+        if not use_accumulated_update or not accumulated_u:
+            return 0.0
+        if not force and (controller.step <= 0 or controller.step % config.step_interval != 0):
+            return 0.0
+        fold_directions = {}
+        for name, acc in accumulated_u.items():
+            V = controller.v_cache.get(name)
+            if V is None:
+                continue
+            fold_directions[name] = {
+                "U": acc,
+                "V": V,
+                "V_T": controller.vt_cache.get(name),
+            }
+        if not fold_directions:
+            accumulated_u.clear()
+            return 0.0
+        t0 = time.perf_counter()
+        weight_sync.apply_lozo_update(
+            fold_directions,
+            {},
+            c=-1.0,
+            lr=1.0,
+            weight_decay=0.0,
+            precision=args.weight_update_precision,
+            sync_device=bool(int(args.sync_weight_update)),
+            qkv_update_mode=args.qkv_weight_update,
+        )
+        for acc in accumulated_u.values():
+            acc.zero_()
+        return time.perf_counter() - t0
 
     def save_runtime_checkpoint(measured_index, latest_eval_loss):
         if args.save_interval <= 0:
@@ -582,7 +535,7 @@ def main():
                         direction["v_refreshed"] = True
                 runtime.update_plus_minus_from_directions(
                     directions_2d,
-                    eps=config.eps,
+                    eps=config.eps * config.direction_scale,
                     step=step_value,
                 )
             else:
@@ -693,13 +646,15 @@ def main():
                         print(f"[trace] step={step} direction_start", flush=True)
                     t0 = time.perf_counter()
                     with nvtx_range("zo_step.direction", emit_step_nvtx):
+                        fold_s = fold_accumulated_update_if_needed()
                         directions_2d, directions_1d = controller.sample_direction(random_seed)
                         direction_digest = None
                         if args.direction_digest:
                             direction_digest = digest_named_uv(
                                 (name, item["U"], item["V"]) for name, item in directions_2d.items()
                             )
-                    record_timing("direction_s", time.perf_counter() - t0)
+                    record_timing("weight_fold_s", fold_s)
+                    record_timing("direction_s", time.perf_counter() - t0 - fold_s)
                     if args.trace_step_events:
                         print(f"[trace] step={step} direction_done", flush=True)
 
@@ -709,9 +664,10 @@ def main():
                         if args.trace_step_events:
                             print(f"[trace] step={step} lora_update_from_directions_start", flush=True)
                         with nvtx_range("zo_step.lora_update", emit_step_nvtx):
+                            attach_accumulated_lora(directions_2d)
                             temp_lora.update_plus_minus_from_directions(
                                 directions_2d,
-                                eps=config.eps,
+                                eps=config.eps * config.direction_scale,
                                 step=step,
                             )
                     else:
@@ -745,17 +701,29 @@ def main():
                 if emit_step_nvtx and torch.cuda.is_available():
                     torch.cuda.nvtx.range_push("zo_step.score")
                 if args.scoring_backend == "direct_worker":
-                    loss_plus, loss_minus, score_detail = (
-                        score_sst2_classification_plus_minus_direct_worker(
-                            llm,
-                            batch_rows,
-                            tokenizer,
-                            plus_id=temp_lora.plus_id,
-                            minus_id=temp_lora.minus_id,
-                            max_logits_tokens=args.direct_worker_max_logits_tokens,
-                            loss_impl=args.direct_worker_loss_impl,
+                    if args.train_objective == "prompt_nll":
+                        loss_plus, loss_minus, score_detail = (
+                            score_prompt_nll_plus_minus_direct_worker(
+                                llm,
+                                batch_rows,
+                                plus_id=temp_lora.plus_id,
+                                minus_id=temp_lora.minus_id,
+                                max_logits_tokens=args.direct_worker_max_logits_tokens,
+                                loss_impl=args.direct_worker_loss_impl,
+                            )
                         )
-                    )
+                    else:
+                        loss_plus, loss_minus, score_detail = (
+                            score_sst2_classification_plus_minus_direct_worker(
+                                llm,
+                                batch_rows,
+                                tokenizer,
+                                plus_id=temp_lora.plus_id,
+                                minus_id=temp_lora.minus_id,
+                                max_logits_tokens=args.direct_worker_max_logits_tokens,
+                                loss_impl=args.direct_worker_loss_impl,
+                            )
+                        )
                     if args.profile_mode == "detailed" and measured_step:
                         timing["score_direct_worker_s"].append(
                             score_detail["score_direct_worker_s"]
@@ -784,6 +752,8 @@ def main():
                             directions_2d, directions_1d, c
                         )
                         weight_sync.sync(updated_weights)
+                    elif use_accumulated_update:
+                        accumulate_step_update(directions_2d, c)
                     else:
                         weight_sync.apply_lozo_update(
                             directions_2d,
@@ -868,7 +838,14 @@ def main():
                         if args.base_eval_mode == "skip":
                             print(f"[vLLM] step={measured_index} eval_loss=skipped", flush=True)
                             save_runtime_checkpoint(measured_index, None)
-                        else:
+                        elif args.train_objective == "sst2_classification":
+                            eval_fold_s = fold_accumulated_update_if_needed(force=True)
+                            if eval_fold_s:
+                                print(
+                                    f"[vLLM] step={measured_index} "
+                                    f"eval_weight_fold_s={eval_fold_s:.6f}",
+                                    flush=True,
+                                )
                             val_loss = score_sst2_classification_direct_worker(
                                 llm,
                                 dev_rows,
@@ -891,6 +868,9 @@ def main():
                             if val_acc is not None:
                                 print(f"[vLLM] step={measured_index} eval_acc={val_acc:.6f}", flush=True)
                             save_runtime_checkpoint(measured_index, val_loss)
+                        else:
+                            print(f"[vLLM] step={measured_index} eval_loss=skipped", flush=True)
+                            save_runtime_checkpoint(measured_index, None)
             if step >= total_target_steps:
                 break
     finally:
@@ -898,10 +878,13 @@ def main():
             prep_executor.shutdown(wait=True)
 
     total_s = 0.0 if measured_train_t0 is None else measured_train_t1 - measured_train_t0
+    final_fold_s = fold_accumulated_update_if_needed(force=True)
+    if final_fold_s:
+        print(f"[vLLM] final_weight_fold_s={final_fold_s:.6f}", flush=True)
     if args.base_eval_mode == "skip":
         final_loss = None
         print("[vLLM] final_loss=skipped", flush=True)
-    else:
+    elif args.train_objective == "sst2_classification":
         final_loss = score_sst2_classification_direct_worker(
             llm,
             dev_rows,
@@ -912,20 +895,30 @@ def main():
         if not eval_losses or eval_losses[-1]["step"] != args.steps:
             eval_losses.append({"step": args.steps, "loss": float(final_loss)})
         print(f"[vLLM] final_loss={final_loss:.6f}", flush=True)
-    final_dev_acc = eval_sst2_accuracy_direct_worker(
-        llm,
-        tokenizer,
-        dev_rows,
-        max_logits_tokens=args.direct_worker_max_logits_tokens,
-        loss_impl=args.direct_worker_loss_impl,
-    )
-    final_valid_acc = eval_sst2_accuracy_direct_worker(
-        llm,
-        tokenizer,
-        valid_rows_cls,
-        max_logits_tokens=args.direct_worker_max_logits_tokens,
-        loss_impl=args.direct_worker_loss_impl,
-    )
+    else:
+        final_loss = None
+        print("[vLLM] final_loss=skipped", flush=True)
+    final_dev_acc = None
+    final_valid_acc = None
+    if accuracy_eval_mode == "skip":
+        print("[vLLM] final_acc=skipped", flush=True)
+    elif args.train_objective == "sst2_classification":
+        final_dev_acc = eval_sst2_accuracy_direct_worker(
+            llm,
+            tokenizer,
+            dev_rows,
+            max_logits_tokens=args.direct_worker_max_logits_tokens,
+            loss_impl=args.direct_worker_loss_impl,
+        )
+        final_valid_acc = eval_sst2_accuracy_direct_worker(
+            llm,
+            tokenizer,
+            valid_rows_cls,
+            max_logits_tokens=args.direct_worker_max_logits_tokens,
+            loss_impl=args.direct_worker_loss_impl,
+        )
+    else:
+        print("[vLLM] final_acc=skipped", flush=True)
     if not eval_metrics or eval_metrics[-1]["step"] != args.steps:
         eval_metrics.append(
             {
@@ -946,6 +939,8 @@ def main():
                 "model": model_name,
                 "backend": "vllm",
                 "lora_injection_resolved": lora_injection,
+                "accuracy_eval_mode_resolved": accuracy_eval_mode,
+                "train_objective_resolved": args.train_objective,
             },
             "initial_loss": None if initial_loss is None else float(initial_loss),
             "final_loss": None if final_loss is None else float(final_loss),
@@ -968,6 +963,9 @@ def main():
             "timing": {
                 "total_s": float(total_s),
                 **{key: summarize(value) for key, value in timing.items()},
+                "tail_100": {
+                    key: summarize_tail(value, 100) for key, value in timing.items()
+                },
             },
             "checkpoints": ckpt_paths,
         }, f, indent=2)

@@ -43,6 +43,7 @@ def apply_lowrank_update_to_weight_(
     lr: float,
     weight_decay: float,
     precision: str,
+    direction_scale: float = 1.0,
 ) -> None:
     """Apply W <- W * (1 - lr * wd) - lr * c * U @ V.T in place."""
     if precision == "float32":
@@ -54,7 +55,7 @@ def apply_lowrank_update_to_weight_(
             U_gpu,
             V_gpu.T,
             beta=beta,
-            alpha=-lr * c,
+            alpha=-lr * c * direction_scale,
         )
         target.copy_(updated.to(dtype=target.dtype))
         return
@@ -64,7 +65,7 @@ def apply_lowrank_update_to_weight_(
             target.mul_(1.0 - lr * weight_decay)
         U_gpu = U.to(device=target.device, dtype=target.dtype, non_blocking=True)
         V_gpu = V.to(device=target.device, dtype=target.dtype, non_blocking=True)
-        target.addmm_(U_gpu, V_gpu.T, alpha=-lr * c)
+        target.addmm_(U_gpu, V_gpu.T, alpha=-lr * c * direction_scale)
         return
 
     raise ValueError(f"unknown update precision: {precision}")
@@ -93,6 +94,7 @@ def apply_qkv_lowrank_update_to_weight_(
     directions = [q_direction, k_direction, v_direction]
     u_tensors = [item["U"] for item in directions]
     vt_tensors = [item.get("V_T") for item in directions]
+    scales = [float(item.get("scale", 1.0)) for item in directions]
     if any(v_t is None for v_t in vt_tensors):
         vt_tensors = [item["V"].T for item in directions]
     if any(tuple(u.shape) != (hidden_size, u_tensors[0].shape[1]) for u in u_tensors):
@@ -104,7 +106,8 @@ def apply_qkv_lowrank_update_to_weight_(
     u_batch = torch.stack(
         [
             u.to(device=target.device, dtype=target.dtype, non_blocking=True)
-            for u in u_tensors
+            * scale
+            for u, scale in zip(u_tensors, scales)
         ],
         dim=0,
     )
@@ -411,6 +414,7 @@ class WeightSync:
                             weight_decay if should_apply_weight_decay(hf_name) else 0.0
                         ),
                         precision=precision,
+                        direction_scale=float(direction.get("scale", 1.0)),
                     )
 
             profile_after_qkv = time.perf_counter()
@@ -430,6 +434,7 @@ class WeightSync:
                         weight_decay if should_apply_weight_decay(hf_name) else 0.0
                     ),
                     precision=precision,
+                    direction_scale=float(direction.get("scale", 1.0)),
                 )
 
             profile_after_other = time.perf_counter()

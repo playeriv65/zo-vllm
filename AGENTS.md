@@ -33,6 +33,8 @@ lora_residency=gpu               # 默认GPU-resident；cpu仅用于旧mock路�
 lora_injection=direct            # 训练默认固定slot原位写LoRA；manager仅作回退/对比
 weight_update=direct             # 可选：vLLM worker内原位更新base weights
 weight_update_precision=param    # 最快；float32用于对齐旧controller数学
+direct_update_mode=accumulate    # Phase 3 launcher默认；V固定区间内累积低秩U更新并延迟折回base weight
+direction_scale=1.0              # 默认不缩放；Phase 6高rank factorized ZO使用1/sqrt(rank)
 ```
 
 ## 构建命令
@@ -53,6 +55,9 @@ MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vl
 只保存可复现实验输出并保持 git-ignore；提交代码时只提交 runner、collector 和状态文档。
 当 vLLM scoring 进入热路径时，优先使用 direct worker scoring 和固定 GPU LoRA slot，
 避免把完整 `generate(prompt_logprobs=1)` serving 包装当作最终训练路径。
+direct worker scoring、plus/minus loss 拆分和 SST-2 option loss 计算属于
+`zo_vllm/core/direct_worker_scorer.py` 的通用 ZO-vLLM 组件；Phase runner 只负责
+参数、日志和实验编排，避免在 runner 里复制 scoring 语义。
 Phase 3 速度统计用外层 wall-clock step 作为主指标，不能用子步骤相加替代总步时；
 OPT-1.3B/2.7B 的运行目录 slug 使用 `opt1p3b`/`opt2p7b`，避免省略小数点造成歧义。
 vLLM direct-score cache 只能缓存已验证不会跨 batch 失效的输入派生张量；不要跨不相邻
@@ -101,6 +106,7 @@ zo_vllm/
 └── core/                    # 跨Phase共享的LOZO/vLLM runtime核心模块
     ├── lozo_controller.py
     ├── temp_lora_runtime.py
+    ├── direct_worker_scorer.py
     ├── vllm_scorer.py
     ├── weight_sync.py
     ├── memory_lora_loader.py
@@ -276,6 +282,13 @@ Full scope 更快下降，但不是数量级差异；vLLM真实注入路径仍�
 ```text
 W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
 ```
+
+当同一个 V 在 `step_interval` 内复用时，训练默认使用
+`--direct-update-mode accumulate`：先在低秩 U/B 槽上累积
+`U_accum += -lr * c * U`，plus/minus scoring 使用
+`(U_accum ± eps * U) @ V.T`，只在 V 刷新、eval 或 final 时把
+`U_accum @ V.T` 折回 base weight。这样保持同一数学更新，同时避免每步对
+完整权重显存做低秩写回。
 
 短验证结果：
 - fake packed-qkv 单测：`float32`模式与旧controller公式逐元素一致

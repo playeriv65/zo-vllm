@@ -100,11 +100,12 @@ def gpu_util_stats(log_dir: Path, pattern: str) -> dict | None:
 
 def row_for(model_dir: Path, batch_dir: Path) -> dict:
     lozo_path, lozo = load_optional(batch_dir / "lozo_baseline", "lozo_perf_minimal_*.json")
-    vllm_path, vllm = load_optional(batch_dir / "vllm_optimized", "vllm_perf_detailed_*.json")
-    lozo_step = total_per_step(lozo) if lozo else None
-    vllm_step = total_per_step(vllm) if vllm else None
+    vllm_path, vllm = load_optional(batch_dir / "vllm_optimized", "vllm_perf_*.json")
+    lozo_step = step_mean(lozo) if lozo else None
+    vllm_step = step_mean(vllm) if vllm else None
     speedup = lozo_step / vllm_step if lozo_step and vllm_step else None
     vllm_timing = vllm.get("timing", {}) if vllm else {}
+    vllm_tail = vllm_timing.get("tail_100", {}) if vllm else {}
     return {
         "model": model_dir.name.removeprefix("model_").replace("__", "/"),
         "batch": batch_sort_key(batch_dir),
@@ -117,11 +118,12 @@ def row_for(model_dir: Path, batch_dir: Path) -> dict:
         "speedup": speedup,
         "lozo_loss_drop": loss_drop(lozo),
         "vllm_loss_drop": loss_drop(vllm),
-        "vllm_score_s": vllm_timing.get("score_s", {}).get("mean"),
-        "vllm_direction_s": vllm_timing.get("direction_s", {}).get("mean"),
-        "vllm_build_lora_s": vllm_timing.get("build_lora_s", {}).get("mean"),
-        "vllm_lora_update_s": vllm_timing.get("lora_update_s", {}).get("mean"),
-        "vllm_weight_update_s": vllm_timing.get("weight_update_s", {}).get("mean"),
+        "vllm_score_s": vllm_tail.get("score_s", vllm_timing.get("score_s", {})).get("mean"),
+        "vllm_direction_s": vllm_tail.get("direction_s", vllm_timing.get("direction_s", {})).get("mean"),
+        "vllm_build_lora_s": vllm_tail.get("build_lora_s", vllm_timing.get("build_lora_s", {})).get("mean"),
+        "vllm_lora_update_s": vllm_tail.get("lora_update_s", vllm_timing.get("lora_update_s", {})).get("mean"),
+        "vllm_weight_update_s": vllm_tail.get("weight_update_s", vllm_timing.get("weight_update_s", {})).get("mean"),
+        "vllm_weight_fold_s": vllm_tail.get("weight_fold_s", vllm_timing.get("weight_fold_s", {})).get("mean"),
         "lozo_gpu": gpu_util_stats(batch_dir / "logs", "gpu_util_lozo_*.csv"),
         "vllm_gpu": gpu_util_stats(batch_dir / "logs", "gpu_util_vllm_*.csv"),
     }
@@ -170,13 +172,13 @@ def build_summary(run_dir: Path, rows: list[dict]) -> str:
         "",
         "## vLLM Timing",
         "",
-        "| model | batch | score_s | direction_s | build_lora_s | lora_update_s | weight_update_s |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| model | batch | score_s | direction_s | build_lora_s | lora_update_s | weight_update_s | weight_fold_s |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in rows:
         lines.append(
             "| {model} | {batch} | {score} | {direction} | {build_lora} | "
-            "{lora_update} | {weight_update} |".format(
+            "{lora_update} | {weight_update} | {weight_fold} |".format(
                 model=row["model"],
                 batch=row["batch"],
                 score=fmt(row["vllm_score_s"]),
@@ -184,6 +186,7 @@ def build_summary(run_dir: Path, rows: list[dict]) -> str:
                 build_lora=fmt(row["vllm_build_lora_s"]),
                 lora_update=fmt(row["vllm_lora_update_s"]),
                 weight_update=fmt(row["vllm_weight_update_s"]),
+                weight_fold=fmt(row["vllm_weight_fold_s"]),
             )
         )
 
