@@ -3,8 +3,12 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from zo_vllm.experiment.launch import (
     ensure_run_dir_available,
@@ -13,9 +17,6 @@ from zo_vllm.experiment.launch import (
     shell_join,
     tmux_new_window_command,
 )
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TMUX_SESSION = "zo-vllm"
 
 

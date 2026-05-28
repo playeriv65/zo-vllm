@@ -3,7 +3,11 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from zo_vllm.experiment.launch import (
     DEFAULT_TMUX_SESSION,
@@ -21,7 +25,6 @@ from zo_vllm.experiment.launch import (
 from zo_vllm.experiment.manifest import append_launch_record, load_manifest, write_manifest
 from zo_vllm.experiment.naming import safe_model_name, timestamp_now
 from zo_vllm.experiment.paths import project_root
-
 
 PROJECT_ROOT = project_root()
 
