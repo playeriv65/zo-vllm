@@ -1,8 +1,9 @@
 from types import SimpleNamespace
+import threading
 
 import torch
 
-from zo_trainer import ZOUSnapshotCallback
+from zo_trainer import StopOnSignalCallback, ZOUSnapshotCallback
 from zo_vllm.experiment.runners.u_snapshot import USnapshotRecorder
 from zo_vllm.training import inspect_training_artifact
 
@@ -27,6 +28,19 @@ class SnapshotState:
 
     def snapshot_tensors(self, *, dtype):
         return {"layer": torch.tensor([1.0], dtype=dtype)}
+
+
+def test_stop_on_signal_callback_stops_at_hf_step_boundaries() -> None:
+    stop_event = threading.Event()
+    callback = StopOnSignalCallback(stop_requested=stop_event.is_set)
+    control = SimpleNamespace(should_training_stop=False)
+
+    callback.on_step_begin(None, None, control)
+    assert control.should_training_stop is False
+
+    stop_event.set()
+    callback.on_step_end(None, None, control)
+    assert control.should_training_stop is True
 
 
 def test_hf_snapshot_callback_preserves_study_artifact_schema(tmp_path) -> None:
