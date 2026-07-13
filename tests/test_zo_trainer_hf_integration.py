@@ -18,6 +18,7 @@ from zo_trainer import (
     ZOTrainer,
     ZOTrainerArguments,
     ZOTrainerModel,
+    ZORolloutTrainerModel,
     ZOVLLMCheckpointHandler,
     build_causal_lm_preprocess,
     build_target_lm_preprocess,
@@ -27,7 +28,7 @@ from zo_trainer.modeling import hf_batch_to_token_groups
 from zo_vllm.core.probe_results import ProbeTiming
 from zo_vllm.core.token_scores import slice_score_result
 from zo_vllm.engine import TokenScoreResult
-from zo_vllm.training.direction import TokenProbeBatch
+from zo_vllm.training.direction import RolloutProbeBatch, TokenProbeBatch
 from zo_vllm.training.zo_step import ZOPendingStep, ZOStepResult
 from zo_vllm.tasks.boolq import BoolQRow
 from zo_vllm.tasks.hf_preprocessing import (
@@ -43,7 +44,6 @@ class TinyTokenizer:
     pad_token_id = 0
     padding_side = "right"
     model_input_names = ["input_ids", "attention_mask"]
-
     def __call__(
         self,
         texts,
@@ -480,6 +480,108 @@ def test_trainer_uses_hf_map_and_collator_for_zo_plus_minus_losses(
     }
     assert trainer.state.log_history
     assert "zo_projected_grad" in trainer.state.log_history[0]
+
+
+def test_rollout_model_uses_native_trainer_train_and_evaluate(tmp_path: Path) -> None:
+    class FakeRolloutEngine:
+        def __init__(self) -> None:
+            self.clean_lora_ids: list[int | None] = []
+
+        def generate_with_lora_id(self, prompts, *, lora_id, **kwargs):
+            del kwargs
+            self.clean_lora_ids.append(lora_id)
+            return [
+                SimpleNamespace(
+                    outputs=[SimpleNamespace(text=str(prompt), token_ids=[1])]
+                )
+                for prompt in prompts
+            ]
+
+    class FakeRolloutRuntime(FakeHFZORuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.engine = FakeRolloutEngine()
+            self.rollout_batches: list[RolloutProbeBatch] = []
+
+        def clean_lora_id_for_score(self) -> int:
+            return 17
+
+        def estimate(self, batch: RolloutProbeBatch, *, step: int):
+            self.rollout_batches.append(batch)
+            rewards = [
+                float(batch.rollout_reward_fn(prompt, target))
+                for prompt, target in zip(
+                    batch.rollout_prompts, batch.rollout_targets
+                )
+            ]
+            reward = sum(rewards) / len(rewards)
+            return self._pending_step(
+                step=step,
+                reported_loss=-reward,
+                loss_plus=-reward,
+                loss_minus=-reward,
+                projected_grad=0.0,
+            )
+
+    def collate(rows):
+        return {
+            "rollout_prompts": [row["prompt"] for row in rows],
+            "rollout_targets": [row["target"] for row in rows],
+        }
+
+    def reward_fn(text, target):
+        return float(text == target)
+
+    def metrics_fn(text, target, reward_result):
+        del text, target
+        return {"accuracy": float(reward_result)}
+
+    def compute_metrics(prediction):
+        return {
+            "reward": float(prediction.predictions[:, 0].mean()),
+            "accuracy": float(prediction.predictions[:, 1].mean()),
+        }
+
+    runtime = FakeRolloutRuntime()
+    dataset = Dataset.from_list(
+        [
+            {"prompt": "correct", "target": "correct"},
+            {"prompt": "wrong", "target": "expected"},
+        ]
+    )
+    trainer = ZOTrainer(
+        model=ZORolloutTrainerModel(
+            runtime,
+            reward_fn=reward_fn,
+            max_tokens=4,
+            metric_names=("reward", "accuracy"),
+            metrics_fn=metrics_fn,
+        ),
+        args=_args(
+            tmp_path,
+            max_steps=1,
+            learning_rate=0.1,
+            eval_strategy="steps",
+            eval_steps=1,
+        ),
+        train_dataset=dataset,
+        eval_dataset=dataset,
+        data_collator=collate,
+        compute_metrics=compute_metrics,
+    )
+
+    result = trainer.train()
+
+    assert result.global_step == 1
+    assert len(runtime.rollout_batches) == 1
+    assert runtime.applied_learning_rates == pytest.approx([0.1])
+    assert runtime.engine.clean_lora_ids == [17]
+    eval_metrics = next(
+        row for row in trainer.state.log_history if "eval_reward" in row
+    )
+    assert eval_metrics["eval_loss"] == pytest.approx(-0.5)
+    assert eval_metrics["eval_reward"] == pytest.approx(0.5)
+    assert eval_metrics["eval_accuracy"] == pytest.approx(0.5)
 
 
 def test_hf_linear_scheduler_controls_runtime_learning_rate(tmp_path: Path) -> None:

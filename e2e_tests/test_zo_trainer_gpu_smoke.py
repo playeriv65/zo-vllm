@@ -18,9 +18,9 @@ from zo_trainer import (
     VLLMDataCollator,
     ZO_DIRECTION_STATE_NAME,
     ZOVLLMCheckpointHandler,
-    ZOSGDOptimizer,
     ZOTrainer,
     ZOTrainerArguments,
+    ZORolloutTrainerModel,
     read_zo_checkpoint_metadata,
 )
 from zo_vllm.config import VLLMZOConfig, ZOVLLMEngineConfig
@@ -30,7 +30,6 @@ from zo_vllm.core.weight_sync import WeightSync
 from zo_vllm.engine import ZOVLLMEngine
 from zo_vllm.training import (
     AccumulatedLowRankUpdateState,
-    RolloutProbeBatch,
     VLLMZOModel,
     build_tokenizer,
 )
@@ -457,40 +456,141 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
 
 @pytest.mark.e2e
 @pytest.mark.gpu
-def test_zo_sgd_optimizer_applies_real_es_rollout_estimate() -> None:
+def test_hf_trainer_runs_real_es_rollout_end_to_end(tmp_path: Path) -> None:
     _skip_without_e2e_gpu()
     _prepare_e2e_environment()
     engine: ZOVLLMEngine | None = None
     try:
         engine, zo_model, _ = _build_real_vllm_zo_model(
+            include_embeddings=True,
+            accumulate_updates=True,
             estimator="evolution_strategy",
             population_size=2,
             query_microbatch_size=2,
             sigma=1e-3,
             reward_shaping="none",
         )
-        pending = zo_model.estimate(
-            RolloutProbeBatch(
-                rollout_prompts=["Review sentiment:"],
-                rollout_targets=[None],
-                rollout_reward_fn=lambda text, target: float(len(text)),
-                rollout_max_tokens=1,
-                rollout_seed=0,
+        dataset = Dataset.from_list(
+            [{"prompt": "Review sentiment:", "target": "nonempty"}]
+        )
+
+        def collate(rows):
+            return {
+                "rollout_prompts": [row["prompt"] for row in rows],
+                "rollout_targets": [row["target"] for row in rows],
+            }
+
+        def reward_fn(text, target):
+            del target
+            return float(len(text) > 0)
+
+        trainer = ZOTrainer(
+            model=ZORolloutTrainerModel(
+                zo_model,
+                reward_fn=reward_fn,
+                max_tokens=1,
+                seed=0,
             ),
-            step=1,
-        )
-        optimizer = ZOSGDOptimizer(
-            [torch.nn.Parameter(torch.zeros(()))],
-            lr=1e-7,
+            args=ZOTrainerArguments(
+                output_dir=str(tmp_path / "es_trainer"),
+                max_steps=1,
+                per_device_train_batch_size=1,
+                per_device_eval_batch_size=1,
+                learning_rate=1e-7,
+                logging_steps=1,
+                eval_strategy="steps",
+                eval_steps=1,
+                save_strategy="steps",
+                save_steps=1,
+                zo_checkpoint_mode="native",
+                disable_tqdm=True,
+                report_to=[],
+                remove_unused_columns=False,
+            ),
+            train_dataset=dataset,
+            eval_dataset=dataset,
+            data_collator=collate,
+            compute_metrics=lambda prediction: {
+                "reward": float(prediction.predictions[:, 0].mean())
+            },
+            checkpoint_handler=ZOVLLMCheckpointHandler(
+                checkpoint_mode="native",
+                llm=engine.llm,
+                weight_sync=zo_model.weight_sync,
+                update_state=zo_model.update_state,
+            ),
         )
 
-        optimizer.stage(pending)
-        optimizer.step()
+        train_result = trainer.train()
 
-        result = optimizer.last_step_result
-        assert result is not None
-        assert result.estimator_metrics["estimator"] == "evolution_strategy"
-        assert result.estimator_metrics["query_count"] == 2
-        assert result.learning_rate == pytest.approx(1e-7)
+        assert train_result.global_step == 1
+        train_metrics = next(
+            row for row in trainer.state.log_history if row.get("zo_step") == 1
+        )
+        assert train_metrics["zo_estimator_query_count"] == 2
+        assert train_metrics["zo_applied_learning_rate"] == pytest.approx(1e-7)
+        eval_metrics = next(
+            row for row in trainer.state.log_history if "eval_reward" in row
+        )
+        assert "eval_loss" in eval_metrics
+        checkpoint = tmp_path / "es_trainer" / "checkpoint-1"
+        metadata = read_zo_checkpoint_metadata(checkpoint)
+        assert metadata["payload"]["materialized_effective_delta"] is True
+        assert _checkpoint_native_state_digests(checkpoint)
+
+        _cleanup_engine(engine)
+        engine = None
+        del trainer, zo_model
+
+        engine, resumed_zo_model, _ = _build_real_vllm_zo_model(
+            include_embeddings=True,
+            accumulate_updates=True,
+            estimator="evolution_strategy",
+            population_size=2,
+            query_microbatch_size=2,
+            sigma=1e-3,
+            reward_shaping="none",
+        )
+        resumed = ZOTrainer(
+            model=ZORolloutTrainerModel(
+                resumed_zo_model,
+                reward_fn=reward_fn,
+                max_tokens=1,
+                seed=0,
+            ),
+            args=ZOTrainerArguments(
+                output_dir=str(tmp_path / "es_trainer"),
+                max_steps=2,
+                per_device_train_batch_size=1,
+                per_device_eval_batch_size=1,
+                learning_rate=1e-7,
+                logging_steps=1,
+                eval_strategy="steps",
+                eval_steps=1,
+                save_strategy="steps",
+                save_steps=1,
+                zo_checkpoint_mode="native",
+                disable_tqdm=True,
+                report_to=[],
+                remove_unused_columns=False,
+            ),
+            train_dataset=dataset,
+            eval_dataset=dataset,
+            data_collator=collate,
+            compute_metrics=lambda prediction: {
+                "reward": float(prediction.predictions[:, 0].mean())
+            },
+            checkpoint_handler=ZOVLLMCheckpointHandler(
+                checkpoint_mode="native",
+                llm=engine.llm,
+                weight_sync=resumed_zo_model.weight_sync,
+                update_state=resumed_zo_model.update_state,
+            ),
+        )
+
+        resumed_result = resumed.train(resume_from_checkpoint=str(checkpoint))
+
+        assert resumed_result.global_step == 2
+        assert (tmp_path / "es_trainer" / "checkpoint-2").exists()
     finally:
         _cleanup_engine(engine)

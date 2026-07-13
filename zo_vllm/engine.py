@@ -372,6 +372,49 @@ class ZOVLLMEngine:
             for start in range(0, len(outputs), width)
         ]
 
+    def generate_with_lora_id(
+        self,
+        prompts: Sequence[str],
+        *,
+        lora_id: int | None,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        seed: int | None,
+    ) -> list[Any]:
+        """Generate one clean rollout batch through an optional runtime slot."""
+
+        from vllm import SamplingParams
+        from vllm.lora.request import LoRARequest
+
+        from zo_vllm.core.lora_runtime import DIRECT_SLOT_PATH_PREFIX
+
+        prompt_rows = list(prompts)
+        sampling_params = SamplingParams(
+            n=1,
+            seed=None if seed is None else int(seed),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            max_tokens=int(max_tokens),
+        )
+        requests = None
+        if lora_id is not None:
+            slot_id = int(lora_id)
+            requests = [
+                LoRARequest(
+                    f"zo_rollout_{slot_id}",
+                    slot_id,
+                    f"{DIRECT_SLOT_PATH_PREFIX}/{slot_id}",
+                )
+                for _ in prompt_rows
+            ]
+        return self.llm.generate(
+            prompt_rows,
+            sampling_params=sampling_params,
+            lora_request=requests,
+            use_tqdm=False,
+        )
+
     def score_token_groups(
         self,
         token_id_groups: Sequence[Sequence[int]],

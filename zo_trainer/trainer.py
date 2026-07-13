@@ -28,6 +28,7 @@ from .checkpointing import (
 from .modeling import (
     CompactCausalOutput,
     OptionClassificationOutput,
+    RolloutOutput,
     ZOTrainerModel,
     ZOTrainerRuntime,
 )
@@ -183,6 +184,12 @@ class ZOTrainer(Trainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """Apply the HF loss contract to logits already produced by vLLM."""
+
+        if isinstance(outputs, RolloutOutput):
+            loss = _output_value(outputs, "loss")
+            if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
+                raise RuntimeError("rollout outputs require a scalar tensor loss")
+            return loss
 
         logits = _output_value(outputs, "logits")
         labels = _output_value(outputs, "loss_labels")
