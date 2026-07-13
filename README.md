@@ -600,6 +600,7 @@ Collectors:
 - `phase3/README.md`: core-step performance experiments.
 - `phase4/README.md`: long-run convergence summaries.
 - `phase6/README.md`: MeZO-style high-rank factorized ZO comparison.
+- `docs/HISTORY_REWORK.md`: archive tags and semantic branch reconstruction.
 
 Generated results and presentation packages are intentionally ignored by git:
 
