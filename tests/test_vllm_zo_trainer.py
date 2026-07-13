@@ -5,6 +5,8 @@ from zo_vllm.training import (
     VLLMZOTrainer,
     VLLMZOTrainerCallback,
     VLLMZOTrainerControl,
+    ZOPendingStep,
+    ZOStepResult,
     ZOTrainingArguments,
 )
 
@@ -13,9 +15,22 @@ class CountingModel:
     def __init__(self) -> None:
         self.steps = []
 
-    def step(self, batch, *, step: int):
+    def estimate(self, batch, *, step: int):
         self.steps.append((batch, step))
-        return {"loss": float(10 - step)}
+        return ZOPendingStep(
+            step=step,
+            reported_loss=float(10 - step),
+            _apply_fn=lambda learning_rate, weight_decay: ZOStepResult(
+                step=step,
+                learning_rate=learning_rate,
+                reported_loss=float(10 - step),
+                loss_plus=float(10 - step),
+                loss_minus=float(10 - step),
+                projected_grad=0.0,
+                update_scale=0.0,
+                direction_refreshed=False,
+            ),
+        )
 
 
 def test_vllm_zo_trainer_saves_step_checkpoints_and_prunes(tmp_path: Path):

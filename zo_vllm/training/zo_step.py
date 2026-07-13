@@ -22,7 +22,6 @@ from .estimator import (
     _sample_direction_from_specs,
 )
 from zo_vllm.core.token_scores import TokenGroupScorer
-from .scheduler import ConstantLR, LRScheduler
 from .update_state import ZOUpdateState
 
 
@@ -31,8 +30,6 @@ class ZOStepConfig:
     """Algorithm settings that are independent of the direction source."""
 
     eps: float = 1e-3
-    learning_rate: float = 1e-6
-    weight_decay: float = 0.0
     max_logits_tokens: int = 8192
     loss_impl: str = "logprobs"
     score_chunk_size: int = 0
@@ -40,8 +37,6 @@ class ZOStepConfig:
     def __post_init__(self) -> None:
         if float(self.eps) <= 0.0:
             raise ValueError("eps must be positive")
-        if float(self.learning_rate) < 0.0:
-            raise ValueError("learning_rate must be non-negative")
         if int(self.score_chunk_size) < 0:
             raise ValueError("score_chunk_size must be non-negative")
 
@@ -335,7 +330,6 @@ class ZOStepper:
         direction_provider: DirectionProvider,
         update_state: ZOUpdateState,
         config: ZOStepConfig,
-        scheduler: LRScheduler | None = None,
         estimator: ZOEstimator | None = None,
         callbacks: Sequence[ZOStepCallback] | None = None,
     ) -> None:
@@ -343,7 +337,6 @@ class ZOStepper:
         self.direction_provider = direction_provider
         self.update_state = update_state
         self.config = config
-        self.scheduler = scheduler or ConstantLR(config.learning_rate)
         self.estimator = estimator or SingleDirectionAntitheticEstimator()
         self.callbacks = list(callbacks or [])
         self.control = ZOStepControl()
@@ -353,13 +346,6 @@ class ZOStepper:
         """Force cached direction factors into newly created runtime slots."""
 
         self._force_direction_slot_sync = True
-
-    def step(self, batch: ProbeBatch, *, step: int) -> ZOStepResult:
-        pending = self.estimate(batch, step=step)
-        return pending.apply(
-            learning_rate=float(self.scheduler(int(step))),
-            weight_decay=float(self.config.weight_decay),
-        )
 
     def estimate(self, batch: ProbeBatch, *, step: int) -> ZOPendingStep:
         """Estimate one runtime-native ZO step without applying it."""

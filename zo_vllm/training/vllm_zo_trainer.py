@@ -12,15 +12,21 @@ from typing import Any, Mapping, Protocol
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler
+from transformers import get_scheduler
 
 from .arguments import ZOTrainingArguments
+from .optimizer import ZOSGDOptimizer
 
 
-class VLLMZOStepModel(Protocol):
+OPTIMIZER_STATE_NAME = "optimizer.pt"
+SCHEDULER_STATE_NAME = "scheduler.pt"
+
+
+class VLLMZOEstimateModel(Protocol):
     """Minimal model protocol consumed by :class:`VLLMZOTrainer`."""
 
-    def step(self, batch: Any, *, step: int) -> Any:
-        """Run one train step and return a metrics-bearing result."""
+    def estimate(self, batch: Any, *, step: int) -> Any:
+        """Estimate one train step without applying it."""
 
 
 @dataclass(frozen=True)
@@ -277,7 +283,7 @@ class VLLMZOTrainer:
     def __init__(
         self,
         *,
-        model: VLLMZOStepModel,
+        model: VLLMZOEstimateModel,
         args: ZOTrainingArguments,
         train_dataset: Any | None = None,
         train_dataloader: Iterable[Any] | None = None,
@@ -303,6 +309,17 @@ class VLLMZOTrainer:
         self.best_tracker = _BestMetricTracker(
             metric_for_best_model=args.metric_for_best_model,
             greater_is_better=args.greater_is_better,
+        )
+        self._optimizer_parameter = torch.nn.Parameter(torch.zeros(()))
+        self.optimizer = ZOSGDOptimizer(
+            [self._optimizer_parameter],
+            lr=float(args.learning_rate),
+        )
+        self.lr_scheduler = get_scheduler(
+            str(args.lr_scheduler_type),
+            optimizer=self.optimizer,
+            num_warmup_steps=int(args.warmup_steps),
+            num_training_steps=int(args.warmup_steps) + int(args.max_steps),
         )
         self._call_event("on_init_end")
 
@@ -358,7 +375,13 @@ class VLLMZOTrainer:
             )
             if self.control.should_training_stop:
                 break
-            result = self.model.step(batch, step=raw_step)
+            pending = self.model.estimate(batch, step=raw_step)
+            self.optimizer.stage(pending)
+            self.optimizer.step()
+            result = self.optimizer.last_step_result
+            if result is None:
+                raise RuntimeError("ZO optimizer did not produce a step result")
+            self.lr_scheduler.step()
             self._call_event(
                 "on_optimizer_step",
                 raw_step=raw_step,
@@ -478,6 +501,18 @@ class VLLMZOTrainer:
             raise FileNotFoundError(f"trainer_state.json not found in {checkpoint}")
         loaded = json.loads(state_path.read_text(encoding="utf-8"))
         self.state = VLLMZOTrainerState.from_dict(loaded)
+        optimizer_path = checkpoint / OPTIMIZER_STATE_NAME
+        scheduler_path = checkpoint / SCHEDULER_STATE_NAME
+        if not optimizer_path.is_file() or not scheduler_path.is_file():
+            raise FileNotFoundError(
+                "trainer checkpoint is missing optimizer or scheduler state"
+            )
+        self.optimizer.load_state_dict(
+            torch.load(optimizer_path, map_location="cpu", weights_only=True)
+        )
+        self.lr_scheduler.load_state_dict(
+            torch.load(scheduler_path, map_location="cpu", weights_only=True)
+        )
         best_checkpoint = self.state.best_checkpoint
         if isinstance(best_checkpoint, dict):
             self.best_tracker.best_record = dict(best_checkpoint)
@@ -533,6 +568,10 @@ class VLLMZOTrainer:
         (checkpoint_dir / "trainer_state.json").write_text(
             _json_dumps(state),
             encoding="utf-8",
+        )
+        torch.save(self.optimizer.state_dict(), checkpoint_dir / OPTIMIZER_STATE_NAME)
+        torch.save(
+            self.lr_scheduler.state_dict(), checkpoint_dir / SCHEDULER_STATE_NAME
         )
 
     def _enforce_save_total_limit(self, *, protect_path: str | None = None) -> None:

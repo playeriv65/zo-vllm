@@ -68,9 +68,7 @@ def init_worker_update_bank(
     zo_config = VLLMZOConfig(
         rank=int(lozo_config["rank"]),
         eps=float(lozo_config["eps"]),
-        learning_rate=float(lozo_config["learning_rate"]),
         nu=int(lozo_config["nu"]),
-        weight_decay=float(lozo_config.get("weight_decay", 0.0)),
         seed=int(lozo_config.get("seed", 42)),
         random_device=str(lozo_config.get("random_device", "cuda")),
         direction_sampling=str(lozo_config.get("direction_sampling", "exact")),

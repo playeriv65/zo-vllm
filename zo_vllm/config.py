@@ -184,8 +184,6 @@ class VLLMZOConfig:
     rank: int = DEFAULT_ZO_RANK
     nu: int = DEFAULT_ZO_NU
     eps: float = DEFAULT_ZO_EPS
-    learning_rate: float = DEFAULT_ZO_LEARNING_RATE
-    weight_decay: float = DEFAULT_ZO_WEIGHT_DECAY
     random_device: str = DEFAULT_ZO_RANDOM_DEVICE
     direction_sampling: str = DEFAULT_ZO_DIRECTION_SAMPLING
     v_normalization: str = "none"
@@ -245,8 +243,6 @@ class VLLMZOConfig:
             raise ValueError("rank must be positive")
         if float(self.eps) <= 0.0:
             raise ValueError("eps must be positive")
-        if float(self.learning_rate) < 0.0:
-            raise ValueError("learning_rate must be non-negative")
         if self.random_device not in {"cpu", "cuda"}:
             raise ValueError(f"unknown random_device: {self.random_device}")
         if self.direction_sampling not in {"exact", "flat"}:
@@ -286,8 +282,6 @@ class VLLMZOConfig:
         object.__setattr__(self, "rank", int(self.rank))
         object.__setattr__(self, "nu", _validate_zo_nu(self.nu))
         object.__setattr__(self, "eps", float(self.eps))
-        object.__setattr__(self, "learning_rate", float(self.learning_rate))
-        object.__setattr__(self, "weight_decay", float(self.weight_decay))
         object.__setattr__(self, "random_device", str(self.random_device))
         object.__setattr__(self, "direction_sampling", str(self.direction_sampling))
         object.__setattr__(self, "v_normalization", str(self.v_normalization))

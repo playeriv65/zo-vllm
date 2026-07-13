@@ -83,9 +83,7 @@ def _lozo_config():
     return {
         "rank": 2,
         "eps": 1e-3,
-        "learning_rate": 1e-7,
         "nu": 10,
-        "weight_decay": 0.0,
         "seed": 7,
         "random_device": "cpu",
         "direction_dtype": "float32",

@@ -26,9 +26,8 @@ from .estimator import (
     SingleDirectionAntitheticEstimator,
     ZOEstimator,
 )
-from .scheduler import ConstantLR, LRScheduler
 from .update_state import ImmediateWeightUpdateState, ZOUpdateState
-from .zo_step import ZOStepCallback, ZOStepConfig, ZOStepResult, ZOStepper
+from .zo_step import ZOStepCallback, ZOStepConfig, ZOStepper
 
 
 class VLLMZOModel:
@@ -41,7 +40,6 @@ class VLLMZOModel:
         weight_sync: WeightSync,
         config: VLLMZOConfig,
         param_metadata: Mapping[str, ParamMetadata] | None = None,
-        scheduler: LRScheduler | None = None,
         estimator: ZOEstimator | None = None,
         update_state: ZOUpdateState | None = None,
         seed_sampler: Callable[[int], int] | None = None,
@@ -58,7 +56,6 @@ class VLLMZOModel:
             if param_metadata is not None
             else weight_sync.get_hf_param_metadata()
         )
-        self.scheduler = scheduler or ConstantLR(config.learning_rate)
         self.direction_provider = self._build_direction_provider(seed_sampler)
         self.update_state = update_state or ImmediateWeightUpdateState(
             weight_sync=weight_sync,
@@ -72,13 +69,10 @@ class VLLMZOModel:
             update_state=self.update_state,
             config=ZOStepConfig(
                 eps=config.eps,
-                learning_rate=config.learning_rate,
-                weight_decay=config.weight_decay,
                 max_logits_tokens=config.max_logits_tokens,
                 loss_impl=config.loss_impl,
                 score_chunk_size=config.score_chunk_size,
             ),
-            scheduler=self.scheduler,
             estimator=estimator or self._build_estimator(),
             callbacks=step_callbacks,
         )
@@ -162,11 +156,6 @@ class VLLMZOModel:
                 perturbation_normalization=self.config.perturbation_normalization,
             )
         raise ValueError(f"unsupported estimator: {self.config.estimator}")
-
-    def step(self, batch: ProbeBatch, *, step: int) -> ZOStepResult:
-        """Run one ZO step and return generic metrics."""
-
-        return self.stepper.step(batch, step=step)
 
     def estimate(self, batch: ProbeBatch, *, step: int):
         """Estimate one runtime-native ZO step without applying it."""

@@ -78,6 +78,7 @@ from zo_vllm.training import (
     VLLMZOTrainer,
     VLLMZOTrainerCallback,
     ZOTrainingArguments,
+    ZOPendingStep,
     ZOTaskDataCollator,
     ZOTaskEncodingConfig,
     build_tokenizer,
@@ -249,8 +250,6 @@ def main():
         lozo_provider_mode=args.lozo_provider_mode,
         rank=args.rank,
         eps=args.eps,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
         nu=args.nu,
         random_device=args.zo_random_device,
         direction_sampling=args.direction_sampling,
@@ -654,7 +653,7 @@ def main():
     last_step_context = {}
 
     class RunnerStepModel:
-        def step(self, batch_rows, *, step: int):
+        def estimate(self, batch_rows, *, step: int):
             nonlocal measured_train_t0
             nonlocal measured_train_t1
             nonlocal last_raw_step
@@ -691,11 +690,52 @@ def main():
                 zo_batch = task_collator(batch_rows)
                 runner_collate_s = time.perf_counter() - collate_t0
                 model_step_t0 = time.perf_counter()
-                stepper_result = zo_model.step(
+                pending = zo_model.estimate(
                     zo_batch,
                     step=step,
                 )
                 runner_model_step_s = time.perf_counter() - model_step_t0
+            return ZOPendingStep(
+                step=int(step),
+                reported_loss=float(pending.reported_loss),
+                _apply_fn=lambda learning_rate, weight_decay: self._finish_step(
+                    pending.apply(
+                        learning_rate=learning_rate,
+                        weight_decay=weight_decay,
+                    ),
+                    batch_rows=batch_rows,
+                    step=int(step),
+                    measured_step=measured_step,
+                    measured_index=measured_index,
+                    lora_runtime=lora_runtime,
+                    direction_digest=direction_digest,
+                    step_t0=step_t0,
+                    stepper_t0=stepper_t0,
+                    runner_collate_s=runner_collate_s,
+                    runner_model_step_s=runner_model_step_s,
+                    step_total_nvtx_pushed=step_total_nvtx_pushed,
+                    record_timing=record_timing,
+                ),
+            )
+
+        def _finish_step(
+            self,
+            stepper_result,
+            *,
+            batch_rows,
+            step,
+            measured_step,
+            measured_index,
+            lora_runtime,
+            direction_digest,
+            step_t0,
+            stepper_t0,
+            runner_collate_s,
+            runner_model_step_s,
+            step_total_nvtx_pushed,
+            record_timing,
+        ):
+            nonlocal measured_train_t1
             unpack_t0 = time.perf_counter()
             stepper_profile = dict(stepper_result.profile_s)
             stepper_update = dict(
@@ -783,18 +823,7 @@ def main():
                         "step_s": float(timing["step_s"][-1]),
                     }
                 )
-                return {
-                    "loss_plus": float(loss_plus),
-                    "loss_minus": float(loss_minus),
-                    "projected_grad": float(c),
-                    "step_s": float(timing["step_s"][-1]) if measured_step else 0.0,
-                }
-            return {
-                "loss_plus": float(loss_plus),
-                "loss_minus": float(loss_minus),
-                "projected_grad": float(c),
-                "step_s": 0.0,
-            }
+            return stepper_result
 
     class VLLMTaskRunnerCallback(VLLMZOTrainerCallback):
         def on_step_end(self, callback_args, state, control, **kwargs):
