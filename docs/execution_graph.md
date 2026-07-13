@@ -60,6 +60,12 @@ dispatch, and checkpoint restore. `ZOSGDOptimizer` performs the real update and
 reports its LR as `zo_applied_learning_rate`. The estimator never receives LR or
 weight decay.
 
+For ES rollout training, `ZORolloutTrainerModel.zo_estimate()` converts the HF
+collator output to `RolloutProbeBatch`; the remaining estimate, optimizer, and
+scheduler path is identical. Its clean `forward()` returns rollout reward
+columns through standard HF `loss`/`logits` outputs, so evaluation and
+`compute_metrics` stay in the native Trainer loop.
+
 ## Evaluation Path
 
 ```text
@@ -99,15 +105,36 @@ next probe forces one V-basis copy into newly created runtime LoRA slots.
 ## Serving Path
 
 ```text
-ServingZOTrainer
-  -> AsyncWorkerUpdateBankClient
-  -> vLLM worker RPC
-     -> worker-resident DirectionProvider and UpdateState
-     -> ZOVLLMEngine-compatible scoring/runtime operations
+Phase 7 runner
+  -> HTTP start / stop / status
+  -> passive BackgroundTrainingHandle in API server state
+  -> one synchronous HF trainer thread
+  -> HF Dataset.shuffle / Dataset.map
+  -> ZOTrainer
+     -> VLLMDataCollator / HF sampler and DataLoader
+     -> ZOTrainerModel / HF classification loss
+     -> shared antithetic estimator aggregation
+     -> ZOPendingStep
+     -> ZOSGDOptimizer.step()
+     -> HF scheduler.step() / eval / metrics / callbacks
+     -> ScheduledServingRuntime
+        -> BlockingAsyncBridge
+           -> AsyncZOEngineService on the API-server event loop
+              -> QoS admission / pair lock / scheduled scoring
+              -> AsyncWorkerUpdateBankClient
+              -> vLLM worker RPC
+                 -> worker-resident DirectionProvider and UpdateState
 ```
 
-Serving admission and worker residency are runtime concerns. They do not add
-dataset, loss, or Trainer policy to the core engine.
+`ZOSGDOptimizer` owns staged-estimate ordering, LR/weight-decay parameter
+groups, step state, and checkpoint guards for both paths. Serving differs only
+at the engine-operation boundary: the trainer thread blocks on two small bridge
+round trips while the server event loop remains free to admit foreground work.
+
+Serving admission and worker residency are runtime concerns. The scheduled
+backend currently exposes option NLL only and fails fast for causal-LM logits;
+adding scheduled compact logits is an engine capability change, not a Trainer
+branch.
 
 ## Ownership Rules
 

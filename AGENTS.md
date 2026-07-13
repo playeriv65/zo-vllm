@@ -159,9 +159,22 @@ queued AGZO V 里额外加入局部 `1/sqrt(rank)` / `1/sqrt(queue)` 缩放；ra
 保存 vLLM native sharded checkpoint 时，只允许非 `lora_bank` 更新模式折回 base weight；
 `AccumulatedLowRankUpdateState.fold()` 会先 flush pending update 再写回 base。Phase7
 `lora_bank` 代表主权重只读，不能为了保存 checkpoint 把 bank update fold 进 base。
+把 accumulated update 物化进 native checkpoint 时必须复用 embedding-aware shape
+语义：训练方向的 token embedding 是 hidden-first，而 vLLM base tensor 可能是
+vocab-first 或带 padded vocab；tied `lm_head` 只是同一方向的输出转置视图。GPU E2E
+必须覆盖 `ES + lora_full + accumulated update + native save/resume`，不能只分别验证
+普通线性层 checkpoint 和关闭保存的 ES rollout。
 vLLM `ShardedStateLoader.save_model()` 保存的是 `model.state_dict()`，direct LoRA slot
 tensor 不是 registered parameter/buffer；native checkpoint 的语义应保持为 folded base
 weights 加少量 ZO metadata，而不是 adapter checkpoint。
+LoRA runtime 会把 base parameter 暴露成 `*.base_layer.*` state key，但 vLLM 在注入
+LoRA wrapper 前加载 sharded checkpoint。native checkpoint 保存边界必须把这些 runtime
+key 规范化回 base-model key；study 和恢复脚本不能依赖或修补 wrapper key。
+所有可恢复的 native 和 LoRA-bank checkpoint 都必须保存完整的
+`hf_to_vllm_mapping`、`hf_to_slice` 和稳定 fingerprint。恢复时先用当前
+`WeightSync` 的实际映射严格比较，再加载任何 tensor；不能根据模型名或当前代码静默推断。
+chunked AGZO subspace 构造只收集 activation，必须同时关闭 `compute_loss` 和
+`compute_token_nll`；任务 loss/labels 属于训练与 evaluation scoring，不得混入子空间构造。
 checkpoint 调度语义对齐 Hugging Face：`--save-strategy steps` 只按 measured step 和
 `--save-steps` 保存，不依赖 eval cadence；`best` 只在 `metric_for_best_model` 改善时
 保存；`load_best_model_at_end` 只能加载 native full checkpoint。LoRA-bank checkpoint
@@ -216,8 +229,20 @@ forward，`ZOTrainer.training_step` 只估计并 stage 一个 `ZOPendingStep`，
 发生在 HF 调用的 `ZOSGDOptimizer.step()` 内；`ZOStepper` 只管方向采样、回调、估计构造
 和 runtime apply orchestration，
 `ZOEstimator` 才拥有 antithetic / one-sided / multi-query / ES 的 probe 计划与聚合。
+`VLLMZOModel` 和 `ZOStepper` 只暴露 estimate，不拥有 learning rate、weight decay 或
+scheduler，也不能提供立即 apply 的 `step()` 便捷路径；所有同步更新必须由
+`ZOSGDOptimizer.stage()` / `step()` 消费。
 direct worker scoring/logits 是 `ZOVLLMEngine` backend 能力，不是可以在 Trainer 里直接
 替代 estimator 的算法入口。
+Generation-reward ES tasks use `ZORolloutTrainerModel`: the task supplies an HF
+collator, scalar reward function, optional per-row metric projection, and
+`compute_metrics`. Do not subclass `ZOTrainer` or override `evaluate()` for a
+rollout task; clean generation returns standard HF `loss`/`logits` outputs,
+while population probing remains in `EvolutionStrategyEstimator`.
+Step-local direction sampling must not retain every seeded multi-query sample.
+Keep only lightweight merged metadata and the first callback sample; independent
+ES replays seeds lazily during update aggregation. Otherwise direction memory
+silently grows with population size despite query microbatching.
 HF-native 路径不得维护平行的 no-op scheduler，也不得绕过
 `Trainer._load_optimizer_and_scheduler`；scheduler 的 warmup、step 和 checkpoint resume
 统一交给 Transformers。ZO 日志用 `zo_applied_learning_rate` 表示当前 update 实际使用的
@@ -631,3 +656,35 @@ Resume tests must compare a resumed numerical trajectory with an uninterrupted
 trajectory, not merely assert that files load. Direction-provider caches and
 runtime LoRA slots are distinct state: after rebuilding workers, preserve the
 cached basis but force one slot synchronization before scoring.
+Cross-engine FP16 GPU forwards are not a bitwise checkpoint contract. Resume
+tests should compare base tensors, batches, and U/V directions exactly, then use
+a documented numerical tolerance for losses and finite-difference estimates.
+Device tensors returned by in-process worker RPC must carry a CUDA readiness
+event, and the caller stream must wait on it before computing the HF loss.
+Native checkpoint reload must validate all shards, tensor keys, and shapes
+before copying any tensor; incompatible tensors are fatal rather than skipped.
+Checkpoint scope metadata is descriptive and must not silently configure a
+study runtime. Generic `zo_trainer` callbacks accept injected recorders and must
+not import experiment runner implementations.
+Resumable trainer checkpoints persist optimizer and scheduler state directly;
+do not reconstruct scheduler position by replaying `scheduler.step()` calls.
+HF clean evaluation must request the runtime's effective clean LoRA slot when
+updates are accumulated; `lora_ids=None` only represents immediate or folded
+updates. Checkpoint handlers infer bank-aware native materialization from the
+update-state capability instead of a caller-provided mode flag.
+Serving-time ZO runs the same HF `ZOTrainer`, `ZOTrainerModel`, ragged collator,
+`ZOSGDOptimizer`, scheduler, eval cadence, metrics, and callbacks in one
+dedicated API-server thread. Do not add a `ServingZOTrainer`, async optimizer,
+serving controller, or serving-specific stepper; the API server stores only a
+passive background-training handle, while free start/stop/status functions own
+lifecycle and the scheduled runtime owns backend differences. The only
+synchronous/async boundary is
+`ScheduledServingRuntime` plus `BlockingAsyncBridge`: scheduled scoring, QoS
+admission, pair locking, cancellation, and worker RPC execute on the server
+event loop while the trainer thread blocks. Estimator aggregation remains the
+shared estimator implementation and must not be copied into API lifecycle
+functions. Serving-time training must use HF `Dataset.shuffle`, `Dataset.map`,
+and the HF sampler; do not expose the removed NumPy row-shuffle or unused
+eval-row request parameters. The scheduled backend currently supports prompt-option NLL and
+must fail fast for causal logits until the engine exposes scheduled compact
+logits.

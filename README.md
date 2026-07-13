@@ -72,13 +72,13 @@ Important runtime components:
 - `zo_vllm/training/worker_update_bank.py`: worker-resident update backend for
   serving-time ZO. It owns direction sampling, LoRA-bank update state, slot
   preparation, and scalar update apply inside the vLLM worker.
-- `zo_vllm/serving/`: private serving-time ZO trainer. It submits
+- `zo_vllm/serving/`: serving lifecycle and scheduled runtime backend. It submits
   background compact-NLL scoring requests through the vLLM scheduler, delegates
   update state to the worker update bank, and exposes `/zo_vllm/serving_zo/*` only
   when `VLLM_ZO_SERVING_TRAINING=1`. Slot writes default to a conservative
   per-pair barrier: write plus/minus slots on a background CUDA stream, wait for
   the copy event before submitting the matching low-priority scoring pair, and
-  do not overwrite plus/minus slots until that pair returns. The serving trainer
+  do not overwrite plus/minus slots until that pair returns. The HF trainer thread
   supports conservative `idle_gap` score admission and a more aggressive
   `scheduler_only` mode. `idle_gap` waits only before score submission until the
   foreground load tracker reports an empty gap; `scheduler_only` submits the
@@ -93,12 +93,8 @@ Important runtime components:
   token lookup, while `lm_head` routes logits through `LogitsProcessorWithLoRA`.
   Base-weight updates remain tied and should update the shared embedding matrix
   only once.
-- `zo_vllm/training/scheduler.py`: small step-indexed learning-rate schedules
-  for external ZO training loops.
-- `zo_vllm/training/vllm_zo_trainer.py`: Hugging Face-like outer training
-  facade. It owns measured-step progression, logging/eval/save cadence,
-  resume state, and callback dispatch, while task encoding and ZO runtime math
-  stay outside the trainer.
+- `zo_vllm/training/optimizer.py`: shared staged ZO-SGD state machine used by
+  offline direct scoring and serving scheduled scoring backends.
 - `zo_vllm/experiment/scoring/sst2.py`: SST-2-specific wrappers built
   on the shared direct-worker API.
 - `zo_vllm/tasks/superglue/`: LOZO-style SuperGLUE prompt adapters split by
@@ -213,6 +209,12 @@ Hugging Face Dataset / DataLoader / TrainerCallback / compute_metrics
            -> ZOVLLMEngine / vLLM worker / LoRA runtime
 ```
 
+ES generation-reward tasks use `ZORolloutTrainerModel` at the same model
+boundary. The task passes a reward function and HF `compute_metrics`; the
+standard `ZOTrainer.train()` and `ZOTrainer.evaluate()` loops remain unchanged.
+Population size, reward shaping, direction mode, and query microbatching remain
+owned by the configured estimator below the Trainer.
+
 Hugging Face owns datasets, preprocessing, sampling, batching, loss, metrics,
 callbacks, logging, evaluation, and checkpoint cadence. `ZOTrainerModel`
 converts one ragged HF batch into compact causal logits or option logits without
@@ -258,12 +260,12 @@ The public engine API is `zo_vllm.ZOVLLMEngine`. External experiments should
 pass their model, token IDs, objective aggregation, and output paths from their
 own config or CLI. The engine owns vLLM startup, persistent plus/minus LoRA
 slots, direct worker scoring, and direction updates. Training-state utilities
-such as `SubspaceQueue` and `CosineAfterLR` live under `zo_vllm.training`, so
-task repositories do not need to duplicate queue or scheduler logic:
+such as `SubspaceQueue` live under `zo_vllm.training`; optimizer and scheduler
+policy belongs to Hugging Face `TrainingArguments`:
 
 ```python
 from transformers import AutoConfig
-from zo_vllm import CosineAfterLR, SubspaceQueue, ZOVLLMEngine
+from zo_vllm import SubspaceQueue, ZOVLLMEngine
 
 model_name = cfg.model_name
 model_config = AutoConfig.from_pretrained(model_name)
@@ -279,13 +281,6 @@ with ZOVLLMEngine(
     max_model_len=cfg.max_length,
     gpu_memory_utilization=cfg.gpu_memory_utilization,
 ) as engine:
-    scheduler = CosineAfterLR(
-        learning_rate=cfg.learning_rate,
-        decay_start_step=cfg.decay_start_step,
-        max_steps=cfg.max_steps,
-        final_scale=cfg.final_lr_scale,
-    )
-    learning_rate = scheduler(step)
     result = engine.score_plus_minus_directions(
         directions,
         token_id_groups,
@@ -366,6 +361,12 @@ rate is read from the optimizer parameter group. `zo_applied_learning_rate` and
 the standard HF `learning_rate` both describe that current optimizer step.
 Only `optim=sgd` is supported; unsupported AdamW, autograd clipping, and
 accumulated-backend weight decay fail explicitly.
+
+Serving-time training runs the same synchronous HF `ZOTrainer`, stages the same
+`ZOPendingStep`, and applies it through the same `ZOSGDOptimizer`. Only the
+scheduled runtime backend bridges scoring and worker-bank mutation onto the
+API-server event loop. Serving QoS admission remains outside the optimizer and
+estimator layers.
 
 Loadable HF checkpoints include the direction-provider cache in addition to the
 runtime model, optimizer, scheduler, RNG, and Trainer state. Rebuilt vLLM
