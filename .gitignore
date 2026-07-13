@@ -1,6 +1,9 @@
 # Python cache
 __pycache__/
 **/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.py[cod]
 *.egg-info/
 *.egg
@@ -16,6 +19,7 @@ build/
 .vscode/
 
 # Generated artifacts
+artifacts/
 adapters*/
 *.pt
 phase1*_results.json
@@ -23,6 +27,15 @@ phase1/artifacts/
 phase2/artifacts/
 phase2/results/
 phase3/results/
+phase4/results/
+phase5/results/
+phase6/results/
+phase7/logs/
+zo_post/artifacts/
+zo_post/results/
+zo_post/logs/
+phase4/LOZO.pdf
+/LOZO.pdf
 preprint_package/
 preprint_package.zip
 
