@@ -113,6 +113,12 @@ both output forms remain on GPU. `ZOTrainer` computes the canonical causal or
 classification loss from those outputs, using public `compute_loss_func` when
 supplied and Transformers loss utilities otherwise.
 
+`ZOLogitsOutput` is the generic task boundary. A runtime may return any logits
+shape together with aligned `loss_labels`; when the caller supplies the native
+HF `compute_loss_func`, `ZOTrainer` does not inspect the task name or output
+subclass. Causal-LM and prompt-option output classes only select built-in
+default losses when no custom loss function is provided.
+
 The worker does not compute token NLL again when causal logits are requested.
 Classification request NLL is computed once on GPU and is not copied to CPU.
 After HF computes every probe-group loss, all group scalars are transferred to

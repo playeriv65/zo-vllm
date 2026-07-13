@@ -167,6 +167,14 @@ class VLLMZOModel:
 
         self.stepper.invalidate_direction_slot_state()
 
+    def clean_lora_id_for_score(self) -> int | None:
+        setter = getattr(self.update_state, "set_clean_lora_for_score", None)
+        if not callable(setter):
+            return None
+        step = int(getattr(self.direction_provider, "step", 0))
+        lora_id, _ = setter(step=step)
+        return None if lora_id is None else int(lora_id)
+
     def estimate_with_score_fn(
         self,
         batch: TokenProbeBatch,

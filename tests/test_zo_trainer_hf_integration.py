@@ -14,6 +14,7 @@ from zo_trainer import (
     IGNORE_INDEX,
     VLLMDataCollator,
     ZO_CHECKPOINT_METADATA_NAME,
+    ZOLogitsOutput,
     ZOTrainer,
     ZOTrainerArguments,
     ZOTrainerModel,
@@ -1006,6 +1007,35 @@ def test_probe_losses_use_hf_compute_loss_func_without_second_forward(
     assert runtime.step_losses == [(3.25, 3.25)]
     assert len(seen) == 2
     assert len(runtime.engine.calls) == 2
+
+
+def test_custom_loss_accepts_generic_logits_output(tmp_path: Path) -> None:
+    trainer = ZOTrainer(
+        model=FakeHFZORuntime(),
+        args=_args(tmp_path, max_steps=1),
+        compute_loss_func=lambda outputs, labels, num_items_in_batch=None: (
+            outputs["logits"].square().mean() + labels.float().mean()
+        ),
+    )
+    outputs = ZOLogitsOutput(
+        logits=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        loss_labels=torch.tensor([0, 1]),
+        timing=ProbeTiming(),
+    )
+
+    loss = trainer._compute_loss_from_outputs(outputs)
+
+    assert loss.item() == pytest.approx(8.0)
+
+
+def test_clean_forward_uses_runtime_effective_lora_slot() -> None:
+    runtime = FakeHFZORuntime()
+    runtime.clean_lora_id_for_score = lambda: runtime.engine.plus_id
+    model = ZOTrainerModel(runtime)
+
+    model(input_ids=[[1, 2, 3]], labels=[[-100, 2, 3]])
+
+    assert runtime.engine.calls[-1]["lora_ids"] == [runtime.engine.plus_id]
 
 
 def test_batched_causal_probe_losses_use_contiguous_request_offsets(

@@ -14,6 +14,7 @@ from .checkpointing import (
 from .modeling import (
     CompactCausalOutput,
     OptionClassificationOutput,
+    ZOLogitsOutput,
     ZOTrainerModel,
     ZOTrainerRuntime,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "ZOCheckpointHandler",
     "ZOCheckpointMetadata",
     "OptionClassificationOutput",
+    "ZOLogitsOutput",
     "VLLMDataCollator",
     "ZOVLLMCheckpointHandler",
     "ZOTrainer",

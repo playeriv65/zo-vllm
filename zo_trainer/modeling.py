@@ -42,6 +42,15 @@ class ZOTrainerRuntime(Protocol):
 
 
 @dataclass
+class ZOLogitsOutput(ModelOutput):
+    """Generic HF-facing logits and aligned labels produced by a ZO runtime."""
+
+    logits: torch.Tensor | None = None
+    loss_labels: torch.Tensor | None = None
+    timing: ProbeTiming | None = None
+
+
+@dataclass
 class CompactCausalOutput(ModelOutput):
     """Compact active-token logits for the Hugging Face causal-LM loss."""
 
@@ -94,20 +103,22 @@ class ZOTrainerModel(nn.Module):
                 hf_prompt_classification_batch_to_token_groups(inputs)
             )
             unpack_s = time.perf_counter() - unpack_t0
+            lora_ids = self._clean_lora_ids(len(token_groups))
             outputs = self._forward_prompt_classification_token_groups(
                 token_groups,
                 option_loss_token_counts=option_loss_token_counts,
                 row_option_counts=row_option_counts,
                 labels=labels,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
         else:
             token_groups, labels = hf_batch_to_token_groups(inputs)
             unpack_s = time.perf_counter() - unpack_t0
+            lora_ids = self._clean_lora_ids(len(token_groups))
             outputs = self._forward_token_groups(
                 token_groups,
                 labels=labels,
-                lora_ids=None,
+                lora_ids=lora_ids,
             )
         if not isinstance(outputs.timing, ProbeTiming):
             raise RuntimeError("ZO model output must include ProbeTiming")
@@ -118,6 +129,15 @@ class ZOTrainerModel(nn.Module):
                 forward_total_s=time.perf_counter() - forward_t0,
             ),
         )
+
+    def _clean_lora_ids(self, request_count: int) -> list[int] | None:
+        clean_lora_id = getattr(self.zo_model, "clean_lora_id_for_score", None)
+        if not callable(clean_lora_id):
+            return None
+        lora_id = clean_lora_id()
+        if lora_id is None:
+            return None
+        return [int(lora_id)] * int(request_count)
 
     def zo_estimate(
         self,

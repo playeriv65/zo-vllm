@@ -245,6 +245,20 @@ class AccumulatedLowRankUpdateState:
             plus_id = self.engine.plus_id
         else:
             plus_id = target_runtime.plus_id
+        clean_directions = self.clean_directions_for_score()
+        if not clean_directions:
+            return None, 0.0
+        t0 = time.perf_counter()
+        target_runtime.update_plus_minus_from_directions(
+            clean_directions,
+            eps=0.0,
+            step=int(step),
+        )
+        return int(plus_id), time.perf_counter() - t0
+
+    def clean_directions_for_score(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Return the effective accumulated update without mutating base weights."""
+
         clean_directions = {}
         for name, acc in self.accumulated_u.items():
             V = self.v_cache.get(name)
@@ -257,15 +271,7 @@ class AccumulatedLowRankUpdateState:
                 "V_T": self.vt_cache.get(name),
                 "v_refreshed": True,
             }
-        if not clean_directions:
-            return None, 0.0
-        t0 = time.perf_counter()
-        target_runtime.update_plus_minus_from_directions(
-            clean_directions,
-            eps=0.0,
-            step=int(step),
-        )
-        return int(plus_id), time.perf_counter() - t0
+        return clean_directions
 
     def snapshot_tensors(
         self,
