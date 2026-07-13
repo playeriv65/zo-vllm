@@ -64,7 +64,7 @@ updates. Existing Phase 3/4 runs keep the default `direction_scale=1.0`.
 
 Record:
 
-- train loss
+- train loss only when measured by an unperturbed training-data forward
 - eval loss and eval accuracy
 - final and best accuracy
 - step time
@@ -95,3 +95,49 @@ and `phase6/results/summary.json`.
 The official MeZO baseline emits intermediate eval loss during training and
 final dev/validation accuracy after training. Intermediate eval accuracy is
 therefore available for vLLM runs, but not for the unmodified MeZO baseline.
+
+## OPT-13B Scope Closure
+
+The OPT-13B/SST-2 closure runs use:
+
+```text
+model=facebook/opt-13b
+task=SST2
+steps=1000
+batch_size=16
+num_train=1000
+num_dev=500
+num_eval=872
+seed=42
+train_set_seed=0
+lr=1e-7
+eps=1e-3
+eval_interval=200
+```
+
+Report labels are:
+
+- `lora_normal`: the ordinary LoRA-compatible attention/MLP scope.
+- `lora_full`: all vLLM LoRA-compatible targets: `lora_normal` plus token
+  embeddings and the tied `lm_head` logits path when the model ties input and
+  output embeddings.
+- `mezo_full`: the third-party MeZO full-parameter baseline.
+
+For tied input/output embeddings, vLLM LoRA must register both `embed_tokens`
+and `lm_head`. `embed_tokens` covers the input lookup path, while `lm_head`
+routes logits through `LogitsProcessorWithLoRA`. Base-weight writeback still
+updates the shared tied embedding matrix once.
+
+| scope | eval loss | final dev acc | final valid acc | artifact |
+|---|---:|---:|---:|---|
+| `mezo_full` / rerun `full` | 0.672852 | 0.650 | 0.661697 | `phase6/results/opt13b_mezo_scope_ablation_20260702_044127_phase6_close` |
+| `skip_pos` | 0.687500 | 0.644 | 0.649083 | `phase6/results/opt13b_mezo_scope_ablation_20260702_044127_phase6_close` |
+| `skip_1d` | 0.691895 | 0.640 | 0.647936 | `phase6/results/opt13b_mezo_scope_ablation_20260702_020625` |
+| `skip_1d_pos` | 0.690918 | 0.646 | 0.646789 | `phase6/results/opt13b_mezo_scope_ablation_20260702_020625` |
+| `vLLM lora_full r512` | 0.678353 | 0.648 | 0.658257 | `phase6/results/opt13b_mezo_embedding_lmhead_20260702_030513_lmhead` |
+| `vLLM lora_full r128` | 0.694339 | 0.644 | 0.654817 | `phase6/results/opt13b_mezo_embedding_lmhead_20260702_030513_lmhead` |
+| `vLLM lora_full r256` | 0.706970 | 0.644 | 0.637615 | `phase6/results/opt13b_mezo_embedding_lmhead_20260702_030513_lmhead` |
+
+The rerun `full` MeZO scope matches the earlier `mezo_full` baseline at the
+reported precision. The best vLLM `lora_full` run is rank 512; it remains close
+but slightly behind `mezo_full`.
