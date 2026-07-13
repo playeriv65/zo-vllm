@@ -26,6 +26,16 @@ from zo_vllm.core.param_metadata import ParamMetadata
 from zo_vllm.core.perturbation_normalization import (
     PERTURBATION_V_ENERGY_REFERENCE_GAUSSIAN,
 )
+from zo_vllm.training.checkpoint_manifest import build_layer_mapping_manifest
+
+
+def _layer_mapping():
+    return build_layer_mapping_manifest(
+        SimpleNamespace(
+            hf_to_vllm_mapping={"layer.weight": "packed.weight"},
+            hf_to_slice={"layer.weight": (0, 2)},
+        )
+    )
 
 
 def test_metric_value_uses_hf_like_eval_prefixes():
@@ -194,6 +204,7 @@ def test_lora_bank_checkpoint_saves_lightweight_payload(tmp_path):
         step=7,
         raw_step=9,
         dtype=torch.float16,
+        layer_mapping=_layer_mapping(),
     )
 
     payload = torch.load(info["lora_payload_path"], map_location="cpu")
@@ -204,6 +215,7 @@ def test_lora_bank_checkpoint_saves_lightweight_payload(tmp_path):
     assert payload["raw_step"] == 9
     assert payload["bank_a"]["layer.weight"].dtype == torch.float16
     assert payload["current_blocks"]["layer.weight"] == {"start": 0, "rank": 2}
+    assert payload["layer_mapping"] == _layer_mapping()
 
 
 def test_lora_bank_checkpoint_loads_into_existing_state(tmp_path):
@@ -224,6 +236,7 @@ def test_lora_bank_checkpoint_loads_into_existing_state(tmp_path):
         accumulated_update_state=state,
         step=11,
         dtype=torch.float32,
+        layer_mapping=_layer_mapping(),
     )
     target = SimpleNamespace(
         update_bank_rank=4,
@@ -242,6 +255,7 @@ def test_lora_bank_checkpoint_loads_into_existing_state(tmp_path):
         str(tmp_path),
         accumulated_update_state=target,
         device="cpu",
+        expected_layer_mapping=_layer_mapping(),
     )
 
     assert info["step"] == 11
@@ -258,6 +272,56 @@ def test_lora_bank_checkpoint_loads_into_existing_state(tmp_path):
     assert target.used_rank["layer.weight"] == 2
     assert target.current_blocks["layer.weight"].start == 0
     assert target.current_blocks["layer.weight"].rank == 2
+
+
+def test_lora_bank_checkpoint_rejects_mapping_before_mutation(tmp_path):
+    state = SimpleNamespace(
+        update_bank_rank=4,
+        u_beta=1.0,
+        u_norm_cap=None,
+        gradient_accumulation_update_steps=0,
+        bank_a={"layer.weight": torch.ones(2, 3)},
+        accumulated_u={"layer.weight": torch.ones(4, 2)},
+        pending_u={},
+        used_rank={"layer.weight": 2},
+        current_blocks={"layer.weight": SimpleNamespace(start=0, rank=2)},
+        flush_pending_to_accumulated=lambda *, step: 0.0,
+    )
+    save_lora_bank_checkpoint(
+        checkpoint_dir=str(tmp_path),
+        accumulated_update_state=state,
+        step=1,
+        layer_mapping=_layer_mapping(),
+    )
+    sentinel = torch.full((1, 1), 7.0)
+    target = SimpleNamespace(
+        update_bank_rank=4,
+        u_beta=1.0,
+        u_norm_cap=None,
+        gradient_accumulation_update_steps=0,
+        bank_a={"sentinel": sentinel},
+        accumulated_u={},
+        pending_u={},
+        zero_u={},
+        used_rank={},
+        current_blocks={},
+    )
+    mismatched = build_layer_mapping_manifest(
+        SimpleNamespace(
+            hf_to_vllm_mapping={"layer.weight": "packed.weight"},
+            hf_to_slice={"layer.weight": (0, 1)},
+        )
+    )
+
+    with pytest.raises(ValueError, match="layer mapping does not match"):
+        load_lora_bank_checkpoint(
+            str(tmp_path),
+            accumulated_update_state=target,
+            device="cpu",
+            expected_layer_mapping=mismatched,
+        )
+
+    assert target.bank_a == {"sentinel": sentinel}
 
 
 def test_zo_trainer_state_roundtrip_and_merge(tmp_path):

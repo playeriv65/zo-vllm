@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 import shutil
 from typing import Any, Mapping
@@ -11,6 +12,7 @@ import torch
 
 from zo_vllm.core.weight_sync import WeightSync
 from zo_vllm.training import lora_checkpoint
+from zo_vllm.training.checkpoint_manifest import build_layer_mapping_manifest
 from zo_vllm.training.native_checkpoint import save_effective_native_checkpoint
 from zo_vllm.experiment.runners.checkpoint_policy import BestMetricTracker
 from zo_vllm.experiment.runners.trainer_state import (
@@ -61,6 +63,20 @@ def write_checkpoint_metadata(
     with open(metadata_path, "w", encoding="utf-8") as handle:
         handle.write(json_dumps(jsonable(dict(metadata))))
     return metadata_path
+
+
+def read_checkpoint_metadata(path: str | os.PathLike[str]) -> dict[str, Any]:
+    path_s = str(path)
+    metadata_path = (
+        os.path.join(path_s, "zo_checkpoint_metadata.json")
+        if os.path.isdir(path_s)
+        else path_s
+    )
+    with open(metadata_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise TypeError("checkpoint metadata must be a JSON object")
+    return payload
 
 
 class RuntimeCheckpointManager:
@@ -126,6 +142,7 @@ class RuntimeCheckpointManager:
             "direct_update_mode": self.args.direct_update_mode,
             "quantized_update_mode": self.args.quantized_update_mode,
             "timestamp": datetime.now().isoformat(),
+            "layer_mapping": build_layer_mapping_manifest(self.weight_sync),
         }
         if self.checkpoint_mode == "native":
             ckpt_path = checkpoint_path or os.path.join(
@@ -160,6 +177,7 @@ class RuntimeCheckpointManager:
                     if self.args.u_snapshot_dtype == "float16"
                     else torch.float32
                 ),
+                layer_mapping=metadata["layer_mapping"],
             )
             metadata |= save_info
             metadata["loadable"] = True

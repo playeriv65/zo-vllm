@@ -35,6 +35,7 @@ from zo_vllm.experiment.runners.checkpoint_policy import (
     resolve_runtime_checkpoint_settings,
 )
 from zo_vllm.experiment.runners.checkpointing import (
+    read_checkpoint_metadata,
     RuntimeCheckpointManager,
 )
 from zo_vllm.training.native_checkpoint import (
@@ -44,6 +45,10 @@ from zo_vllm.training.native_checkpoint import (
 from zo_vllm.training.lora_checkpoint import (
     load_lora_bank_checkpoint,
     restore_direction_provider_v_cache_from_lora_bank,
+)
+from zo_vllm.training.checkpoint_manifest import (
+    build_layer_mapping_manifest,
+    validate_layer_mapping_manifest,
 )
 from zo_vllm.experiment.runners.intervals import resolve_runner_intervals
 from zo_vllm.experiment.runners.trainer_state import (
@@ -535,6 +540,7 @@ def main():
                 args.resume_lora_checkpoint,
                 accumulated_update_state=accumulated_update_state,
                 device=resume_device,
+                expected_layer_mapping=build_layer_mapping_manifest(weight_sync),
             )
             print(
                 f"[vLLM] resume_lora_checkpoint={args.resume_lora_checkpoint} "
@@ -1143,6 +1149,14 @@ def main():
                 f"best_record={best_tracker.best_record}"
             )
         best_checkpoint_path = str(best_checkpoint["path"])
+        best_metadata = read_checkpoint_metadata(best_checkpoint_path)
+        recorded_mapping = best_metadata.get("layer_mapping")
+        if not isinstance(recorded_mapping, dict):
+            raise ValueError("best native checkpoint is missing layer_mapping")
+        validate_layer_mapping_manifest(
+            recorded_mapping,
+            build_layer_mapping_manifest(weight_sync),
+        )
         load_results = load_native_checkpoint_into_workers(llm, best_checkpoint_path)
         clear_update_state_for_loaded_checkpoint(accumulated_update_state)
         loaded_best_checkpoint = dict(best_tracker.best_record) | {

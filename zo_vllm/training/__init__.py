@@ -2,6 +2,14 @@
 
 from zo_vllm.config import VLLMZOConfig
 
+from .artifacts import (
+    TrainingArtifact,
+    inspect_training_artifact,
+    native_checkpoint_model_kwargs,
+    require_native_checkpoint,
+    validate_checkpoint_layer_mapping,
+)
+
 from .arguments import ZOTrainingArguments
 from .direction import (
     AGZODirectionProvider,
@@ -83,6 +91,7 @@ __all__ = [
     "RolloutProbeBatch",
     "SubspaceTokenProbeBatch",
     "TokenProbeBatch",
+    "TrainingArtifact",
     "SingleDirectionAntitheticEstimator",
     "SubspaceQueue",
     "UAGZODirectionProvider",
@@ -111,6 +120,10 @@ __all__ = [
     "build_objective_batch",
     "build_tokenizer",
     "collect_per_row_coefficients",
+    "inspect_training_artifact",
+    "native_checkpoint_model_kwargs",
+    "require_native_checkpoint",
+    "validate_checkpoint_layer_mapping",
     "score_clean_objective",
     "score_plus_minus_objective",
 ]

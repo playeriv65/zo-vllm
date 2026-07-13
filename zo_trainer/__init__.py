@@ -1,6 +1,7 @@
 """Hugging Face Trainer integration for ZO-vLLM."""
 
 from .arguments import ZOTrainerArguments
+from .callbacks import ZOUSnapshotCallback
 from .checkpointing import (
     ZO_CHECKPOINT_METADATA_NAME,
     ZO_CHECKPOINT_METADATA_VERSION,
@@ -41,6 +42,7 @@ __all__ = [
     "ZOTrainerArguments",
     "ZOTrainerModel",
     "ZOTrainerRuntime",
+    "ZOUSnapshotCallback",
     "ZOSGDOptimizer",
     "build_causal_lm_preprocess",
     "build_target_lm_preprocess",

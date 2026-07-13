@@ -9,24 +9,104 @@ from typing import Any, Mapping
 
 import torch
 
-from zo_vllm.core.weight_sync import WeightSync, apply_lowrank_update_to_weight_
+from zo_vllm.core.weight_sync import (
+    WeightSync,
+    apply_embedding_lowrank_update_to_weight_,
+    apply_lowrank_update_to_weight_,
+)
+
+
+DEFAULT_MAX_SHARD_BYTES = 4 * 1024**3
+
+
+def _apply_effective_direction_to_target_(
+    target: torch.Tensor,
+    *,
+    hf_name: str,
+    raw_direction: Mapping[str, torch.Tensor],
+    precision: str,
+) -> None:
+    """Materialize one accumulated HF direction into a checkpoint tensor."""
+
+    direction = dict(raw_direction)
+    U = direction.get("U_accum")
+    if U is None:
+        U = direction["U"]
+    V = direction["V"]
+    apply_update = (
+        apply_embedding_lowrank_update_to_weight_
+        if "embed_tokens" in hf_name or hf_name == "lm_head.weight"
+        else apply_lowrank_update_to_weight_
+    )
+    apply_update(
+        target,
+        U.to(device="cpu", non_blocking=False),
+        V.to(device="cpu", non_blocking=False),
+        c=-1.0,
+        lr=1.0,
+        weight_decay=0.0,
+        precision=precision,
+        direction_scale=1.0,
+    )
+
+
+def normalize_native_checkpoint_key(key: str) -> str:
+    """Map runtime wrapper state keys back to base-model state keys."""
+
+    return key.replace(".linear_method.base_layer.", ".").replace(".base_layer.", ".")
+
+
+def normalize_native_checkpoint_state(
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Remove runtime-only wrapper names from a native checkpoint state dict."""
+
+    normalized: dict[str, torch.Tensor] = {}
+    source_keys: dict[str, str] = {}
+    for source_key, tensor in state_dict.items():
+        target_key = normalize_native_checkpoint_key(source_key)
+        previous = normalized.get(target_key)
+        if previous is not None:
+            same_storage = (
+                previous.device == tensor.device
+                and previous.data_ptr() == tensor.data_ptr()
+            )
+            if not same_storage:
+                raise RuntimeError(
+                    "native checkpoint key normalization collision: "
+                    f"{source_keys[target_key]!r} and {source_key!r} both map to "
+                    f"{target_key!r}"
+                )
+            continue
+        normalized[target_key] = tensor
+        source_keys[target_key] = source_key
+    return normalized
 
 
 def save_sharded_state(llm: Any, checkpoint_dir: str) -> None:
+    """Save base-model-compatible shards without runtime wrapper key names."""
+
     os.makedirs(checkpoint_dir, exist_ok=True)
-    save_sharded_state_fn = getattr(llm.llm_engine, "save_sharded_state", None)
-    if callable(save_sharded_state_fn):
-        save_sharded_state_fn(checkpoint_dir)
-        return
-    model_executor = getattr(llm.llm_engine, "model_executor", None)
-    executor_save = getattr(model_executor, "save_sharded_state", None)
-    if callable(executor_save):
-        executor_save(checkpoint_dir)
-        return
-    llm.collective_rpc(
-        "save_sharded_state",
-        kwargs={"path": checkpoint_dir, "pattern": None, "max_size": None},
-    )
+    checkpoint_path = str(checkpoint_dir)
+
+    def save_on_worker(worker):
+        from safetensors.torch import save_file
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.model_executor.model_loader import ShardedStateLoader
+
+        model = worker.model_runner.model
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        state_dict = normalize_native_checkpoint_state(state_dict)
+        rank = get_tensor_model_parallel_rank()
+        result = _save_tensor_parts(
+            state_dict,
+            checkpoint_path=checkpoint_path,
+            rank=int(rank),
+            save_file=save_file,
+        )
+        return {"rank": int(rank), **result}
+
+    llm.collective_rpc(save_on_worker)
 
 
 def save_effective_native_checkpoint(
@@ -97,39 +177,85 @@ def load_native_checkpoint_into_workers(llm: Any, checkpoint_dir: str) -> list[A
 
     checkpoint_path = str(checkpoint_dir)
 
-    def load_on_worker(worker):
-        from safetensors.torch import load_file
+    def live_state_and_paths(worker):
         from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.model_executor.model_loader import ShardedStateLoader
 
         model = worker.model_runner.model
-        state_dict = model.state_dict()
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        state_dict = normalize_native_checkpoint_state(state_dict)
         rank = get_tensor_model_parallel_rank()
-        loaded = 0
-        skipped = []
         rank_pattern = f"model-rank-{rank}-part-*.safetensors"
         paths = sorted(Path(checkpoint_path).glob(rank_pattern))
         if not paths:
-            paths = sorted(Path(checkpoint_path).glob("*.safetensors"))
+            raise FileNotFoundError(
+                f"native checkpoint has no shards for tensor-parallel rank {rank}: "
+                f"{checkpoint_path}"
+            )
+        return state_dict, paths
+
+    def validate_on_worker(worker):
+        from safetensors import safe_open
+
+        state_dict, paths = live_state_and_paths(worker)
+        checkpoint_shapes: dict[str, tuple[int, ...]] = {}
+        for path in paths:
+            with safe_open(str(path), framework="pt", device="cpu") as shard:
+                for key in shard.keys():
+                    if key in checkpoint_shapes:
+                        raise RuntimeError(
+                            f"duplicate tensor {key!r} across native checkpoint shards"
+                        )
+                    checkpoint_shapes[key] = tuple(shard.get_slice(key).get_shape())
+        expected_keys = set(state_dict)
+        checkpoint_keys = set(checkpoint_shapes)
+        missing = sorted(expected_keys - checkpoint_keys)
+        unexpected = sorted(checkpoint_keys - expected_keys)
+        shape_mismatches = sorted(
+            key
+            for key in expected_keys & checkpoint_keys
+            if tuple(state_dict[key].shape) != checkpoint_shapes[key]
+        )
+        if missing or unexpected or shape_mismatches:
+            raise RuntimeError(
+                "native checkpoint does not exactly match the live model: "
+                f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
+                f"shape_mismatches={shape_mismatches[:5]}"
+            )
+        return {
+            "validated_tensors": int(len(state_dict)),
+            "num_parts": int(len(paths)),
+        }
+
+    def load_on_worker(worker):
+        from safetensors.torch import load_file
+
+        state_dict, paths = live_state_and_paths(worker)
+        loaded = 0
         for path in paths:
             shard = load_file(str(path), device="cpu")
             for key, tensor in shard.items():
                 target = state_dict.get(key)
-                if target is None:
-                    skipped.append(key)
-                    continue
-                if tuple(target.shape) != tuple(tensor.shape):
-                    skipped.append(key)
-                    continue
+                if target is None or tuple(target.shape) != tuple(tensor.shape):
+                    raise RuntimeError(
+                        "native checkpoint changed after validation: "
+                        f"incompatible tensor {key!r}"
+                    )
                 target.copy_(tensor.to(device=target.device, dtype=target.dtype))
                 loaded += 1
+        if loaded != len(state_dict):
+            raise RuntimeError(
+                "native checkpoint changed after validation: "
+                f"loaded {loaded} of {len(state_dict)} tensors"
+            )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return {
             "loaded_tensors": int(loaded),
-            "skipped_tensors": int(len(skipped)),
-            "first_skipped": skipped[:5],
+            "num_parts": int(len(paths)),
         }
 
+    llm.collective_rpc(validate_on_worker)
     return llm.collective_rpc(load_on_worker)
 
 
@@ -212,28 +338,9 @@ def _save_lora_bank_effective_state_without_mutation(
                 (hf_name, vllm_name, raw_direction)
             )
 
-        max_shard_bytes = int(
-            os.environ.get(
-                "VLLM_ZO_CHECKPOINT_MAX_CPU_SHARD_BYTES",
-                str(4 * 1024**3),
-            )
-        )
-
         rank = get_tensor_model_parallel_rank()
-        part_idx = 0
-        part_bytes = 0
-        state_dict_part: dict[str, torch.Tensor] = {}
+        materialized_state: dict[str, torch.Tensor] = {}
         num_materialized_tensors = 0
-
-        def flush_part() -> None:
-            nonlocal part_idx, part_bytes, state_dict_part
-            if not state_dict_part:
-                return
-            filename = f"model-rank-{rank}-part-{part_idx}.safetensors"
-            save_file(state_dict_part, os.path.join(checkpoint_path, filename))
-            part_idx += 1
-            part_bytes = 0
-            state_dict_part = {}
 
         for key, tensor in state_dict.items():
             tensor_cpu = tensor.detach().to(device="cpu", copy=True)
@@ -255,39 +362,74 @@ def _save_lora_bank_effective_state_without_mutation(
                         target = target[2 * hidden_size : 3 * hidden_size, :]
                     else:
                         raise ValueError(f"Unknown packed qkv projection: {hf_name}")
-                direction = dict(raw_direction)
-                U = direction.get("U_accum")
-                if U is None:
-                    U = direction["U"]
-                V = direction["V"]
-                apply_lowrank_update_to_weight_(
+                _apply_effective_direction_to_target_(
                     target,
-                    U.to(device="cpu", non_blocking=False),
-                    V.to(device="cpu", non_blocking=False),
-                    c=-1.0,
-                    lr=1.0,
-                    weight_decay=0.0,
+                    hf_name=hf_name,
+                    raw_direction=raw_direction,
                     precision=precision,
-                    direction_scale=1.0,
                 )
-            tensor_bytes = tensor_cpu.nelement() * tensor_cpu.element_size()
-            if (
-                max_shard_bytes > 0
-                and state_dict_part
-                and part_bytes + tensor_bytes > max_shard_bytes
-            ):
-                flush_part()
-            state_dict_part[key] = tensor_cpu
-            part_bytes += tensor_bytes
-        flush_part()
+            checkpoint_key = normalize_native_checkpoint_key(key)
+            if checkpoint_key in materialized_state:
+                raise RuntimeError(
+                    f"native checkpoint key normalization collision: {checkpoint_key!r}"
+                )
+            materialized_state[checkpoint_key] = tensor_cpu
+        save_result = _save_tensor_parts(
+            materialized_state,
+            checkpoint_path=checkpoint_path,
+            rank=int(rank),
+            save_file=save_file,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return {
             "rank": int(rank),
             "num_directions": int(len(directions)),
             "num_materialized_tensors": int(num_materialized_tensors),
-            "num_parts": int(part_idx),
-            "max_cpu_shard_bytes": int(max_shard_bytes),
+            **save_result,
         }
 
     return llm.collective_rpc(save_on_worker)
+
+
+def _save_tensor_parts(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    checkpoint_path: str,
+    rank: int,
+    save_file: Any,
+) -> dict[str, int]:
+    max_shard_bytes = int(
+        os.environ.get(
+            "VLLM_ZO_CHECKPOINT_MAX_CPU_SHARD_BYTES",
+            str(DEFAULT_MAX_SHARD_BYTES),
+        )
+    )
+    if max_shard_bytes <= 0:
+        raise ValueError("VLLM_ZO_CHECKPOINT_MAX_CPU_SHARD_BYTES must be positive")
+    part: dict[str, torch.Tensor] = {}
+    part_bytes = 0
+    part_index = 0
+
+    def flush() -> None:
+        nonlocal part, part_bytes, part_index
+        if not part:
+            return
+        filename = f"model-rank-{rank}-part-{part_index}.safetensors"
+        save_file(part, os.path.join(checkpoint_path, filename))
+        part = {}
+        part_bytes = 0
+        part_index += 1
+
+    for key, tensor in state_dict.items():
+        tensor_bytes = tensor.nelement() * tensor.element_size()
+        if part and part_bytes + tensor_bytes > max_shard_bytes:
+            flush()
+        part[key] = tensor
+        part_bytes += tensor_bytes
+    flush()
+    return {
+        "num_tensors": int(len(state_dict)),
+        "num_parts": int(part_index),
+        "max_cpu_shard_bytes": int(max_shard_bytes),
+    }

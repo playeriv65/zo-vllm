@@ -146,6 +146,17 @@ class TinyTokenizer:
         return (str(path),)
 
 
+def _fake_weight_sync() -> SimpleNamespace:
+    return SimpleNamespace(
+        hf_to_vllm_mapping={
+            "model.layers.0.self_attn.q_proj.weight": (
+                "model.layers.0.self_attn.qkv_proj.weight"
+            )
+        },
+        hf_to_slice={"model.layers.0.self_attn.q_proj.weight": (0, 8)},
+    )
+
+
 class CountingTokenizer(TinyTokenizer):
     def __init__(self) -> None:
         self.encode_calls = 0
@@ -1344,6 +1355,7 @@ def test_real_checkpoint_handler_writes_one_payload_with_global_step(
         checkpoint_handler=ZOVLLMCheckpointHandler(
             checkpoint_mode="lora",
             update_state=object(),
+            weight_sync=_fake_weight_sync(),
         ),
         args=_args(
             tmp_path,
@@ -1364,6 +1376,11 @@ def test_real_checkpoint_handler_writes_one_payload_with_global_step(
     metadata = read_zo_checkpoint_metadata(tmp_path / "checkpoint-1")
     assert metadata["global_step"] == 1
     assert metadata["payload"]["step"] == 1
+    layer_mapping = metadata["payload"]["runtime_manifest"]["layer_mapping"]
+    assert layer_mapping["hf_to_slice"] == {
+        "model.layers.0.self_attn.q_proj.weight": [0, 8]
+    }
+    assert len(layer_mapping["fingerprint"]) == 64
 
 
 def test_native_checkpoint_ignores_immediate_update_state(
@@ -1383,9 +1400,8 @@ def test_native_checkpoint_ignores_immediate_update_state(
     handler = ZOVLLMCheckpointHandler(
         checkpoint_mode="native",
         llm=object(),
-        weight_sync=object(),
+        weight_sync=_fake_weight_sync(),
         update_state=object(),
-        use_lora_bank_update=False,
     )
 
     payload = handler.save_checkpoint(
@@ -1397,6 +1413,31 @@ def test_native_checkpoint_ignores_immediate_update_state(
 
     assert calls[0]["accumulated_update_state"] is None
     assert payload["loadable"] is True
+
+
+def test_native_checkpoint_detects_accumulated_update_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    accumulated = SimpleNamespace(clean_directions_for_score=lambda: {})
+    monkeypatch.setattr(
+        "zo_trainer.runtime.save_effective_native_checkpoint",
+        lambda **kwargs: calls.append(dict(kwargs)) or {"num_parts": 1},
+    )
+    handler = ZOVLLMCheckpointHandler(
+        checkpoint_mode="native",
+        llm=object(),
+        weight_sync=_fake_weight_sync(),
+        update_state=accumulated,
+    )
+
+    handler.save_checkpoint(
+        str(tmp_path), step=1, metrics=None, reason="checkpoint"
+    )
+
+    assert calls[0]["accumulated_update_state"] is accumulated
+    assert calls[0]["use_lora_bank_update"] is True
 
 
 def test_zo_trainer_save_model_writes_hf_artifacts(tmp_path: Path) -> None:

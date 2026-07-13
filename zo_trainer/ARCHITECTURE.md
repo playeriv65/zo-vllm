@@ -178,8 +178,22 @@ HF therefore owns scheduler type, warmup, stepping, checkpoint save, and
 checkpoint restore. `zo_applied_learning_rate` reports the value used for the
 current ZO update. Transformers records its standard `learning_rate` before
 advancing the scheduler, so it has the same current-step value. The lower-level
-non-HF `VLLMZOModel.step()` entry point still consumes a pending estimate
-immediately with its standalone scheduler.
+runtime objects expose estimation only; callers must stage the returned
+`ZOPendingStep` in an optimizer rather than applying an update through the
+model or stepper.
+
+Every loadable native or LoRA-bank checkpoint records the complete
+`hf_to_vllm_mapping`, packed `hf_to_slice` mapping, and a deterministic
+fingerprint. Resume compares that manifest with the current `WeightSync` before
+loading tensors. Model names and target-module lists are provenance, not a
+substitute for the exact mapping.
+
+Native checkpoints use bounded per-rank safetensor parts. Live reload validates
+the complete shard set, tensor keys, and tensor shapes before copying the first
+model tensor. Checkpoint scope fields remain descriptive provenance; model
+loading never turns them into implicit runtime configuration. Generic HF
+callbacks depend only on injected observation protocols, not experiment runner
+implementations.
 
 Only exact ZO-SGD is currently supported. `optim` must be `sgd`, autograd
 gradient clipping is disabled, and HF gradient accumulation remains restricted

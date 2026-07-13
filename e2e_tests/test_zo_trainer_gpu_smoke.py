@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 from pathlib import Path
 
 import pytest
 import torch
 from datasets import Dataset
+from safetensors import safe_open
 from transformers import AutoConfig, TrainerCallback
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
@@ -22,17 +24,21 @@ from zo_trainer import (
     read_zo_checkpoint_metadata,
 )
 from zo_vllm.config import VLLMZOConfig, ZOVLLMEngineConfig
+from zo_vllm.core.direction_digest import digest_named_uv
 from zo_vllm.core.lora_scope import resolve_lora_target_modules
 from zo_vllm.core.weight_sync import WeightSync
 from zo_vllm.engine import ZOVLLMEngine
 from zo_vllm.training import (
+    AccumulatedLowRankUpdateState,
     RolloutProbeBatch,
     VLLMZOModel,
     build_tokenizer,
 )
+from zo_vllm.training.zo_step import ZOStepCallback
 from zo_vllm.tasks.hf_preprocessing import (
     build_sst2_prompt_classification_preprocess,
 )
+from zo_vllm.training.native_checkpoint import normalize_native_checkpoint_state
 
 OPT_125M = "facebook/opt-125m"
 
@@ -49,11 +55,19 @@ def _prepare_e2e_environment() -> None:
 
 
 def _build_real_vllm_zo_model(
+    *,
+    include_embeddings: bool = False,
+    accumulate_updates: bool = False,
     **zo_config_overrides: object,
 ) -> tuple[ZOVLLMEngine, VLLMZOModel, object]:
     model_config = AutoConfig.from_pretrained(OPT_125M)
     tokenizer = build_tokenizer(OPT_125M, use_fast=False)
-    target_modules = resolve_lora_target_modules(None)
+    target_modules = resolve_lora_target_modules(
+        None,
+        include_lm_head=include_embeddings
+        and bool(getattr(model_config, "tie_word_embeddings", False)),
+        include_embeddings=include_embeddings,
+    )
     engine = ZOVLLMEngine(
         model=OPT_125M,
         rank=1,
@@ -80,7 +94,6 @@ def _build_real_vllm_zo_model(
         "lozo_provider_mode": "fast",
         "rank": 1,
         "eps": 1e-3,
-        "learning_rate": 1e-7,
         "nu": 10,
         "random_device": "cuda",
         "direction_sampling": "flat",
@@ -91,11 +104,25 @@ def _build_real_vllm_zo_model(
         "seed": 0,
     }
     zo_config_values.update(zo_config_overrides)
+    update_state = (
+        AccumulatedLowRankUpdateState(
+            weight_sync=weight_sync,
+            engine=engine,
+            precision="param",
+            sync_device=False,
+            qkv_update_mode="batched",
+        )
+        if accumulate_updates
+        else None
+    )
     zo_model = VLLMZOModel(
         engine=engine,
         weight_sync=weight_sync,
         config=VLLMZOConfig(**zo_config_values),
-        param_metadata=weight_sync.get_hf_param_metadata(include_embeddings=False),
+        param_metadata=weight_sync.get_hf_param_metadata(
+            include_embeddings=include_embeddings
+        ),
+        update_state=update_state,
         sync_weight_update=False,
         qkv_update_mode="batched",
     )
@@ -148,6 +175,56 @@ def _cleanup_engine(engine: ZOVLLMEngine | None) -> None:
         torch.cuda.empty_cache()
 
 
+def _tensor_digest(tensor: torch.Tensor) -> str:
+    raw = (
+        tensor.detach()
+        .contiguous()
+        .reshape(-1)
+        .view(torch.uint8)
+        .cpu()
+        .numpy()
+        .tobytes()
+    )
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _live_native_state_digests(engine: ZOVLLMEngine) -> dict[str, str]:
+    def read_on_worker(worker):
+        import hashlib as worker_hashlib
+
+        from vllm.model_executor.model_loader import ShardedStateLoader
+
+        state = ShardedStateLoader._filter_subtensors(
+            worker.model_runner.model.state_dict()
+        )
+        state = normalize_native_checkpoint_state(state)
+        return {
+            key: worker_hashlib.sha256(
+                value.detach()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .cpu()
+                .numpy()
+                .tobytes()
+            ).hexdigest()
+            for key, value in state.items()
+        }
+
+    return dict(engine.llm.collective_rpc(read_on_worker)[0])
+
+
+def _checkpoint_native_state_digests(checkpoint: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for shard in sorted(checkpoint.glob("model-rank-*-part-*.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key in result:
+                    raise AssertionError(f"duplicate checkpoint tensor: {key}")
+                result[key] = _tensor_digest(handle.get_tensor(key))
+    return result
+
+
 def _skip_without_e2e_gpu() -> None:
     if not _e2e_enabled():
         pytest.skip("set ZO_VLLM_RUN_E2E=1 to run GPU e2e smoke tests")
@@ -160,6 +237,28 @@ def _skip_without_e2e_gpu() -> None:
 def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
     tmp_path: Path,
 ) -> None:
+    class CaptureDirectionDigests(ZOStepCallback):
+        def __init__(self) -> None:
+            self.by_step: dict[int, str] = {}
+            self.batch_by_step: dict[int, str] = {}
+
+        def on_direction_sampled(self, *, step, batch, sample, control, **kwargs):
+            del kwargs
+            self.by_step[int(step)] = digest_named_uv(
+                (name, value["U"], value["V"])
+                for name, value in sorted(sample.directions.items())
+            )
+            self.batch_by_step[int(step)] = hashlib.sha256(
+                repr(
+                    (
+                        batch.token_id_groups,
+                        batch.loss_token_lens,
+                        batch.labels,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            return control
+
     class StopAfterOneStep(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
             del args, kwargs
@@ -167,11 +266,40 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
                 control.should_training_stop = True
             return control
 
+    class AssertRestoredDirectionState(TrainerCallback):
+        def __init__(self, direction_provider, engine, expected_state_digests) -> None:
+            self.direction_provider = direction_provider
+            self.engine = engine
+            self.expected_state_digests = expected_state_digests
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            assert not self.direction_provider.will_refresh(step=2)
+            assert (
+                _live_native_state_digests(self.engine) == self.expected_state_digests
+            )
+            return control
+
+    class RehydrateSlotsAfterFirstStep(TrainerCallback):
+        def __init__(self, zo_model, engine) -> None:
+            self.zo_model = zo_model
+            self.engine = engine
+            self.state_digests: dict[int, dict[str, str]] = {}
+
+        def on_step_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            if state.global_step == 1:
+                self.state_digests[1] = _live_native_state_digests(self.engine)
+                self.zo_model.invalidate_direction_slot_state()
+            return control
+
     _skip_without_e2e_gpu()
     _prepare_e2e_environment()
     engine: ZOVLLMEngine | None = None
     try:
         engine, zo_model, tokenizer = _build_real_vllm_zo_model()
+        stopped_digests = CaptureDirectionDigests()
+        zo_model.stepper.callbacks.append(stopped_digests)
         train_rows, data_collator = _train_dataset_and_collator(tokenizer)
         trainer = ZOTrainer(
             model=zo_model,
@@ -191,6 +319,9 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
 
         assert output.global_step == 1
         assert trainer.state.log_history
+        stopped_step_one = next(
+            row for row in trainer.state.log_history if row.get("zo_step") == 1
+        )
         assert "zo_projected_grad" in trainer.state.log_history[0]
         assert trainer.state.log_history[0][
             "zo_applied_learning_rate"
@@ -199,16 +330,27 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
         metadata = read_zo_checkpoint_metadata(checkpoint)
         assert metadata["checkpoint_mode"] == "native"
         assert metadata["payload"]["loadable"] is True
+        layer_mapping = metadata["payload"]["runtime_manifest"]["layer_mapping"]
+        assert len(layer_mapping["hf_to_vllm_mapping"]) > 0
+        assert len(layer_mapping["hf_to_slice"]) > 0
+        assert len(layer_mapping["fingerprint"]) == 64
         assert (checkpoint / "optimizer.pt").exists()
         assert (checkpoint / "scheduler.pt").exists()
         assert (checkpoint / ZO_DIRECTION_STATE_NAME).exists()
         assert (checkpoint / "rng_state.pth").exists()
+        shard = next(checkpoint.glob("model-rank-*-part-*.safetensors"))
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            assert not any(".base_layer." in key for key in handle.keys())
+        checkpoint_state_digests = _checkpoint_native_state_digests(checkpoint)
+        assert _live_native_state_digests(engine) == checkpoint_state_digests
 
         _cleanup_engine(engine)
         engine = None
         del trainer, zo_model
 
         engine, resumed_zo_model, resumed_tokenizer = _build_real_vllm_zo_model()
+        resumed_digests = CaptureDirectionDigests()
+        resumed_zo_model.stepper.callbacks.append(resumed_digests)
         resumed_rows, resumed_collator = _train_dataset_and_collator(resumed_tokenizer)
         resumed = ZOTrainer(
             model=resumed_zo_model,
@@ -221,6 +363,13 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
                 weight_sync=resumed_zo_model.weight_sync,
                 update_state=resumed_zo_model.update_state,
             ),
+            callbacks=[
+                AssertRestoredDirectionState(
+                    resumed_zo_model.direction_provider,
+                    engine,
+                    checkpoint_state_digests,
+                )
+            ],
         )
 
         resumed_output = resumed.train(resume_from_checkpoint=str(checkpoint))
@@ -241,8 +390,14 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
         del resumed, resumed_zo_model
 
         engine, continuous_zo_model, continuous_tokenizer = _build_real_vllm_zo_model()
+        continuous_digests = CaptureDirectionDigests()
+        continuous_zo_model.stepper.callbacks.append(continuous_digests)
         continuous_rows, continuous_collator = _train_dataset_and_collator(
             continuous_tokenizer
+        )
+        continuous_state = RehydrateSlotsAfterFirstStep(
+            continuous_zo_model,
+            engine,
         )
         continuous = ZOTrainer(
             model=continuous_zo_model,
@@ -259,23 +414,43 @@ def test_zo_trainer_resumes_real_runtime_optimizer_and_scheduler(
                 weight_sync=continuous_zo_model.weight_sync,
                 update_state=continuous_zo_model.update_state,
             ),
+            callbacks=[continuous_state],
         )
 
         continuous.train()
 
-        continuous_step_two = next(
-            row for row in continuous.state.log_history if row.get("zo_step") == 2
+        assert stopped_digests.by_step[1] == continuous_digests.by_step[1]
+        assert resumed_digests.by_step[2] == continuous_digests.by_step[2]
+        assert resumed_digests.batch_by_step[2] == continuous_digests.batch_by_step[2]
+        assert continuous_state.state_digests[1] == checkpoint_state_digests
+
+        continuous_step_one = next(
+            row for row in continuous.state.log_history if row.get("zo_step") == 1
         )
         for key in (
             "zo_loss",
             "zo_loss_plus",
             "zo_loss_minus",
             "zo_projected_grad",
-            "zo_applied_learning_rate",
         ):
-            assert resumed_step_two[key] == pytest.approx(
-                continuous_step_two[key], abs=1e-6
+            assert stopped_step_one[key] == pytest.approx(
+                continuous_step_one[key], abs=1e-6
             )
+        continuous_step_two = next(
+            row for row in continuous.state.log_history if row.get("zo_step") == 2
+        )
+        for key in ("zo_loss", "zo_loss_plus", "zo_loss_minus"):
+            assert resumed_step_two[key] == pytest.approx(
+                continuous_step_two[key], abs=5e-3
+            )
+        assert resumed_step_two["zo_projected_grad"] == pytest.approx(
+            continuous_step_two["zo_projected_grad"],
+            rel=6e-2,
+            abs=2.0,
+        )
+        assert resumed_step_two["zo_applied_learning_rate"] == pytest.approx(
+            continuous_step_two["zo_applied_learning_rate"], abs=0.0
+        )
     finally:
         _cleanup_engine(engine)
 

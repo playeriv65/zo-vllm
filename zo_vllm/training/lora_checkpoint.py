@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 import torch
 
+from .checkpoint_manifest import validate_layer_mapping_manifest
+
 from zo_vllm.core.perturbation_normalization import (
     attach_factorized_perturbation_spec_,
     v_energy_reference_for_direction_provider,
@@ -88,6 +90,7 @@ def save_lora_bank_checkpoint(
     step: int,
     raw_step: int | None = None,
     dtype: torch.dtype = torch.float16,
+    layer_mapping: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Save only LoRA bank state for resumable lightweight checkpoints."""
 
@@ -119,6 +122,7 @@ def save_lora_bank_checkpoint(
         "gradient_accumulation_update_steps": int(
             accumulated_update_state.gradient_accumulation_update_steps
         ),
+        "layer_mapping": dict(layer_mapping),
         "bank_a": _cpu_tensor_dict(bank_a, dtype=dtype),
         "accumulated_u": _cpu_tensor_dict(accumulated_u, dtype=dtype),
         "pending_u": _cpu_tensor_dict(pending_u, dtype=dtype),
@@ -148,6 +152,7 @@ def load_lora_bank_checkpoint(
     *,
     accumulated_update_state: Any,
     device: torch.device | str,
+    expected_layer_mapping: Mapping[str, Any],
     dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Load a lightweight LoRA bank checkpoint into an existing bank state."""
@@ -158,6 +163,10 @@ def load_lora_bank_checkpoint(
         raise ValueError(
             f"not a vLLM ZO LoRA bank checkpoint: {payload['checkpoint_type']!r}"
         )
+    recorded_mapping = payload.get("layer_mapping")
+    if not isinstance(recorded_mapping, Mapping):
+        raise ValueError("LoRA checkpoint payload is missing layer_mapping")
+    validate_layer_mapping_manifest(recorded_mapping, expected_layer_mapping)
     if int(payload["update_bank_rank"]) > int(
         accumulated_update_state.update_bank_rank
     ):
