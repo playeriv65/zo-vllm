@@ -1,4 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "zo-vllm"
 version = "0.1.0"
 requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["zo_vllm", "zo_vllm.*", "zo_trainer", "zo_trainer.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "e2e_tests"]
+markers = [
+    "e2e: end-to-end tests that launch real scripts",
+    "gpu: tests that require CUDA GPUs",
+]
