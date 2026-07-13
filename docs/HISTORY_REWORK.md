@@ -32,15 +32,16 @@ The annotated archive tags themselves naturally have a new tag-creation date.
 
 ## Rebuilt Main-Repository Topology
 
-The named branch roles are:
+The named branch roles are content-only and intentionally have no namespace
+prefix:
 
 | Branch | Tip before this history-only document | Responsibility |
 |---|---|---|
-| `codex/rework/runtime-foundation` | `5c9ec25f4d5fd11ea142620c4688e45a70d6a545` | Packaged runtime, estimator, checkpoint, update, and phase foundations |
-| `codex/rework/hf-native` | `c52a54abe85e4da233a45e62246c229beb3c1efb` | Native Hugging Face Trainer, preprocessing, checkpoint, and Phase 3/4 integration |
-| `codex/rework/es-rollout` | `c0a7d0511ffeee7140e3f49bd3eb51a87c7c8141` | Generation-reward ES model boundary |
-| `codex/rework/phase7-serving` | `1679554d7c078a5806beb127042c59b1ba74b61f` | Scheduled serving backend, HF thread bridge, QoS workflows, and benchmark |
-| `codex/integration-rework` | `74bdb3f441f290a0e08fa4c538f6ddb156f917b7` | Integration content before this map was added |
+| `runtime-foundation` | `5c9ec25f4d5fd11ea142620c4688e45a70d6a545` | Packaged runtime, estimator, checkpoint, update, and phase foundations |
+| `hf-trainer-core` | `c52a54abe85e4da233a45e62246c229beb3c1efb` | Native Hugging Face Trainer, preprocessing, checkpoint, and Phase 3/4 integration |
+| `es-rollout` | `c0a7d0511ffeee7140e3f49bd3eb51a87c7c8141` | Generation-reward ES model boundary |
+| `phase7-serving` | `1679554d7c078a5806beb127042c59b1ba74b61f` | Scheduled serving backend, HF thread bridge, QoS workflows, and benchmark |
+| `hf-native` | `74bdb3f441f290a0e08fa4c538f6ddb156f917b7` | Integration content before this map was added |
 
 The runtime-foundation sequence is:
 
@@ -126,7 +127,7 @@ The sibling repository has the same two-level archive policy:
 | `archive/zo-post-bd8902c` | `bd8902c5897ad647141343e9551a4eed3dc63afa` | `452eba372610a85314192d007c87a62621892bf7` | Original committed tip |
 | `archive/zo-post-dirty-before-rework-20260713` | `443e0b7c8ce4422c91a659ecc94749d1eb3ee9f5` | `b4b89cec469cc3b5dc0f38aa14ca84b32fd331cc` | Synthetic pre-rework dirty snapshot |
 
-Branch `codex/rework/zo-post-migration` contains:
+Branch `hf-study-consumers` contains:
 
 ```text
 1735c3c Migrate Countdown ES to HF Trainer
