@@ -238,6 +238,98 @@ def build_vllm_cmd(args, artifact_dir: Path) -> list[str]:
             ),
             *([] if args.u_norm_cap is None else ["--u-norm-cap", str(args.u_norm_cap)]),
         ]
+    if args.vllm_runner == "hf_phase4":
+        if args.direction_provider != "lozo" or args.lozo_provider_mode != "fast":
+            raise ValueError("hf_phase4 currently requires the migrated LOZO fast provider")
+        task = get_task(args.task_name)
+        checkpoint_mode = str(args.save_checkpoint_mode)
+        if checkpoint_mode == "auto":
+            checkpoint_mode = (
+                "native" if str(args.load_best_model_at_end) == "1" else "metadata"
+            )
+        if args.resume_lora_checkpoint is not None:
+            checkpoint_mode = "lora"
+        return [
+            ".venv/bin/python",
+            "-u",
+            "phase4/runners/hf_trainer_sst2_alignment.py",
+            "--mode",
+            "hf",
+            "--model",
+            args.model_name,
+            "--task-objective",
+            task.vllm_train_objective,
+            "--output-root",
+            str(artifact_dir),
+            "--run-id",
+            "hf_native",
+            "--steps",
+            str(args.steps),
+            "--eval-steps",
+            str(args.eval_interval),
+            "--batch-size",
+            str(args.batch_size),
+            "--num-train",
+            str(args.num_samples),
+            "--num-dev",
+            str(args.num_dev),
+            "--num-eval",
+            str(args.eval_accuracy_samples),
+            "--max-length",
+            str(args.max_length),
+            "--max-model-len",
+            str(args.max_length),
+            "--max-new-tokens",
+            str(args.max_new_tokens),
+            "--rank",
+            str(args.rank),
+            "--nu",
+            str(args.nu),
+            "--lr",
+            str(args.lr),
+            "--eps",
+            str(args.eps),
+            "--seed",
+            str(args.seed),
+            "--data-seed",
+            str(args.seed if args.train_set_seed is None else args.train_set_seed),
+            "--gpu-memory-utilization",
+            str(args.gpu_memory_utilization),
+            "--max-num-batched-tokens",
+            str(args.max_num_batched_tokens or 16384),
+            "--max-num-seqs",
+            str(max(16, int(args.batch_size) * 4)),
+            "--direct-update-mode",
+            "accumulate" if args.direct_update_mode == "accumulate" else "direct",
+            "--weight-update-precision",
+            args.weight_update_precision,
+            "--qkv-weight-update",
+            args.qkv_weight_update,
+            "--gradient-accumulation-update-steps",
+            str(args.gradient_accumulation_update_steps),
+            "--u-beta",
+            str(args.u_beta),
+            "--save-strategy",
+            args.save_strategy,
+            "--save-steps",
+            str(args.save_steps or args.eval_interval),
+            "--save-total-limit",
+            str(args.save_total_limit),
+            "--checkpoint-mode",
+            checkpoint_mode,
+            "--load-best-model-at-end",
+            str(args.load_best_model_at_end),
+            "--metric-for-best-model",
+            args.metric_for_best_model,
+            "--greater-is-better",
+            args.greater_is_better,
+            *([] if args.u_norm_cap is None else ["--u-norm-cap", str(args.u_norm_cap)]),
+            *(
+                []
+                if args.resume_lora_checkpoint is None
+                else ["--resume-from-checkpoint", str(args.resume_lora_checkpoint)]
+            ),
+        ]
     task = get_task(args.task_name)
     task_cfg = build_task_config(args)
     data_seed = args.seed if args.train_set_seed is None else args.train_set_seed
@@ -368,8 +460,11 @@ def result_json(backend: str, artifact_dir: Path) -> Path:
         candidate = str(artifact_dir / "official_metrics.json")
     else:
         hf_speed_result = artifact_dir / "hf_native" / "result.json"
+        hf_phase4_result = artifact_dir / "hf_native" / "hf_result.json"
         candidate_path = (
-            hf_speed_result
+            hf_phase4_result
+            if hf_phase4_result.is_file()
+            else hf_speed_result
             if hf_speed_result.is_file()
             else newest_path(str(artifact_dir / "vllm_perf_*.json"))
         )
@@ -601,7 +696,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--vllm-runner",
-        choices=["legacy", "hf_phase3"],
+        choices=["legacy", "hf_phase3", "hf_phase4"],
         default="legacy",
     )
     return parser.parse_args()

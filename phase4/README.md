@@ -56,6 +56,11 @@ does not depend on Phase 3 timing wrappers.
 
 ## Launch
 
+`launch_phase4.py` marks vLLM jobs with `vllm_runner=hf_phase4`. Training,
+evaluation cadence, optimizer/scheduler state, and checkpoints therefore use
+`ZOTrainer`. Objective helpers remain responsible only for task metrics such as
+SQuAD and ReCoRD F1/EM.
+
 ```bash
 .venv/bin/python -u phase4/runners/launch_phase4.py \
   --config phase4/configs/phase4_sst2_opt1p3b_long.json \
@@ -68,6 +73,47 @@ This launcher:
 - starts one tmux window per job
 - supports `--resume-existing` (skip completed, rerun failed/partial)
 - writes per-job `run_state.json`, `manifest.json`, logs, and artifacts
+
+HF Trainer semantic migration probe:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> PYTHONUNBUFFERED=1 \
+.venv/bin/python -u phase4/runners/hf_trainer_semantic_migration.py \
+  --run-id <run_id> \
+  --steps 50 \
+  --eval-steps 10 \
+  --batch-size 2
+```
+
+This probe is phase-local. It uses the generic `zo_trainer.ZOTrainer` path,
+Hugging Face `eval_strategy="steps"`, script-local `compute_metrics`, and writes
+clean eval loss, eval accuracy, and ZO probe log checks to
+`phase4/results/<run_id>/phase4_hf_semantic_result.json`. It is a migration
+sanity check, not a replacement for the long-run Phase 4 launcher.
+
+HF Trainer classification numeric comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> PYTHONUNBUFFERED=1 \
+.venv/bin/python -u phase4/runners/hf_trainer_sst2_alignment.py \
+  --run-id <run_id> \
+  --model facebook/opt-125m \
+  --task-objective sst2_classification \
+  --steps 10 \
+  --eval-steps 5 \
+  --batch-size 2 \
+  --rank 1 \
+  --nu 10 \
+  --lr 1e-7 \
+  --eps 1e-3
+```
+
+This check runs legacy `VLLMZOTrainer` and Hugging Face `ZOTrainer` in isolated
+child processes with the same classification objective batches, perturbation
+settings, and evaluation cadence. It compares initial clean loss, stepped eval
+loss, and eval accuracy, then writes
+`legacy_result.json`, `hf_result.json`, and `alignment_result.json` under
+`phase4/results/<run_id>/`.
 
 ## Collect Summary
 

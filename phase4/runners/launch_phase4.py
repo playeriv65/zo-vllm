@@ -100,6 +100,7 @@ def build_job_cmd(
     train_set_seed = task_cfg["data_seed"]
     spec = {
         **merged,
+        "vllm_runner": "hf_phase4",
         "wandb_project": wandb_cfg.get("project", "lozo-vllm-phase4"),
         "wandb_entity": wandb_cfg.get("entity", "playeriv65-university-of-minnesota"),
         "task_name": task_name,
