@@ -1,0 +1,65 @@
+{
+  "wandb": {
+    "project": "lozo-vllm-phase4",
+    "entity": "playeriv65-university-of-minnesota"
+  },
+  "defaults": {
+    "steps": 20000,
+    "warmup_steps": 0,
+    "batch_size": 16,
+    "eval_interval": 500,
+    "save_steps": 500,
+    "save_total_limit": 3,
+    "seed": 42,
+    "model_name": "facebook/opt-13b",
+    "zo_random_device": "cuda",
+    "rank": 2,
+    "nu": 100,
+    "lr": 1e-7,
+    "eps": 0.001,
+    "gpu_memory_utilization": 0.5,
+    "task": {
+      "num_train": 1000,
+      "num_dev": 500,
+      "num_eval": 1000,
+      "data_seed": 42,
+      "template": "default",
+      "max_length": 2048,
+      "max_new_tokens": 50
+    }
+  },
+  "jobs": [
+    {
+      "job_id": "lozo_boolq_lora_normal_opt13b_r2_nu100_lr1e7_eps1e3_bs16_eval500",
+      "backend": "lozo",
+      "train_scope": "lora_normal",
+      "task": {
+        "name": "BoolQ"
+      }
+    },
+    {
+      "job_id": "lozo_boolq_full_opt13b_r2_nu100_lr1e7_eps1e3_bs16_eval500",
+      "backend": "lozo",
+      "train_scope": "full",
+      "task": {
+        "name": "BoolQ"
+      }
+    },
+    {
+      "job_id": "lozo_squad_lora_normal_opt13b_r2_nu100_lr1e7_eps1e3_bs16_eval500",
+      "backend": "lozo",
+      "train_scope": "lora_normal",
+      "task": {
+        "name": "SQuAD"
+      }
+    },
+    {
+      "job_id": "lozo_squad_full_opt13b_r2_nu100_lr1e7_eps1e3_bs16_eval500",
+      "backend": "lozo",
+      "train_scope": "full",
+      "task": {
+        "name": "SQuAD"
+      }
+    }
+  ]
+}

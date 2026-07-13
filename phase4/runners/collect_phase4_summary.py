@@ -6,9 +6,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from zo_vllm.experiment.io import load_json
-from zo_vllm.experiment.paths import project_root, resolve_path
-from zo_vllm.experiment.phase4_summary import summarize_phase4_job
+from zo_vllm.utils.io import load_json  # noqa: E402
+from zo_vllm.experiment.infra.paths import project_root, resolve_path  # noqa: E402
+from zo_vllm.experiment.infra.phase4_summary import summarize_phase4_job  # noqa: E402
 
 
 PROJECT_ROOT = project_root()

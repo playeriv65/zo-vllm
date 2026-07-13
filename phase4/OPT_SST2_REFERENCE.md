@@ -46,7 +46,7 @@ Interpretation: LOZO curve is generally below MeZO and drops faster early.
 
 SST-2 table for rank `r` and lazy interval `nu`:
 
-| r | nu | SST-2 Acc | train loss |
+| r | nu | SST-2 Acc | reported loss |
 |---:|---:|---:|---:|
 | 1 | 50 | 88.1 | 0.45 |
 | 1 | 100 | 89.0 | 0.46 |
@@ -125,7 +125,7 @@ For quick correctness checks, start from OPT-1.3B + SST-2:
 - epsilon: `1e-3` first, then `1e-4`
 - lr: try `1e-6` then `1e-7`
 - save/eval interval: every `4000` steps
-- practical target: accuracy around `92-93`, train loss around `0.37`
+- practical target: accuracy around `92-93`, reported loss around `0.37`
 
 Then compare against MeZO baseline with:
 

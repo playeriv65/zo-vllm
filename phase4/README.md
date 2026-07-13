@@ -6,10 +6,13 @@ real training workloads, starting with OPT small model + SST-2.
 ## Scope
 
 - Baseline: official LOZO (`third_party/LOZO/large_models/run_lozo.py`)
-- vLLM path: LoZO-vLLM (`phase3/runners/train_vllm_perf.py`)
-- Task: SST-2, official `{train=1000, dev=500, eval=872}` split sampling
+- vLLM path: shared LoZO-vLLM task runner
+  (`python -m zo_vllm.experiment.runners.vllm_zo_task`)
+- Default task: SST-2, official `{train=1000, dev=500, eval=872}` split sampling
+- Task management: HF `datasets.Dataset` splits are owned by `zo_vllm.tasks`
+  adapters; Phase 4 runners only select a task and orchestrate backends.
 - Seeds: `seed=42` for the official LOZO/Trainer random stream and
-  `train_set_seed=0` for SST-2 train/dev/eval sampling
+  `task.data_seed=0` for SST-2 train/dev/eval sampling
 - Default OPT paper-grid profile is copied from LOZO/MeZO scripts and paper Table 5:
   - `steps=20000`
   - `eval_interval=4000`
@@ -17,7 +20,7 @@ real training workloads, starting with OPT small model + SST-2.
   - `lr={1e-6,1e-7}`
   - `eps={1e-3,1e-4}`
   - `rank={1,2,4}`
-  - `step_interval={50,100}`
+  - `nu={50,100}`
   - `seed=0`
 
 ## Directory Layout
@@ -47,10 +50,9 @@ They include:
 - `lozo` official baseline, launched through the unmodified LOZO repository
 - `vllm` optimized path, using the same SST-2 classification loss/accuracy口径
 
-The official LOZO backend intentionally does not use the local
-`phase3/runners/train_lozo_baseline_perf.py` timing wrapper for Phase 4
-alignment. That wrapper remains useful for instrumentation, but it is not the
-paper baseline.
+The official LOZO backend intentionally launches the unmodified LOZO repository
+through the shared `zo_vllm.experiment.runners.backend_job` wrapper; Phase 4
+does not depend on Phase 3 timing wrappers.
 
 ## Launch
 
@@ -78,6 +80,33 @@ This launcher:
 Summary includes per-run config, final eval metric/loss, wall clock, step time,
 throughput, convergence flag, resume flag, wandb links, and baseline-vs-vLLM
 comparison notes.
+
+## Task Configuration
+
+Phase 4 configs use an HF-like nested task block:
+
+```json
+{
+  "task": {
+    "name": "sst2",
+    "num_train": 1000,
+    "num_dev": 500,
+    "num_eval": 872,
+    "data_seed": 0,
+    "template": "default",
+    "max_length": 2048,
+    "max_new_tokens": 50
+  }
+}
+```
+
+Supported task adapters currently map to these backend objectives:
+
+| task | official LOZO task | vLLM objective |
+| --- | --- | --- |
+| `sst2` | `SST2` | `sst2_classification` |
+| `boolq` | `BoolQ` | `boolq_classification` |
+| `squad` | `SQuAD` | `squad_nll` |
 
 ## Current OPT-13B Snapshot
 

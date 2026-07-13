@@ -35,7 +35,7 @@ Jobs:
 ## Clean Eval Results
 
 Primary convergence metrics are clean eval loss and eval accuracy on the current
-base parameters. The 10-step training loss is not a clean objective; it is the
+base parameters. The 10-step probe loss is not a clean objective; it is the
 official LOZO plus-perturbation probe loss `loss(theta + eps * direction)`.
 
 | job | step 4000 loss | step 8000 loss | step 12000 loss | step 16000 loss | step 20000 loss | step 20000 eval acc | final full eval acc |
@@ -65,13 +65,13 @@ treated as convergence-plot approximations, not precise per-metric timestamps.
 
 Step-based plots:
 
-- `plots/phase4_train_loss.svg`
+- `plots/phase4_probe_loss.svg`
 - `plots/phase4_eval_loss.svg`
 - `plots/phase4_eval_acc.svg`
 
 Estimated wall-clock plots:
 
-- `plots/phase4_estimated_wallclock_train_loss.svg`
+- `plots/phase4_estimated_wallclock_probe_loss.svg`
 - `plots/phase4_estimated_wallclock_eval_loss.svg`
 - `plots/phase4_estimated_wallclock_eval_acc.svg`
 
@@ -82,6 +82,6 @@ The corresponding CSV files are stored next to the SVGs.
 - vLLM completed both long runs successfully with `exit_code=0`.
 - Official LOZO full and lora_only baselines are still running and should not be
   stopped unless final loss/accuracy is clearly bad or the run fails.
-- Training loss is useful only as a noisy debug signal because it is measured at
+- Probe loss is useful only as a noisy debug signal because it is measured at
   `theta + eps * direction`; clean eval loss and accuracy are the main
   convergence evidence.

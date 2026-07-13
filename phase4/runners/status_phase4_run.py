@@ -6,8 +6,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from zo_vllm.experiment.paths import resolve_path
-from zo_vllm.experiment.run_state import read_run_state
+from zo_vllm.experiment.infra.paths import resolve_path  # noqa: E402
+from zo_vllm.experiment.infra.run_state import read_run_state  # noqa: E402
 
 
 def display(path: Path) -> str:
@@ -29,7 +29,7 @@ def collect(run_dir: Path) -> dict:
                     "status": state.get("status"),
                     "attempts": state.get("attempts", 0),
                     "resume_count": state.get("resume_count", 0),
-                    "has_result": (job_dir / "phase4_result.json").exists(),
+                    "has_result": (job_dir / "result.json").exists(),
                     "has_manifest": (job_dir / "manifest.json").exists(),
                     "has_log": (job_dir / "logs" / "run.log").exists(),
                 }

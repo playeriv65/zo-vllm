@@ -4,51 +4,58 @@
     "entity": "playeriv65-university-of-minnesota"
   },
   "defaults": {
-    "task_name": "SST2",
     "steps": 20000,
     "warmup_steps": 20,
     "batch_size": 16,
-    "num_samples": 1000,
     "eval_interval": 4000,
-    "save_interval": 4000,
+    "save_steps": 4000,
     "save_total_limit": 3,
-    "eval_accuracy_samples": 512,
     "seed": 42,
     "rank": 8,
-    "lr": 1e-7,
-    "eps": 1e-3,
-    "step_interval": 100,
+    "lr": 1e-07,
+    "eps": 0.001,
+    "nu": 100,
     "zo_random_device": "cuda",
-    "train_scope": "lora_only"
+    "train_scope": "lora_normal",
+    "task": {
+      "name": "SST2",
+      "num_train": 1000,
+      "num_dev": 500,
+      "num_eval": 512,
+      "data_seed": 42,
+      "template": "default",
+      "max_length": 2048,
+      "max_new_tokens": 50
+    }
   },
   "jobs": [
     {
-      "job_id": "lozo_opt2p7b_lora_only",
+      "job_id": "lozo_opt2p7b_lora_normal",
       "backend": "lozo",
       "model_name": "facebook/opt-2.7b"
     },
     {
-      "job_id": "vllm_opt2p7b_lora_only",
+      "job_id": "vllm_opt2p7b_lora_normal",
       "backend": "vllm",
       "model_name": "facebook/opt-2.7b"
     },
     {
-      "job_id": "lozo_opt6p7b_lora_only",
+      "job_id": "lozo_opt6p7b_lora_normal",
       "backend": "lozo",
       "model_name": "facebook/opt-6.7b"
     },
     {
-      "job_id": "vllm_opt6p7b_lora_only",
+      "job_id": "vllm_opt6p7b_lora_normal",
       "backend": "vllm",
       "model_name": "facebook/opt-6.7b"
     },
     {
-      "job_id": "lozo_opt13b_lora_only",
+      "job_id": "lozo_opt13b_lora_normal",
       "backend": "lozo",
       "model_name": "facebook/opt-13b"
     },
     {
-      "job_id": "vllm_opt13b_lora_only",
+      "job_id": "vllm_opt13b_lora_normal",
       "backend": "vllm",
       "model_name": "facebook/opt-13b"
     }

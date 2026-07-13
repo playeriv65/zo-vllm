@@ -1,4 +1,4 @@
-series,step,train_loss
+series,step,probe_loss
 LOZO full nu50,10,0.9181
 LOZO full nu50,20,0.9251
 LOZO full nu50,30,0.976

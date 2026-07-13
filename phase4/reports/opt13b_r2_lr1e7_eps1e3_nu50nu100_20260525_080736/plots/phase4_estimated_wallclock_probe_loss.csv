@@ -1,4 +1,4 @@
-series,estimated_min,step,train_loss,mean_step_s
+series,estimated_min,step,probe_loss,mean_step_s
 LOZO full nu50,0.134675,10,0.9181,0.80805
 LOZO full nu50,0.269350,20,0.9251,0.80805
 LOZO full nu50,0.404025,30,0.976,0.80805
