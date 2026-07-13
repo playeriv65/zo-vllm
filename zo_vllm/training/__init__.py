@@ -18,6 +18,7 @@ from .direction import (
 from .scheduler import ConstantLR, CosineAfterLR, LRScheduler
 from .direction import SubspaceQueue
 from .estimator import (
+    AntitheticProbePlan,
     DirectionBundle,
     EvolutionStrategyEstimator,
     MultiQueryZOEstimator,
@@ -27,6 +28,7 @@ from .estimator import (
     ZOEstimator,
     ZOEstimatorConfig,
     ZOGradientEstimate,
+    build_single_direction_antithetic_estimate,
 )
 from .objective_scoring import (
     ObjectiveScore,
@@ -61,6 +63,7 @@ from .zo_step import (
 
 __all__ = [
     "AGZODirectionProvider",
+    "AntitheticProbePlan",
     "AccumulatedLowRankUpdateState",
     "BlockLoRAUpdateBankState",
     "ConstantLR",
@@ -95,6 +98,7 @@ __all__ = [
     "ZOEstimator",
     "ZOEstimatorConfig",
     "ZOGradientEstimate",
+    "build_single_direction_antithetic_estimate",
     "ZOTaskDataCollator",
     "ZOTaskEncodingConfig",
     "ZOStepCallback",

@@ -39,7 +39,7 @@ _DIRECTION_NORMALIZATION_STAT_KEYS = {
 }
 
 
-def _direction_specs_from_param_metadata(
+def direction_specs_from_param_metadata(
     param_metadata: Mapping[str, ParamMetadata],
     *,
     rank: int,
@@ -354,7 +354,7 @@ class AGZODirectionProvider(FactorizedDirectionProvider):
         direction_scale = float(kwargs.get("direction_scale", 1.0))
         super().__init__(
             direction_provider_name="agzo",
-            direction_specs=_direction_specs_from_param_metadata(
+            direction_specs=direction_specs_from_param_metadata(
                 param_metadata,
                 rank=rank,
                 direction_scale=direction_scale,
@@ -623,7 +623,7 @@ class UAGZODirectionProvider(FactorizedDirectionProvider):
         )
         super().__init__(
             direction_provider_name="uagzo",
-            direction_specs=_direction_specs_from_param_metadata(
+            direction_specs=direction_specs_from_param_metadata(
                 param_metadata,
                 rank=rank,
                 direction_scale=direction_scale,
@@ -678,7 +678,7 @@ class SUAGZODirectionProvider(FactorizedDirectionProvider):
         )
         super().__init__(
             direction_provider_name="suagzo",
-            direction_specs=_direction_specs_from_param_metadata(
+            direction_specs=direction_specs_from_param_metadata(
                 param_metadata,
                 rank=rank,
                 direction_scale=direction_scale,
@@ -708,4 +708,5 @@ __all__ = [
     "LOZOFastDirectionProvider",
     "SUAGZODirectionProvider",
     "UAGZODirectionProvider",
+    "direction_specs_from_param_metadata",
 ]

@@ -428,6 +428,7 @@ class ZOVLLMEngine:
                 loss_impl=loss_impl,
                 return_device_tensors=return_device_tensors,
             )
+        self._wait_for_device_tensors(raw)
         logits = raw.get("logits")
         if not isinstance(logits, torch.Tensor):
             logits = torch.as_tensor(logits, dtype=torch.float32)
@@ -469,6 +470,7 @@ class ZOVLLMEngine:
                 loss_impl=loss_impl,
                 return_device_tensors=self._can_return_device_tensors(),
             )
+        self._wait_for_device_tensors(raw)
         request_nll = raw["request_nll_tensor"]
         if not isinstance(request_nll, torch.Tensor):
             request_nll = torch.as_tensor(request_nll, dtype=torch.float32)
@@ -484,6 +486,15 @@ class ZOVLLMEngine:
             getattr(self.llm, "llm_engine", None), "model_executor", None
         )
         return bool(getattr(executor, "supports_device_tensor_rpc", False))
+
+    @staticmethod
+    def _wait_for_device_tensors(raw: Mapping[str, Any]) -> None:
+        ready_event = raw.get("device_tensors_ready_event")
+        if ready_event is None:
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("received a CUDA readiness event without CUDA")
+        torch.cuda.current_stream().wait_event(ready_event)
 
     @staticmethod
     def _probe_timing_from_raw(raw: Mapping[str, Any]) -> ProbeTiming:

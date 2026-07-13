@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import time
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -13,6 +14,7 @@ from zo_vllm.core.perturbation_normalization import (
     normalize_perturbation_normalization,
     reference_v_column_norm_sq,
 )
+from zo_vllm.core.probe_results import ProbeLossResult
 from zo_vllm.core.token_scores import slice_score_result
 from zo_vllm.engine import ZOVLLMEngine
 
@@ -47,6 +49,18 @@ class ZOGradientEstimate:
 
     directions: Any
     scale: float
+
+
+@dataclass(frozen=True)
+class AntitheticProbePlan:
+    """Executor-independent plan for one two-sided direction probe."""
+
+    eps: float
+    probe_names: tuple[str, str] = ("plus", "minus")
+
+    def __post_init__(self) -> None:
+        if float(self.eps) <= 0.0 or not math.isfinite(float(self.eps)):
+            raise ValueError("eps must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -223,11 +237,95 @@ class ZOEstimator(Protocol):
         ...
 
 
+def build_single_direction_antithetic_estimate(
+    *,
+    loss_plus: float,
+    loss_minus: float,
+    eps: float,
+    directions: Any,
+    projected_grad: float | None = None,
+    profile_s: Mapping[str, float] | None = None,
+    probe_metrics: Mapping[str, Any] | None = None,
+    direction_info: Mapping[str, Any] | None = None,
+) -> ZOEstimate:
+    """Aggregate one antithetic probe pair independently of its executor."""
+
+    eps_f = float(eps)
+    if eps_f <= 0.0 or not math.isfinite(eps_f):
+        raise ValueError("eps must be positive and finite")
+    plus = float(loss_plus)
+    minus = float(loss_minus)
+    if not math.isfinite(plus) or not math.isfinite(minus):
+        raise ValueError("antithetic probe losses must be finite")
+    coefficient = (
+        (plus - minus) / (2.0 * eps_f)
+        if projected_grad is None
+        else float(projected_grad)
+    )
+    if not math.isfinite(coefficient):
+        raise ValueError("projected gradient must be finite")
+    return ZOEstimate(
+        reported_loss=(plus + minus) / 2.0,
+        loss_plus=plus,
+        loss_minus=minus,
+        projected_grad=coefficient,
+        gradient=ZOGradientEstimate(
+            directions=directions,
+            scale=coefficient,
+        ),
+        profile_s=dict(profile_s or {}),
+        probe_metrics=dict(probe_metrics or {}),
+        estimator_metrics={
+            "estimator": SingleDirectionAntitheticEstimator.name,
+            "query_count": SingleDirectionAntitheticEstimator.query_count,
+        },
+        direction_info=dict(direction_info or {}),
+    )
+
+
 class SingleDirectionAntitheticEstimator:
     """Default LOZO/AGZO estimator using one plus/minus LoRA slot pair."""
 
     name = "single_direction_antithetic"
     query_count = 2
+
+    def plan(self, config: ZOEstimatorConfig) -> AntitheticProbePlan:
+        """Describe the probes without choosing an execution backend."""
+
+        return AntitheticProbePlan(eps=float(config.eps))
+
+    def aggregate(
+        self,
+        plan: AntitheticProbePlan,
+        losses: ProbeLossResult,
+        *,
+        directions: Any,
+        projected_grad: float | None = None,
+        profile_s: Mapping[str, float] | None = None,
+        probe_metrics: Mapping[str, Any] | None = None,
+        direction_info: Mapping[str, Any] | None = None,
+    ) -> ZOEstimate:
+        """Aggregate backend-produced objective losses into one ZO estimate."""
+
+        if tuple(plan.probe_names) != ("plus", "minus"):
+            raise ValueError("single-direction antithetic probes must be plus/minus")
+        if len(losses.group_losses) != self.query_count:
+            raise ValueError(
+                "single-direction antithetic aggregation requires two probe losses"
+            )
+        loss_plus, loss_minus = losses.group_losses
+        timing_profile = losses.timing.resolve_cuda_events().profile_seconds()
+        timing_profile.update(dict(profile_s or {}))
+        return build_single_direction_antithetic_estimate(
+            loss_plus=float(loss_plus),
+            loss_minus=float(loss_minus),
+            eps=float(plan.eps),
+            directions=directions,
+            projected_grad=projected_grad,
+            profile_s=timing_profile,
+            probe_metrics=probe_metrics,
+            direction_info=direction_info,
+        )
 
     def estimate(
         self,
@@ -239,6 +337,7 @@ class SingleDirectionAntitheticEstimator:
         step: int,
         scorer: Any | None = None,
     ) -> ZOEstimate:
+        plan = self.plan(config)
         direction = direction_sampler.sample()
         score_method = (
             engine.score_plus_minus_directions
@@ -260,21 +359,16 @@ class SingleDirectionAntitheticEstimator:
             step=step,
         )
         profile_s, probe_metrics = _split_probe_observation(score.update_info)
-        return ZOEstimate(
-            reported_loss=(float(score.loss_plus) + float(score.loss_minus)) / 2.0,
-            loss_plus=float(score.loss_plus),
-            loss_minus=float(score.loss_minus),
-            projected_grad=float(score.projected_grad),
-            gradient=ZOGradientEstimate(
-                directions=direction.directions,
-                scale=float(score.projected_grad),
+        return self.aggregate(
+            plan,
+            ProbeLossResult(
+                group_losses=(float(score.loss_plus), float(score.loss_minus)),
+                requests_per_group=len(batch.token_id_groups),
             ),
+            directions=direction.directions,
+            projected_grad=float(score.projected_grad),
             profile_s=profile_s,
             probe_metrics=probe_metrics,
-            estimator_metrics={
-                "estimator": self.name,
-                "query_count": self.query_count,
-            },
         )
 
 
@@ -803,10 +897,12 @@ class EvolutionStrategyEstimator:
 
 
 __all__ = [
+    "AntitheticProbePlan",
     "DirectionBundle",
     "EvolutionStrategyEstimator",
     "MultiQueryZOEstimator",
     "SingleDirectionAntitheticEstimator",
+    "build_single_direction_antithetic_estimate",
     "ZODirectionSampler",
     "ZOEstimate",
     "ZOGradientEstimate",

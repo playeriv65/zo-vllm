@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from zo_vllm.engine import ZOVLLMEngine
+from zo_vllm.core.probe_results import ProbeLossResult
 
 from .direction import DirectionProvider, DirectionSample, ProbeBatch, TokenProbeBatch
 from .estimator import (
@@ -97,6 +98,54 @@ class ZOStepResult:
         return values
 
 
+def validate_zo_update_hparams(
+    learning_rate: float,
+    weight_decay: float,
+) -> tuple[float, float]:
+    """Validate optimizer-owned update hyperparameters once for every executor."""
+
+    lr = float(learning_rate)
+    decay = float(weight_decay)
+    if lr < 0.0 or not math.isfinite(lr):
+        raise ValueError("learning_rate must be non-negative and finite")
+    if decay < 0.0 or not math.isfinite(decay):
+        raise ValueError("weight_decay must be non-negative and finite")
+    return lr, decay
+
+
+def build_zo_step_result(
+    *,
+    step: int,
+    learning_rate: float,
+    estimate: ZOEstimate,
+    direction_refreshed: bool,
+    direction_info: dict[str, Any] | None = None,
+    profile_s: dict[str, float] | None = None,
+    update_info: dict[str, Any] | None = None,
+) -> ZOStepResult:
+    """Build the common step result after either sync or async mutation."""
+
+    merged_direction_info = dict(direction_info or {})
+    merged_direction_info.update(dict(estimate.direction_info))
+    merged_profile = dict(estimate.profile_s)
+    merged_profile.update(dict(profile_s or {}))
+    return ZOStepResult(
+        step=int(step),
+        learning_rate=float(learning_rate),
+        reported_loss=float(estimate.reported_loss),
+        loss_plus=float(estimate.loss_plus),
+        loss_minus=float(estimate.loss_minus),
+        projected_grad=estimate.projected_grad,
+        update_scale=float(estimate.gradient.scale),
+        direction_refreshed=bool(direction_refreshed),
+        direction_info=merged_direction_info,
+        profile_s=merged_profile,
+        probe_metrics=dict(estimate.probe_metrics),
+        estimator_metrics=dict(estimate.estimator_metrics),
+        update_info=dict(update_info or {}),
+    )
+
+
 @dataclass
 class ZOPendingStep:
     """One estimated ZO step waiting for an optimizer update."""
@@ -109,14 +158,19 @@ class ZOPendingStep:
     def apply(self, *, learning_rate: float, weight_decay: float) -> ZOStepResult:
         if self._consumed:
             raise RuntimeError("pending ZO step has already been applied")
-        lr = float(learning_rate)
-        decay = float(weight_decay)
-        if lr < 0.0 or not math.isfinite(lr):
-            raise ValueError("learning_rate must be non-negative and finite")
-        if decay < 0.0 or not math.isfinite(decay):
-            raise ValueError("weight_decay must be non-negative and finite")
+        lr, decay = validate_zo_update_hparams(learning_rate, weight_decay)
         self._consumed = True
         return self._apply_fn(lr, decay)
+
+
+@dataclass(frozen=True)
+class ZOProbeExecution:
+    """Executor-independent observations for one completed probe plan."""
+
+    losses: ProbeLossResult
+    direction_refreshed: bool = False
+    direction_info: dict[str, Any] = field(default_factory=dict)
+    observations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -191,8 +245,9 @@ class _StepDirectionSampler:
         self.batch = batch
         self.step = int(step)
         self.perturbation_normalization = perturbation_normalization
-        self.samples: list[DirectionSample] = []
         self.first_sample: DirectionSample | None = None
+        self._refreshed = False
+        self._direction_info: dict[str, Any] = {}
         self.profile_s: dict[str, float] = {}
 
     def sample(self, *, seed: int | None = None) -> DirectionBundle:
@@ -251,19 +306,17 @@ class _StepDirectionSampler:
 
     @property
     def refreshed(self) -> bool:
-        return any(sample.refreshed for sample in self.samples)
+        return self._refreshed
 
     @property
     def direction_info(self) -> dict[str, Any]:
-        info: dict[str, Any] = {}
-        for sample in self.samples:
-            info.update(sample.info)
-        return info
+        return dict(self._direction_info)
 
     def _record_sample(self, sample: DirectionSample) -> None:
         if self.first_sample is None:
             self.first_sample = sample
-        self.samples.append(sample)
+        self._refreshed = self._refreshed or bool(sample.refreshed)
+        self._direction_info.update(sample.info)
         self.stepper._call_event(
             "on_direction_sampled",
             step=self.step,
@@ -474,19 +527,13 @@ class ZOStepper:
                 "zo_stepper_total": time.perf_counter() - profile_t0,
             }
         )
-        return ZOStepResult(
+        return build_zo_step_result(
             step=step,
             learning_rate=learning_rate,
-            reported_loss=estimate.reported_loss,
-            loss_plus=estimate.loss_plus,
-            loss_minus=estimate.loss_minus,
-            projected_grad=estimate.projected_grad,
-            update_scale=gradient.scale,
+            estimate=estimate,
             direction_refreshed=sampler.refreshed,
-            direction_info={**sampler.direction_info, **estimate.direction_info},
+            direction_info=sampler.direction_info,
             profile_s=profile_s,
-            probe_metrics=estimate.probe_metrics,
-            estimator_metrics=estimate.estimator_metrics,
             update_info=update_info,
         )
 
