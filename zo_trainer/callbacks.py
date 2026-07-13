@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from transformers import TrainerCallback
@@ -56,6 +57,25 @@ class ZOUSnapshotCallback(TrainerCallback):
             self._captured_steps.add(step)
 
 
+class StopOnSignalCallback(TrainerCallback):
+    """Stop the synchronous HF loop at a safe callback boundary."""
+
+    def __init__(self, *, stop_requested: Callable[[], bool]) -> None:
+        self.stop_requested = stop_requested
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        del args, state, kwargs
+        if self.stop_requested():
+            control.should_training_stop = True
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        del args, state, kwargs
+        if self.stop_requested():
+            control.should_training_stop = True
+        return control
+
+
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
@@ -67,4 +87,4 @@ def _first_metric(values: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-__all__ = ["ZOUSnapshotCallback"]
+__all__ = ["StopOnSignalCallback", "ZOUSnapshotCallback"]

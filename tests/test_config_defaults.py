@@ -15,15 +15,17 @@ from zo_vllm.config import (
     DEFAULT_ZO_STEPS,
     DEFAULT_ZO_TASK_SHUFFLE_IMPL,
     DEFAULT_ZO_WEIGHT_DECAY,
-    VLLMZOConfig,
+    DEFAULT_ZO_SERVING_CONFIG,
 )
-from zo_vllm.core.lora_scope import lora_scope_includes_embeddings
+from zo_vllm.serving.schemas import ServingZOStartRequest
 from zo_vllm.experiment.runners.args import build_vllm_zo_task_arg_parser
 from zo_vllm.tasks.tokenization import OPT_BOS_NATIVE
 from zo_vllm.training.arguments import ZOTrainingArguments
 from zo_vllm.training.direction import (
     LOZOFastDirectionProvider,
 )
+from zo_vllm.config import VLLMZOConfig
+from zo_vllm.core.lora_scope import lora_scope_includes_embeddings
 
 
 def test_task_runner_defaults_follow_package_config():
@@ -195,3 +197,16 @@ def test_vllm_zo_config_rejects_invalid_multi_query_params(field, value, message
 
 def test_fast_lozo_provider_is_public_direction_provider():
     assert LOZOFastDirectionProvider.__name__ == "LOZOFastDirectionProvider"
+
+
+def test_serving_zo_output_dir_is_configured_outside_phase_paths():
+    assert DEFAULT_ZO_SERVING_CONFIG.output_dir == "zo_vllm_runs/serving"
+    assert ServingZOStartRequest().output_dir == DEFAULT_ZO_SERVING_CONFIG.output_dir
+    assert (
+        ServingZOStartRequest().lr_scheduler_type
+        == DEFAULT_ZO_SERVING_CONFIG.lr_scheduler_type
+    )
+    assert (
+        ServingZOStartRequest().warmup_steps == DEFAULT_ZO_SERVING_CONFIG.warmup_steps
+    )
+    assert "phase" not in DEFAULT_ZO_SERVING_CONFIG.output_dir

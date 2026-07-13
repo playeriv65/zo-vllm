@@ -31,6 +31,7 @@ phase4/results/
 phase5/results/
 phase6/results/
 phase7/logs/
+zo_vllm_runs/
 zo_post/artifacts/
 zo_post/results/
 zo_post/logs/

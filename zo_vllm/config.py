@@ -299,17 +299,19 @@ class VLLMZOConfig:
 class ZOServingConfig:
     """Serving-time ZO trainer defaults shared by API and experiment runners."""
 
+    task_name: str = "sst2"
     steps: int = 100
     batch_size: int = 8
     num_train: int = 1024
     num_dev: int = 256
-    num_eval: int = 256
     eval_interval: int = 50
     rank: int = DEFAULT_ZO_RANK
     update_bank_rank: int | str | None = "auto"
     eps: float = 1e-3
     learning_rate: float = DEFAULT_ZO_LEARNING_RATE
     weight_decay: float = 0.0
+    lr_scheduler_type: str = "constant"
+    warmup_steps: int = 0
     nu: int = 50
     seed: int = 42
     priority: int = 1000
@@ -352,7 +354,6 @@ class ZOServingConfig:
             "batch_size": self.batch_size,
             "num_train": self.num_train,
             "num_dev": self.num_dev,
-            "num_eval": self.num_eval,
             "rank": self.rank,
             "nu": self.nu,
             "priority": self.priority,
@@ -368,6 +369,7 @@ class ZOServingConfig:
         non_negative_int_fields = {
             "steps": self.steps,
             "eval_interval": self.eval_interval,
+            "warmup_steps": self.warmup_steps,
             "gradient_accumulation_update_steps": (
                 self.gradient_accumulation_update_steps
             ),
@@ -416,6 +418,10 @@ class ZOServingConfig:
         if self.direction_scale is not None:
             object.__setattr__(self, "direction_scale", float(self.direction_scale))
         object.__setattr__(self, "output_dir", str(self.output_dir))
+        if str(self.task_name).strip().lower() != "sst2":
+            raise ValueError("serving task_name currently supports only sst2")
+        object.__setattr__(self, "task_name", "sst2")
+        object.__setattr__(self, "lr_scheduler_type", str(self.lr_scheduler_type))
         object.__setattr__(
             self,
             "perturbation_normalization",
