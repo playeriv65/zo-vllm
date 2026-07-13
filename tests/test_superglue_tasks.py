@@ -128,7 +128,7 @@ def test_superglue_small_train_split_uses_tail_dev_without_overlap(monkeypatch):
     monkeypatch.setattr(
         superglue_base,
         "shuffled_select",
-        lambda dataset, *, seed, num: (
+        lambda dataset, *, seed, num, shuffle_impl=None: (
             dataset.select(range(min(int(num), len(dataset))))
             if num is not None
             else dataset
@@ -194,6 +194,16 @@ def test_shuffled_select_shuffle_impl_contract(monkeypatch):
 
     monkeypatch.setenv("ZO_TASK_SHUFFLE_IMPL", "hf")
     hf_rows = list(superglue_base.shuffled_select(rows, seed=42, num=6)["x"])
+    explicit_numpy_rows = list(
+        superglue_base.shuffled_select(
+            rows,
+            seed=42,
+            num=6,
+            shuffle_impl="numpy",
+        )["x"]
+    )
+    assert explicit_numpy_rows == default_rows
+    assert explicit_numpy_rows != hf_rows
 
     monkeypatch.setenv("ZO_TASK_SHUFFLE_IMPL", "bad")
     with pytest.raises(ValueError, match="ZO_TASK_SHUFFLE_IMPL"):

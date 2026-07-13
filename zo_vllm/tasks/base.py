@@ -27,6 +27,7 @@ class TaskConfig:
     template: str = "default"
     max_length: int = 2048
     max_new_tokens: int = 50
+    shuffle_impl: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,10 +107,20 @@ def build_task_data_collator(
     return _collate
 
 
-def shuffled_select(dataset: Dataset, *, seed: int, num: int | None) -> Dataset:
+def shuffled_select(
+    dataset: Dataset,
+    *,
+    seed: int,
+    num: int | None,
+    shuffle_impl: str | None = None,
+) -> Dataset:
     """Return a deterministic shuffled subset using the configured algorithm."""
     shuffle_impl = (
-        os.environ.get(ZO_TASK_SHUFFLE_IMPL_ENV, DEFAULT_ZO_TASK_SHUFFLE_IMPL)
+        shuffle_impl
+        or os.environ.get(ZO_TASK_SHUFFLE_IMPL_ENV, DEFAULT_ZO_TASK_SHUFFLE_IMPL)
+    )
+    shuffle_impl = (
+        str(shuffle_impl)
         .strip()
         .lower()
     )

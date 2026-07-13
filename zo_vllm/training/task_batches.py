@@ -340,6 +340,7 @@ def load_objective_rows(
     num_train: int,
     num_dev: int,
     num_eval: int,
+    shuffle_impl: str | None = None,
 ):
     objective_name = resolve_objective_name(objective_name)
     if objective_name == "sst2_classification":
@@ -366,6 +367,7 @@ def load_objective_rows(
             num_dev=num_dev,
             num_eval=num_eval,
             data_seed=data_seed,
+            shuffle_impl=shuffle_impl,
         )
     )
     return convert(splits.train), convert(splits.dev), convert(splits.eval)

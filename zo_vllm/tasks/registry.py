@@ -23,10 +23,11 @@ for _task_name, _spec in SUPERGLUE_TASK_SPECS.items():
 
 
 def get_task(name: str):
-    if name not in _TASKS:
+    normalized = str(name).strip().lower()
+    if normalized not in _TASKS:
         choices = ", ".join(sorted(_TASKS))
         raise KeyError(f"unsupported task {name!r}; supported tasks: {choices}")
-    return _TASKS[name]
+    return _TASKS[normalized]
 
 
 def list_tasks() -> list[str]:

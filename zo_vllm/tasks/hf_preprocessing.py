@@ -5,14 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 
 from zo_vllm.core.binary_option_objective import option_lengths
-from zo_vllm.tasks.boolq import encode_boolq_vllm_prompts
-from zo_vllm.tasks.squad import encode_squad_train_prompts
-from zo_vllm.tasks.sst2 import encode_sst2_vllm_prompts
+from zo_vllm.tasks.boolq import dataset_to_boolq_rows, encode_boolq_vllm_prompts
+from zo_vllm.tasks.squad import dataset_to_squad_rows, encode_squad_train_prompts
+from zo_vllm.tasks.sst2 import dataset_to_sst2_rows, encode_sst2_vllm_prompts
 from zo_vllm.tasks.superglue import (
     SUPERGLUE_OBJECTIVE_TO_TASK,
+    dataset_to_superglue_rows,
     encode_superglue_option_prompts,
 )
 from zo_vllm.tasks.superglue.record import (
@@ -90,6 +91,37 @@ def build_sst2_prompt_classification_preprocess(
     return preprocess
 
 
+def load_sst2_prompt_classification_datasets(
+    tokenizer: Any,
+    *,
+    data_seed: int,
+    num_train: int,
+    num_dev: int,
+) -> tuple[Dataset, Dataset]:
+    """Load, split, and map SST-2 into HF prompt-classification features."""
+
+    raw_train = load_dataset("glue", "sst2", split="train")
+    requested = int(num_train) + int(num_dev)
+    if requested > len(raw_train):
+        raise ValueError(
+            f"SST-2 train split has {len(raw_train)} rows, requested {requested}"
+        )
+    selected = raw_train.shuffle(seed=int(data_seed)).select(range(requested))
+    train_raw = selected.select(range(int(num_train)))
+    dev_raw = selected.select(range(int(num_train), requested))
+    preprocess = build_sst2_prompt_classification_preprocess(tokenizer)
+
+    def encode(dataset: Dataset) -> Dataset:
+        return dataset.map(
+            preprocess,
+            batched=True,
+            remove_columns=dataset.column_names,
+            desc="Tokenizing SST-2 prompt classification",
+        )
+
+    return encode(train_raw), encode(dev_raw)
+
+
 def build_objective_hf_dataset(
     rows: Sequence[Any],
     tokenizer: Any,
@@ -101,13 +133,14 @@ def build_objective_hf_dataset(
     """Encode a registered experiment objective into ragged HF features."""
 
     objective = str(objective_name)
+    normalized_rows = _objective_rows(rows, objective=objective)
     if objective in {"sst2_classification", "boolq_classification"}:
         encode = (
             encode_sst2_vllm_prompts
             if objective == "sst2_classification"
             else encode_boolq_vllm_prompts
         )
-        stem_ids, negative_ids, positive_ids, labels = encode(rows, tokenizer)
+        stem_ids, negative_ids, positive_ids, labels = encode(normalized_rows, tokenizer)
         negative_lens, positive_lens = option_lengths(
             stem_ids, negative_ids, positive_ids
         )
@@ -122,7 +155,7 @@ def build_objective_hf_dataset(
             ]
         )
     if objective in SUPERGLUE_OBJECTIVE_TO_TASK and objective != RECORD_NLL_OBJECTIVE:
-        encoded = encode_superglue_option_prompts(rows, tokenizer)
+        encoded = encode_superglue_option_prompts(normalized_rows, tokenizer)
         return Dataset.from_list(
             [
                 _classification_feature(
@@ -135,14 +168,14 @@ def build_objective_hf_dataset(
         )
     if objective == "squad_nll":
         token_groups, suffix_lens = encode_squad_train_prompts(
-            list(rows),
+            list(normalized_rows),
             tokenizer,
             max_length=int(max_length),
             max_new_tokens=int(max_new_tokens),
         )
     elif objective == RECORD_NLL_OBJECTIVE:
         token_groups, suffix_lens = encode_gold_prompts(
-            rows,
+            normalized_rows,
             tokenizer,
             max_length=int(max_length),
             max_new_tokens=int(max_new_tokens),
@@ -155,6 +188,22 @@ def build_objective_hf_dataset(
             for token_ids, suffix_len in zip(token_groups, suffix_lens)
         ]
     )
+
+
+def _objective_rows(rows: Sequence[Any], *, objective: str) -> list[Any]:
+    values = list(rows)
+    if not values or not isinstance(values[0], Mapping):
+        return values
+    if objective == "sst2_classification":
+        return dataset_to_sst2_rows(Dataset.from_list(values))
+    if objective == "boolq_classification":
+        return dataset_to_boolq_rows(Dataset.from_list(values))
+    if objective == "squad_nll":
+        return dataset_to_squad_rows(Dataset.from_list(values))
+    task_name = SUPERGLUE_OBJECTIVE_TO_TASK.get(objective)
+    if task_name is not None:
+        return dataset_to_superglue_rows(values, task_name=task_name)
+    return values
 
 
 def _classification_feature(
@@ -216,4 +265,5 @@ def _truncate_option_prompt(
 __all__ = [
     "build_objective_hf_dataset",
     "build_sst2_prompt_classification_preprocess",
+    "load_sst2_prompt_classification_datasets",
 ]

@@ -88,6 +88,7 @@ class SuperGLUETaskAdapter:
             raw["train"],
             seed=cfg.data_seed,
             num=int(cfg.num_train) + int(cfg.num_dev),
+            shuffle_impl=cfg.shuffle_impl,
         )
         train, dev = split_train_dev(
             train_dev,
@@ -98,6 +99,7 @@ class SuperGLUETaskAdapter:
             raw["validation"],
             seed=cfg.data_seed,
             num=cfg.num_eval,
+            shuffle_impl=cfg.shuffle_impl,
         )
         return TaskSplits(train=train, dev=dev, eval=eval_split)
 

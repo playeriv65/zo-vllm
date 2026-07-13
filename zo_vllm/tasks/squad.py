@@ -40,6 +40,7 @@ class SquadTaskAdapter:
             train_raw,
             seed=cfg.data_seed,
             num=int(cfg.num_train) + int(cfg.num_dev),
+            shuffle_impl=cfg.shuffle_impl,
         )
         train = train_dev.select(range(min(int(cfg.num_train), len(train_dev))))
         dev_start = min(int(cfg.num_train), len(train_dev))
@@ -49,6 +50,7 @@ class SquadTaskAdapter:
             validation_raw,
             seed=cfg.data_seed,
             num=cfg.num_eval,
+            shuffle_impl=cfg.shuffle_impl,
         )
         return TaskSplits(train=train, dev=dev, eval=eval_split)
 
