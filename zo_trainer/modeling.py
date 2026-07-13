@@ -16,7 +16,7 @@ from zo_vllm.core.token_groups import (
     borrow_or_copy_token_groups,
 )
 from zo_vllm.core.probe_results import ProbeLossResult, ProbeTiming
-from zo_vllm.training.direction import TokenProbeBatch
+from zo_vllm.training.direction import RolloutProbeBatch, TokenProbeBatch
 
 if TYPE_CHECKING:
     from zo_vllm.training.zo_step import ZOPendingStep
@@ -64,6 +64,16 @@ class CompactCausalOutput(ModelOutput):
 class OptionClassificationOutput(ModelOutput):
     """Per-row option logits for the Hugging Face classification loss."""
 
+    logits: torch.Tensor | None = None
+    loss_labels: torch.Tensor | None = None
+    timing: ProbeTiming | None = None
+
+
+@dataclass
+class RolloutOutput(ModelOutput):
+    """HF evaluation output for generation-reward tasks."""
+
+    loss: torch.Tensor | None = None
     logits: torch.Tensor | None = None
     loss_labels: torch.Tensor | None = None
     timing: ProbeTiming | None = None
@@ -326,6 +336,147 @@ class ZOTrainerModel(nn.Module):
                 forward_total_s=time.perf_counter() - forward_t0,
             ),
         )
+
+
+class ZORolloutTrainerModel(ZOTrainerModel):
+    """HF model facade for ES tasks scored by generated-rollout rewards."""
+
+    def __init__(
+        self,
+        zo_model: ZOTrainerRuntime,
+        *,
+        reward_fn: Callable[[str, Any], Any],
+        max_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int | None = None,
+        metric_names: Sequence[str] = ("reward",),
+        metrics_fn: Callable[[str, Any, Any], Mapping[str, float]] | None = None,
+    ) -> None:
+        super().__init__(zo_model)
+        if not callable(reward_fn):
+            raise TypeError("reward_fn must be callable")
+        if int(max_tokens) <= 0:
+            raise ValueError("max_tokens must be positive")
+        names = tuple(str(name) for name in metric_names)
+        if not names or len(set(names)) != len(names):
+            raise ValueError("metric_names must contain unique names")
+        if "reward" not in names:
+            raise ValueError("metric_names must include reward")
+        self.reward_fn = reward_fn
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = None if seed is None else int(seed)
+        self.metric_names = names
+        self.metrics_fn = metrics_fn
+
+    def forward(self, **inputs: Any) -> RolloutOutput:
+        prompts, targets = _rollout_inputs(inputs)
+        generate = getattr(self.zo_model.engine, "generate_with_lora_id", None)
+        if not callable(generate):
+            raise TypeError(
+                "rollout runtime engine must implement generate_with_lora_id"
+            )
+        forward_t0 = time.perf_counter()
+        engine_t0 = time.perf_counter()
+        outputs = generate(
+            prompts,
+            lora_id=self._clean_lora_id(),
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            seed=self.seed,
+        )
+        engine_s = time.perf_counter() - engine_t0
+        if len(outputs) != len(targets):
+            raise RuntimeError("rollout generation output count does not match targets")
+        metric_rows = []
+        for output, target in zip(outputs, targets):
+            choice = output.outputs[0]
+            reward_result = self.reward_fn(choice.text, target)
+            values = {"reward": _rollout_reward_value(reward_result)}
+            if self.metrics_fn is not None:
+                values.update(self.metrics_fn(choice.text, target, reward_result))
+            missing = [name for name in self.metric_names if name not in values]
+            if missing:
+                raise ValueError(
+                    "rollout metrics_fn did not produce: " + ", ".join(missing)
+                )
+            metric_rows.append([float(values[name]) for name in self.metric_names])
+        logits = torch.tensor(metric_rows, dtype=torch.float32)
+        reward_index = self.metric_names.index("reward")
+        return RolloutOutput(
+            loss=-logits[:, reward_index].mean(),
+            logits=logits,
+            loss_labels=torch.zeros(len(metric_rows), dtype=torch.long),
+            timing=ProbeTiming(
+                engine_call_s=engine_s,
+                forward_total_s=time.perf_counter() - forward_t0,
+            ),
+        )
+
+    def zo_estimate(
+        self,
+        inputs: Mapping[str, Any],
+        *,
+        step: int,
+        compute_loss_from_outputs_fn: Callable[[Mapping[str, Any]], torch.Tensor],
+    ) -> ZOPendingStep:
+        del compute_loss_from_outputs_fn
+        prompts, targets = _rollout_inputs(inputs)
+        estimate = getattr(self.zo_model, "estimate", None)
+        if not callable(estimate):
+            raise TypeError("rollout runtime must implement estimate")
+        return estimate(
+            RolloutProbeBatch(
+                rollout_prompts=prompts,
+                rollout_targets=targets,
+                rollout_reward_fn=self.reward_fn,
+                rollout_max_tokens=self.max_tokens,
+                rollout_temperature=self.temperature,
+                rollout_top_p=self.top_p,
+                rollout_seed=self.seed,
+            ),
+            step=int(step),
+        )
+
+    def _clean_lora_id(self) -> int | None:
+        clean_lora_id = getattr(self.zo_model, "clean_lora_id_for_score", None)
+        if not callable(clean_lora_id):
+            return None
+        value = clean_lora_id()
+        return None if value is None else int(value)
+
+
+def _rollout_inputs(inputs: Mapping[str, Any]) -> tuple[list[str], list[Any]]:
+    private_fields = sorted(key for key in inputs if key.startswith("_zo_"))
+    if private_fields:
+        raise ValueError(
+            "HF batches cannot select runtime-private state: "
+            + ", ".join(private_fields)
+        )
+    prompts = inputs.get("rollout_prompts")
+    targets = inputs.get("rollout_targets")
+    if not isinstance(prompts, Sequence) or isinstance(prompts, (str, bytes)):
+        raise TypeError("rollout_prompts must be a sequence")
+    if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
+        raise TypeError("rollout_targets must be a sequence")
+    prompt_rows = [str(prompt) for prompt in prompts]
+    target_rows = list(targets)
+    if not prompt_rows:
+        raise ValueError("rollout_prompts must not be empty")
+    if len(prompt_rows) != len(target_rows):
+        raise ValueError("rollout_prompts and rollout_targets must have equal length")
+    return prompt_rows, target_rows
+
+
+def _rollout_reward_value(reward_result: Any) -> float:
+    if isinstance(reward_result, tuple):
+        if len(reward_result) != 2:
+            raise ValueError("rollout reward tuple must contain metadata and reward")
+        return float(reward_result[1])
+    return float(reward_result)
 
 
 def hf_batch_to_token_groups(

@@ -119,6 +119,13 @@ HF `compute_loss_func`, `ZOTrainer` does not inspect the task name or output
 subclass. Causal-LM and prompt-option output classes only select built-in
 default losses when no custom loss function is provided.
 
+Generation-reward tasks use `ZORolloutTrainerModel`. Its `zo_estimate()` maps
+the HF collator batch to `RolloutProbeBatch`, while `forward()` performs a clean
+rollout and returns standard `loss`, `logits`, and labels for the native HF
+evaluation loop. The task supplies only its reward function, optional per-row
+metric projection, collator, and `compute_metrics`; it does not subclass
+`ZOTrainer` or replace `evaluate()`.
+
 The worker does not compute token NLL again when causal logits are requested.
 Classification request NLL is computed once on GPU and is not copied to CPU.
 After HF computes every probe-group loss, all group scalars are transferred to
@@ -139,7 +146,7 @@ Current estimator ownership:
 | Layer | Owns | Must Not Own |
 | --- | --- | --- |
 | `ZOTrainer` | HF loop integration, LR scheduler, estimate staging, post-forward loss, logging/eval/save cadence | LoRA slot IDs, perturbation sides, number of queries |
-| `ZOTrainerModel` | One-time HF batch conversion and compact-logits scoring | Task loss, direction sampling, estimator branching, slot allocation policy |
+| `ZOTrainerModel` / `ZORolloutTrainerModel` | HF batch conversion and clean model outputs | Direction sampling, estimator branching, slot allocation policy |
 | `ZOStepper` | callback ordering, direction sampling, estimate construction, runtime apply orchestration | HF scheduler/optimizer policy, dataset/tokenizer semantics |
 | `ZOEstimator` | antithetic, one-sided, multi-query, ES probe plan and aggregation | HF dataloading or metric APIs |
 | `ZOSGDOptimizer` | HF optimizer protocol, LR/weight decay, step ordering, one staged estimate per step | Probe planning, LoRA slots, runtime tensor execution |
@@ -183,7 +190,7 @@ exactly once. `ZOUpdateState` executes that update inside vLLM.
 HF therefore owns scheduler type, warmup, stepping, checkpoint save, and
 checkpoint restore. `zo_applied_learning_rate` reports the value used for the
 current ZO update. Transformers records its standard `learning_rate` before
-advancing the scheduler, so it has the same current-step value. The lower-level
+advancing the scheduler, so it has the same current-step value. Lower-level
 runtime objects expose estimation only; callers must stage the returned
 `ZOPendingStep` in an optimizer rather than applying an update through the
 model or stepper.
