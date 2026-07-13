@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def resolve_path(path_arg: str | Path) -> Path:

@@ -1,7 +1,7 @@
 from pathlib import Path
 import re
 
-from .io import load_json
+from zo_vllm.utils.io import load_json
 from .run_state import read_run_state
 
 
@@ -27,7 +27,7 @@ def _extract_wandb_url_from_log(log_path: Path) -> str | None:
 
 
 def summarize_phase4_job(job_dir: Path) -> dict:
-    result_path = job_dir / "phase4_result.json"
+    result_path = job_dir / "result.json"
     manifest_path = job_dir / "manifest.json"
     state = read_run_state(job_dir)
 

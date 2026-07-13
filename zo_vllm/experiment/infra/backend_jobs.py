@@ -1,0 +1,126 @@
+"""Command builders for the shared backend job wrapper."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def optional_arg(cmd: list[str], name: str, value) -> None:
+    if value is not None:
+        cmd.extend([name, str(value)])
+
+
+def build_backend_job_command(run_dir: Path, gpu: str, spec: dict) -> list[str]:
+    cmd = [
+        ".venv/bin/python",
+        "-u",
+        "-m",
+        "zo_vllm.experiment.runners.backend_job",
+        "--run-dir",
+        str(run_dir),
+        "--job-id",
+        str(spec["job_id"]),
+        "--backend",
+        str(spec["backend"]),
+        "--gpu",
+        str(gpu),
+        "--wandb-project",
+        str(spec.get("wandb_project", "lozo-vllm-phase4")),
+        "--wandb-entity",
+        str(spec.get("wandb_entity", "playeriv65-university-of-minnesota")),
+        "--model-name",
+        str(spec["model_name"]),
+        "--task-name",
+        str(spec["task_name"]),
+        "--task-template",
+        str(spec.get("task_template", "default")),
+        "--max-length",
+        str(spec.get("max_length", 2048)),
+        "--max-new-tokens",
+        str(spec.get("max_new_tokens", 50)),
+        "--steps",
+        str(spec.get("steps", 20000)),
+        "--warmup-steps",
+        str(spec.get("warmup_steps", 0)),
+        "--batch-size",
+        str(spec.get("batch_size", 16)),
+        "--num-samples",
+        str(spec.get("num_samples", 1000)),
+        "--num-dev",
+        str(spec.get("num_dev", 500)),
+        "--eval-interval",
+        str(spec.get("eval_interval", 4000)),
+        "--logging-steps",
+        str(spec.get("logging_steps", 10)),
+        "--seed",
+        str(spec.get("seed", 42)),
+        "--rank",
+        str(spec.get("rank", 8)),
+        "--lr",
+        str(spec.get("lr", 1e-7)),
+        "--eps",
+        str(spec.get("eps", 1e-3)),
+        "--nu",
+        str(spec.get("nu", 100)),
+        "--zo-random-device",
+        str(spec.get("zo_random_device", "cuda")),
+        "--direction-provider",
+        str(spec.get("direction_provider", "lozo")),
+        "--lozo-provider-mode",
+        str(spec.get("lozo_provider_mode", "fast")),
+        "--direction-sampling",
+        str(spec.get("direction_sampling", "exact")),
+        "--perturbation-normalization",
+        str(spec.get("perturbation_normalization", "rms")),
+        "--train-scope",
+        str(spec.get("train_scope", "lora_normal")),
+        "--train-sampler",
+        str(spec.get("train_sampler", "sequential")),
+        "--weight-update-precision",
+        str(spec.get("weight_update_precision", "param")),
+        "--direct-update-mode",
+        str(spec.get("direct_update_mode", "accumulate")),
+        "--quantized-update-mode",
+        str(spec.get("quantized_update_mode", "none")),
+        "--update-bank-rank",
+        str(spec.get("update_bank_rank", "auto")),
+        "--gradient-accumulation-update-steps",
+        str(spec.get("gradient_accumulation_update_steps", 0)),
+        "--u-beta",
+        str(spec.get("u_beta", 1.0)),
+        "--qkv-weight-update",
+        str(spec.get("qkv_weight_update", "batched")),
+        "--gpu-memory-utilization",
+        str(spec.get("gpu_memory_utilization", 0.9)),
+        "--score-chunk-size",
+        str(spec.get("score_chunk_size", 0)),
+        "--progress-interval",
+        str(spec.get("progress_interval", 200)),
+        "--save-strategy",
+        str(spec.get("save_strategy", "steps")),
+        "--save-steps",
+        str(spec.get("save_steps", 0)),
+        "--save-total-limit",
+        str(spec.get("save_total_limit", 3)),
+        "--save-checkpoint-mode",
+        str(spec.get("save_checkpoint_mode", "auto")),
+        "--load-best-model-at-end",
+        str(spec.get("load_best_model_at_end", 0)),
+        "--metric-for-best-model",
+        str(spec.get("metric_for_best_model", "eval_loss")),
+        "--greater-is-better",
+        str(spec.get("greater_is_better", "auto")),
+        "--save-final-checkpoint",
+        str(spec.get("save_final_checkpoint", 0)),
+        "--eval-accuracy-samples",
+        str(spec.get("eval_accuracy_samples", 512)),
+    ]
+    optional_arg(cmd, "--train-set-seed", spec.get("train_set_seed"))
+    optional_arg(cmd, "--dataloader-seed", spec.get("dataloader_seed"))
+    optional_arg(cmd, "--task-shuffle-impl", spec.get("task_shuffle_impl"))
+    optional_arg(cmd, "--u-norm-cap", spec.get("u_norm_cap"))
+    optional_arg(cmd, "--max-num-batched-tokens", spec.get("max_num_batched_tokens"))
+    optional_arg(cmd, "--resume-lora-checkpoint", spec.get("resume_lora_checkpoint"))
+    if spec.get("resume"):
+        cmd.append("--resume")
+    return cmd

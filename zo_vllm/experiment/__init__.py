@@ -1,11 +1,11 @@
 """Reusable experiment orchestration utilities."""
 
-from .io import load_json, write_json
-from .manifest import append_launch_record, load_manifest, write_manifest
-from .naming import safe_model_name, timestamp_now
-from .paths import project_root, resolve_path
-from .phase4_summary import summarize_phase4_job
-from .run_state import (
+from zo_vllm.utils.io import append_jsonl, load_json, write_json
+from .infra.manifest import append_launch_record, load_manifest, write_manifest
+from .infra.naming import safe_model_name, timestamp_now
+from .infra.paths import project_root, resolve_path
+from .infra.phase4_summary import summarize_phase4_job
+from .infra.run_state import (
     mark_run_completed,
     mark_run_failed,
     mark_run_running,
@@ -14,6 +14,7 @@ from .run_state import (
 
 __all__ = [
     "load_json",
+    "append_jsonl",
     "append_launch_record",
     "load_manifest",
     "mark_run_completed",

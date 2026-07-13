@@ -51,7 +51,7 @@ def ensure_run_dir_available(base_dir: Path) -> None:
 
 
 def tmux_new_window_command(session: str, window: str, body: str) -> list[str]:
-    return ["tmux", "new-window", "-t", session, "-n", window, body]
+    return ["tmux", "new-window", "-a", "-t", f"{session}:", "-n", window, body]
 
 
 def write_job_script(base_dir: Path, window: str, body: str) -> Path:
