@@ -141,6 +141,24 @@ Its final tree is exactly
 `b4b89cec469cc3b5dc0f38aa14ca84b32fd331cc`, byte-for-byte identical to the
 archived dirty tree.
 
+## Worktree Consolidation
+
+Two older detached worktrees still contained intermediate dirty states. They
+were archived before the auxiliary directories were removed:
+
+| Archive tag | Snapshot commit | Tree | Parent |
+|---|---|---|---|
+| `archive/old-speed-1b97142-dirty` | `9d5a84917dbce8fd892e8e0335ab68b20a916745` | `794f7307262b47165fc29fed8a55482d06ef32bf` | `1b97142db259f803f04d5ede3021e6aae653d2ac` |
+| `archive/hf-wrapper-ablation-2af96b1-dirty` | `57b8dc22001e1b2efcd12a11c1f4b9f9a94dcf92` | `5e003df274c32a03a15055046f139655c6afc20f` | `2af96b16634bbeeeaa560e37d876d02cf33320da` |
+
+After consolidation, each independent repository has one canonical worktree:
+
+- `/home/zelin4593/research_local/zo-vllm` on `hf-native`;
+- `/home/zelin4593/research_local/zo-post` on `hf-study-consumers`.
+
+The vLLM, LOZO, AGZO, and ES-at-Scale directories are Git submodules inside
+those repositories, not additional top-level development worktrees.
+
 ## Recovery and Storage
 
 Inspect an archived state without changing branches:
