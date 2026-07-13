@@ -158,6 +158,86 @@ def build_lozo_cmd(args, artifact_dir: Path) -> list[str]:
 
 
 def build_vllm_cmd(args, artifact_dir: Path) -> list[str]:
+    if args.vllm_runner == "hf_phase3":
+        if args.save_strategy != "no" or args.resume_lora_checkpoint is not None:
+            raise ValueError("hf_phase3 speed jobs do not support checkpointing")
+        return [
+            ".venv/bin/python",
+            "-u",
+            "phase3/runners/hf_trainer_speed_migration.py",
+            "--model",
+            args.model_name,
+            "--task",
+            args.task_name,
+            "--task-objective",
+            "registered",
+            "--output-root",
+            str(artifact_dir),
+            "--run-id",
+            "hf_native",
+            "--steps",
+            str(args.steps),
+            "--tail-steps",
+            str(min(100, args.steps)),
+            "--batch-size",
+            str(args.batch_size),
+            "--num-train",
+            str(args.num_samples),
+            "--num-dev",
+            str(args.num_dev),
+            "--max-length",
+            str(args.max_length),
+            "--max-model-len",
+            str(args.max_length),
+            "--max-new-tokens",
+            str(args.max_new_tokens),
+            "--rank",
+            str(args.rank),
+            "--nu",
+            str(args.nu),
+            "--lr",
+            str(args.lr),
+            "--lr-scheduler-type",
+            "constant",
+            "--eps",
+            str(args.eps),
+            "--direction-provider",
+            args.direction_provider,
+            "--lozo-provider-mode",
+            args.lozo_provider_mode,
+            "--random-device",
+            args.zo_random_device,
+            "--direction-sampling",
+            args.direction_sampling,
+            "--perturbation-normalization",
+            args.perturbation_normalization,
+            "--seed",
+            str(args.seed),
+            "--data-seed",
+            str(args.seed if args.train_set_seed is None else args.train_set_seed),
+            "--gpu-memory-utilization",
+            str(args.gpu_memory_utilization),
+            "--direct-update-mode",
+            "accumulate" if args.direct_update_mode == "accumulate" else "direct",
+            "--weight-update-precision",
+            args.weight_update_precision,
+            "--qkv-weight-update",
+            args.qkv_weight_update,
+            "--gradient-accumulation-update-steps",
+            str(args.gradient_accumulation_update_steps),
+            "--u-beta",
+            str(args.u_beta),
+            "--score-chunk-size",
+            str(args.score_chunk_size),
+            "--logging-steps",
+            str(args.logging_steps),
+            *(
+                []
+                if args.max_num_batched_tokens is None
+                else ["--max-num-batched-tokens", str(args.max_num_batched_tokens)]
+            ),
+            *([] if args.u_norm_cap is None else ["--u-norm-cap", str(args.u_norm_cap)]),
+        ]
     task = get_task(args.task_name)
     task_cfg = build_task_config(args)
     data_seed = args.seed if args.train_set_seed is None else args.train_set_seed
@@ -287,7 +367,12 @@ def result_json(backend: str, artifact_dir: Path) -> Path:
     if backend == "lozo":
         candidate = str(artifact_dir / "official_metrics.json")
     else:
-        candidate_path = newest_path(str(artifact_dir / "vllm_perf_*.json"))
+        hf_speed_result = artifact_dir / "hf_native" / "result.json"
+        candidate_path = (
+            hf_speed_result
+            if hf_speed_result.is_file()
+            else newest_path(str(artifact_dir / "vllm_perf_*.json"))
+        )
         candidate = str(candidate_path) if candidate_path is not None else None
     if candidate is None or not Path(candidate).exists():
         raise FileNotFoundError(f"result json not found in {artifact_dir}")
@@ -514,6 +599,11 @@ def parse_args():
     parser.add_argument("--resume-lora-checkpoint", default=None)
     parser.add_argument("--eval-accuracy-samples", type=int, default=512)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--vllm-runner",
+        choices=["legacy", "hf_phase3"],
+        default="legacy",
+    )
     return parser.parse_args()
 
 

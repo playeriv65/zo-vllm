@@ -76,6 +76,7 @@ def build_superglue_scaling_job_specs(args, base_dir: Path) -> list[dict]:
                         {
                             "job_id": job_id,
                             "backend": backend,
+                            "vllm_runner": "hf_phase3",
                             "task_index": task_index,
                             "model_index": model_index,
                             "batch_index": batch_index,

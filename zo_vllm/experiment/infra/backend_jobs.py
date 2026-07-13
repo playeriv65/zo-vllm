@@ -121,6 +121,7 @@ def build_backend_job_command(run_dir: Path, gpu: str, spec: dict) -> list[str]:
     optional_arg(cmd, "--u-norm-cap", spec.get("u_norm_cap"))
     optional_arg(cmd, "--max-num-batched-tokens", spec.get("max_num_batched_tokens"))
     optional_arg(cmd, "--resume-lora-checkpoint", spec.get("resume_lora_checkpoint"))
+    optional_arg(cmd, "--vllm-runner", spec.get("vllm_runner"))
     if spec.get("resume"):
         cmd.append("--resume")
     return cmd

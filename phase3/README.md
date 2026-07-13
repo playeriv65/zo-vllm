@@ -124,6 +124,10 @@ writes and direct base-weight updates contribute smaller stable savings.
 
 ## HF Trainer Same-Parameter Check
 
+The canonical scaling queue marks vLLM jobs with `vllm_runner=hf_phase3`.
+Those jobs run the registered SST-2 or SuperGLUE objective through `ZOTrainer`;
+the official LOZO comparison backend is unchanged.
+
 Current OPT-13B SST-2 classification wrapper comparison uses identical HF
 dataset selection, epoch sampler order, ZO seeds, and runtime parameters. The
 old `+0.901 ms/step` comparison is invalid because its two selected 1000-row
