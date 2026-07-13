@@ -22,7 +22,7 @@ def parse_list(raw: str, cast):
     return [cast(item) for item in raw.split(",") if item]
 
 
-def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, step_interval: int) -> None:
+def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, nu: int) -> None:
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "phase2" / "runners" / "run_convergence_experiment.py"),
@@ -38,16 +38,10 @@ def run_one(args: argparse.Namespace, output_dir: Path, lr: float, rank: int, st
         str(lr),
         "--eps",
         str(args.eps),
-        "--step-interval",
-        str(step_interval),
+        "--nu",
+        str(nu),
         "--eval-interval",
         str(args.eval_interval),
-        "--lora-residency",
-        args.lora_residency,
-        "--lora-injection",
-        args.lora_injection,
-        "--batch-invariant",
-        args.batch_invariant,
         "--enforce-eager",
         args.enforce_eager,
         "--weight-update",
@@ -105,7 +99,7 @@ def row_for(run_dir: Path, config: dict, summary: dict) -> dict:
         "backend": primary["config"]["backend"],
         "lr": config["lr"],
         "rank": config["rank"],
-        "step_interval": config["step_interval"],
+        "nu": config["nu"],
         "initial_loss": primary["initial_loss"],
         "final_loss": primary["final_loss"],
         "loss_change": primary["loss_change"],
@@ -133,7 +127,7 @@ def write_sweep_summary(rows: list[dict], output_root: Path) -> None:
     fieldnames = [
         "lr",
         "rank",
-        "step_interval",
+        "nu",
         "initial_loss",
         "final_loss",
         "loss_change",
@@ -158,12 +152,12 @@ def write_sweep_summary(rows: list[dict], output_root: Path) -> None:
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
     lines = [
-        "| rank | step_interval | lr | initial | final | change | osc | steps/s | run |",
+        "| rank | nu | lr | initial | final | change | osc | steps/s | run |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['rank']} | {row['step_interval']} | {row['lr']:.1e} | "
+            f"| {row['rank']} | {row['nu']} | {row['lr']:.1e} | "
             f"{row['initial_loss']:.6f} | {row['final_loss']:.6f} | "
             f"{row['loss_change']:.6f} | {row['eval_oscillations']} | "
             f"{row['steps_per_s']:.2f} | `{row['run_dir']}` |"
@@ -185,12 +179,9 @@ def main() -> None:
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument("--lrs", default="1e-7,3e-7,1e-6")
     parser.add_argument("--ranks", default="8,16")
-    parser.add_argument("--step-intervals", default="50,100")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
-    parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
-    parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
+    parser.add_argument("--nus", default="50,100")
+    parser.add_argument("--weight-update", choices=["direct"], default="direct")
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
-    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-root", default=None)
     args = parser.parse_args()
@@ -204,20 +195,20 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    for rank, step_interval, lr in itertools.product(
+    for rank, nu, lr in itertools.product(
         parse_list(args.ranks, int),
-        parse_list(args.step_intervals, int),
+        parse_list(args.nus, int),
         parse_list(args.lrs, float),
     ):
-        run_dir = output_root / f"r{rank}_si{step_interval}_lr{lr:.0e}"
+        run_dir = output_root / f"r{rank}_nu{nu}_lr{lr:.0e}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        config = {"rank": rank, "step_interval": step_interval, "lr": lr}
+        config = {"rank": rank, "nu": nu, "lr": lr}
         (run_dir / "sweep_config.json").write_text(
             json.dumps(config, indent=2),
             encoding="utf-8",
         )
         if not (run_dir / "summary.json").exists():
-            run_one(args, run_dir, lr=lr, rank=rank, step_interval=step_interval)
+            run_one(args, run_dir, lr=lr, rank=rank, nu=nu)
         rows.append(row_for(run_dir, config, load_summary(run_dir)))
         write_sweep_summary(rows, output_root)
 

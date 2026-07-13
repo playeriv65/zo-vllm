@@ -15,6 +15,10 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from zo_vllm.experiment.infra.env import hf_cache_env
+
 STEP_LOSS_ABS_TOL = 4e-2
 STEP_C_ABS_TOL = 25.0
 
@@ -59,8 +63,8 @@ def build_common_args(args: argparse.Namespace, output_dir: Path) -> list[str]:
         str(args.rank),
         "--eps",
         str(args.eps),
-        "--step-interval",
-        str(args.step_interval),
+        "--nu",
+        str(args.nu),
         "--batch-size",
         str(args.batch_size),
         "--eval-interval",
@@ -81,25 +85,19 @@ def build_common_args(args: argparse.Namespace, output_dir: Path) -> list[str]:
 
 
 def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
-    if name == "vllm" and args.train_scope != "lora_only":
-        raise SystemExit("vLLM backend only supports --train-scope lora_only")
+    if name == "vllm" and args.train_scope != "lora_normal":
+        raise SystemExit("vLLM backend only supports --train-scope lora_normal")
 
     env = os.environ.copy()
-    cache_root = PROJECT_ROOT / ".cache" / "hf"
     env.update(
         {
-            "VLLM_BATCH_INVARIANT": args.batch_invariant,
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
             "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
-            "HF_HOME": str(cache_root / "home"),
-            "HF_DATASETS_CACHE": str(cache_root / "datasets"),
-            "HF_HUB_CACHE": str(cache_root / "hub"),
-            "HF_XET_CACHE": str(cache_root / "xet"),
-            "TRANSFORMERS_CACHE": str(cache_root / "transformers"),
             "WANDB_MODE": "offline",
             "WANDB_DISABLED": "true",
         }
     )
+    env.update(hf_cache_env(PROJECT_ROOT))
     if args.gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = args.gpu
 
@@ -114,12 +112,6 @@ def run_backend(name: str, args: argparse.Namespace, output_dir: Path) -> None:
             sys.executable,
             str(PROJECT_ROOT / "phase2" / "runners" / "train_convergence.py"),
             *build_common_args(args, output_dir),
-            "--lora-residency",
-            args.lora_residency,
-            "--lora-injection",
-            args.lora_injection,
-            "--batch-invariant",
-            args.batch_invariant,
             "--enforce-eager",
             args.enforce_eager,
             "--weight-update",
@@ -328,22 +320,19 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-7)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--eps", type=float, default=1e-3)
-    parser.add_argument("--step-interval", type=int, default=100)
+    parser.add_argument("--nu", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
-    parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
-    parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
+    parser.add_argument("--train-scope", choices=["lora_normal"], default="lora_normal")
+    parser.add_argument("--weight-update", choices=["direct"], default="direct")
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
     parser.add_argument(
         "--direction-digest",
         action="store_true",
         help="Enable vLLM U/V digest hashing for strict side-by-side alignment.",
     )
-    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")

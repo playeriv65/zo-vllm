@@ -3,7 +3,7 @@
 This directory contains the strict LOZO baseline vs vLLM fake-LoRA convergence
 path for OPT-2.7B. The current accepted configuration is:
 
-| model | backend | rank | step_interval | lr | eps | batch_size |
+| model | backend | rank | nu | lr | eps | batch_size |
 |---|---|---:|---:|---:|---:|---:|
 | `facebook/opt-2.7b` | vLLM fake-LoRA LOZO | 8 | 50 | 3e-7 | 1e-3 | 16 |
 
@@ -27,8 +27,8 @@ Clean-run artifacts were regenerated after clearing `phase1/results`,
 | 300-step vLLM step time | 0.0864 s/step | PASS |
 | 300-step baseline step time | 0.1155 s/step | reference |
 | sample-level batch invariance max NLL diff | 0.000000000 | PASS |
-| memory LoRA file vs in-memory sign match | 16 / 16 | PASS |
-| memory LoRA file vs in-memory max abs c error | 0.000000 | PASS |
+| archived memory LoRA file vs in-memory sign match | 16 / 16 | historical |
+| archived memory LoRA file vs in-memory max abs c error | 0.000000 | historical |
 
 The 300-step convergence run is a convergence/speed acceptance, not a strict
 per-step tolerance acceptance. It had 6 loss-diff tolerance excursions and 3
@@ -43,7 +43,8 @@ Clean-run validation artifacts:
 - `phase2/results/convergence/side_by_side20_20260523_clean/summary.json`
 - `phase2/results/convergence/convergence300_20260523_clean/summary.json`
 - `phase2/results/batch_invariance/sample_level_20260523_clean.json`
-- `phase2/results/milestone1_2_20260523_162450.json`
+- `phase2/results/milestone1_2_20260523_162450.json` (archived CPU-mock
+  comparison; the CPU-mock implementation has since been removed)
 
 ## Main Entry Points
 
@@ -59,16 +60,13 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   --rank 8 \
   --lr 3e-7 \
   --eps 1e-3 \
-  --step-interval 50 \
+  --nu 50 \
   --zo-random-device cuda \
-  --lora-residency gpu \
-  --lora-injection direct \
   --weight-update direct \
   --weight-update-precision param \
-  --batch-invariant 0 \
   --enforce-eager 1 \
   --eval-interval 20 \
-  --output-dir phase2/results/convergence/manual_r8_si50_lr3e-7 \
+  --output-dir phase2/results/convergence/manual_r8_nu50_lr3e-7 \
   --no-wandb
 ```
 
@@ -81,15 +79,12 @@ Run the 100-step sweep:
   --batch-size 16 \
   --eps 1e-3 \
   --eval-interval 20 \
-  --lora-residency gpu \
-  --lora-injection direct \
   --weight-update direct \
   --weight-update-precision param \
-  --batch-invariant 0 \
   --enforce-eager 1 \
   --lrs 1e-7,3e-7,1e-6 \
   --ranks 8,16 \
-  --step-intervals 50,100 \
+  --nus 50,100 \
   --output-root phase2/results/convergence/sweep100_manual
 ```
 
@@ -99,15 +94,14 @@ Syntax check:
 
 ```bash
 .venv/bin/python -m py_compile \
-  zo_vllm/core/lozo_controller.py \
-  zo_vllm/core/temp_lora_runtime.py \
-  zo_vllm/core/vllm_scorer.py \
+  zo_vllm/training/direction/ \
+  zo_vllm/core/lora_runtime/ \
+  zo_vllm/experiment/scoring/generate_scorer.py \
   zo_vllm/core/weight_sync.py \
   phase2/runners/run_baseline_helper.py \
   phase2/runners/train_convergence.py \
   phase2/runners/run_convergence_experiment.py \
   phase2/runners/run_convergence_sweep.py \
-  phase2/validation/memory_lora_test_utils.py \
   phase2/validation/test_batch_invariance.py
 ```
 
@@ -118,40 +112,28 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_real_lozo
   --steps 3 \
   --eval-interval 3 \
   --zo-random-device cuda \
-  --lora-residency gpu \
-  --lora-injection direct \
   --weight-update direct \
   --weight-update-precision param \
-  --batch-invariant 0 \
   --enforce-eager 1 \
   --output-dir phase2/results/convergence/acceptance_side_by_side_smoke
 
 CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_batch_invariance.py \
   --output-json phase2/results/batch_invariance/sample_level_manual.json
 
-CUDA_VISIBLE_DEVICES=<GPU_IDS> VLLM_BATCH_INVARIANT=1 \
-VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+CUDA_VISIBLE_DEVICES=<GPU_IDS> VLLM_ENABLE_V1_MULTIPROCESSING=0 \
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
 .venv/bin/python phase2/validation/test_training_loop.py
 
-CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_memory_lora_alignment.py
-CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_memory_lora_multi.py
-CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_memory_lora_speed.py
 ```
 
 ## Implementation Notes
 
 - OPT-2.7B must use fp16, not bf16.
-- Training defaults to `VLLM_BATCH_INVARIANT=0` for speed. Set it to `1` only
-  for explicit sample-level batch-invariance validation or when reproducing the
-  older invariant acceptance runs.
-- Phase 2 CLIs default to `--lora-residency gpu`. The CPU mock path remains
-  available for regression of the original in-memory safetensors loader, but it
-  is no longer the speed acceptance path.
-- `--lora-injection auto` selects the training-only direct updater on GPU and
-  the manager path on CPU. Direct injection creates fixed plus/minus LoRA slots
-  once, then overwrites the slot tensors in place each step. `manager` remains
-  available as a fallback and comparison path.
+- Training CLIs do not read or set `VLLM_BATCH_INVARIANT`. Dedicated
+  sample-level batch-invariance validation scripts handle that env var
+  themselves.
+- LoRA perturbations use GPU direct slots only. The old CPU mock safetensors
+  loader and manager reload comparison path have been removed from active CLIs.
 - `--enforce-eager 1` is the default because it avoids a large vLLM
   torch.compile/CUDA graph startup cost. `--enforce-eager 0` can improve steady
   training-loop time on longer runs.
@@ -166,20 +148,14 @@ CUDA_VISIBLE_DEVICES=<GPU_IDS> .venv/bin/python phase2/validation/test_memory_lo
   `CUDA_VISIBLE_DEVICES` in the shell/job launcher. The optional `--gpu` flag
   only exists as a one-off environment override and accepts whatever ID string
   the current allocation requires.
-- `TempLoRARuntime` uses stable plus/minus LoRA IDs. The CPU mock path still
-  uses vLLM `LoRARequest(load_inplace=True)` to avoid stale cache hits. The GPU
-  direct path initializes two slots through the manager once, then writes
+- `LoRAUpdateRuntime` uses stable plus/minus LoRA IDs. The direct path
+  initializes two slots through the manager once, then writes
   `lora_a_stacked`/`lora_b_stacked` through each wrapper's `set_lora()` without
   per-step `remove_adapter/add_adapter/activate_adapter`.
-- `LOZOController` supports `train_scope=lora_only` for vLLM-compatible
-  Linear-only perturbations and `train_scope=full` for HF baseline ablations
-  that include embeddings and 1D parameters.
-- `WeightSync` copies packed QKV slices in place instead of cloning the full
-  packed tensor per layer.
+- `LOZO direction provider` supports only `train_scope=lora_normal` and keeps metadata,
+  not full master weight copies.
 - `--weight-update direct` applies the LOZO base-weight update inside the vLLM
-  worker, so vLLM's base weights become the training master state. The `copy`
-  path remains available for regression against the older external-master plus
-  full-weight sync flow.
+  worker, so vLLM's base weights become the training master state.
 
 ## Clean-Run Details
 

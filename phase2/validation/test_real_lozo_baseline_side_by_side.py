@@ -30,16 +30,13 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-7)
     parser.add_argument("--eps", type=float, default=1e-3)
-    parser.add_argument("--step-interval", type=int, default=100)
+    parser.add_argument("--nu", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--lora-residency", choices=["cpu", "gpu"], default="gpu")
-    parser.add_argument("--lora-injection", choices=["auto", "direct", "manager"], default="auto")
-    parser.add_argument("--weight-update", choices=["copy", "direct"], default="direct")
+    parser.add_argument("--weight-update", choices=["direct"], default="direct")
     parser.add_argument("--weight-update-precision", choices=["float32", "param"], default="param")
-    parser.add_argument("--batch-invariant", choices=["0", "1"], default="0")
     parser.add_argument("--enforce-eager", choices=["0", "1"], default="1")
     parser.add_argument("--loss-tol", type=float, default=4e-2)
     parser.add_argument("--c-tol", type=float, default=25.0)
@@ -65,8 +62,8 @@ def main() -> None:
         str(args.lr),
         "--eps",
         str(args.eps),
-        "--step-interval",
-        str(args.step_interval),
+        "--nu",
+        str(args.nu),
         "--batch-size",
         str(args.batch_size),
         "--eval-interval",
@@ -75,20 +72,14 @@ def main() -> None:
         str(args.seed),
         "--zo-random-device",
         args.zo_random_device,
-        "--lora-residency",
-        args.lora_residency,
-        "--lora-injection",
-        args.lora_injection,
         "--weight-update",
         args.weight_update,
         "--weight-update-precision",
         args.weight_update_precision,
-        "--batch-invariant",
-        args.batch_invariant,
         "--enforce-eager",
         args.enforce_eager,
         "--train-scope",
-        "lora_only",
+        "lora_normal",
         "--direction-digest",
         "--output-dir",
         str(output_dir),

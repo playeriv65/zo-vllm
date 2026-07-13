@@ -5,9 +5,9 @@
 ### Completed
 - ✅ Shard_id write for qkv_proj (can write q/k/v separately)
 - ✅ HF→vLLM complete parameter mapping
-- ✅ LOZOController with V cache
-- ✅ TempLoRARuntime for all layers
-- ✅ GPU-resident TempLoRARuntime path for plus/minus LoRA slots
+- ✅ LOZO direction provider with V cache
+- ✅ LoRAUpdateRuntime for all layers
+- ✅ GPU-resident LoRAUpdateRuntime path for plus/minus LoRA slots
 
 ### Simplifications (accepted vLLM scope)
 
@@ -36,8 +36,8 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 - Linear layers' bias (if present)
 
 **Current handling**:
-- vLLM accepted path uses `train_scope=lora_only`, so 1D params remain skipped.
-- HF/LOZO baseline supports `train_scope=full` for ablations that include 1D params.
+- vLLM accepted path is `train_scope=lora_normal`; 1D params are not sampled or
+  updated in `LOZO direction provider`.
 
 ---
 
@@ -54,10 +54,8 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 - `embed_positions.weight`: Position embeddings (OPT uses learned position embeddings)
 
 **Current handling**:
-- vLLM accepted path uses `train_scope=lora_only`, so embeddings remain skipped.
-- HF/LOZO baseline supports `train_scope=full` for ablations that include embeddings.
-- 100-step baseline ablation with CUDA RNG: `full` drops eval loss by `0.250000`;
-  `lora_only` drops by `0.140625` under the same hyperparameters.
+- vLLM accepted path uses `train_scope=lora_normal`, so embeddings remain skipped.
+- Full-scope HF/LOZO ablations belong outside the reusable vLLM training path.
 
 ---
 
@@ -65,40 +63,30 @@ else:  # 1D params (bias, layer_norm.weight/bias)
 
 ### Data Flow
 ```
-LOZOController (HF model master weights on CPU or CUDA)
+LOZO direction provider
     │
-    │ 1. Maintain master weights (LoRA-compatible params by default)
-    │ 2. Sample U, V directions (V cached for step_interval steps)
-    │ 3. Build LoRA tensors for perturbation forward
-    │
-    ▼
-TempLoRARuntime (CPU mock or GPU-resident LoRA)
-    │
-    │ 4. Register/select stable plus/minus LoRA IDs
-    │ 5. Update LoRA tensors each step
-    │    - cpu: mock safetensors path + LoRARequest(load_inplace=True)
-    │    - gpu/direct: fixed slots + in-place wrapper.set_lora(slot_index, ...)
-    │    - gpu/manager: LoRAModel.from_lora_tensors + model.lora_manager
+    │ 1. Use LoRA-compatible parameter metadata
+    │ 2. Sample U, V directions (V cached for nu steps)
+    │ 3. Return direction tensors to the stepper/runtime
     │
     ▼
-VLLMScorer
+LoRAUpdateRuntime (GPU direct slots)
     │
-    │ 6. Compute loss_plus, loss_minus via LoRA forward
-    │
-    ▼
-LOZOController
-    │
-    │ 7. Compute c = (L+ - L-) / (2*eps)
-    │ 8a. copy path: update external master weights
-    │ 8b. direct path: keep vLLM base weights as master
+    │ 4. Register stable plus/minus LoRA IDs
+    │ 5. Write fixed vLLM LoRA slots in place
     │
     ▼
-WeightSync
+Scoring path
     │
-    │ 9a. copy path: map HF names → vLLM names, copy full updated tensors
-    │ 9b. direct path: map HF names → vLLM names, apply in-place low-rank update
+    │ 6. Main runner: direct-worker compact NLL scoring
+    │ 7. Legacy validation: VLLMScorer over LLM.generate(prompt_logprobs=1)
+    │
+    ▼
+Update state / WeightSync
+    │
+    │ 8. Compute c = (L+ - L-) / (2*eps)
+    │ 9. Apply direct base update or accumulated/LoRA-bank update state
     │ 10. Handle packed q/k/v slices
-    │ 11. Write or update other params directly
     │
     ▼
 vLLM Engine (GPU)
@@ -108,9 +96,9 @@ vLLM Engine (GPU)
 
 | Component | File | Description |
 |-----------|------|-------------|
-| LOZOController | `lozo_controller.py` | Master weights, U/V sampling, updates |
-| TempLoRARuntime | `temp_lora_runtime.py` | CPU mock or GPU-resident LoRA for perturbation |
-| VLLMScorer | `vllm_scorer.py` | Loss computation via vLLM |
+| LOZO direction provider | `training/direction/` | Metadata-driven U/V sampling and provider variants |
+| LoRAUpdateRuntime | `core/lora_runtime/` | GPU direct plus/minus LoRA slot registration and writes |
+| VLLMScorer | `experiment/scoring/generate_scorer.py` | Legacy validation loss computation via vLLM `generate()` |
 | WeightSync | `weight_sync.py` | Sync updated weights or apply direct vLLM in-place updates |
 
 ---
@@ -119,9 +107,10 @@ vLLM Engine (GPU)
 
 ### Single-process mode required
 
-**Issue**: CPU mock functions only work in single-process mode. The
-GPU-resident path also currently uses `LLM.apply_model()` and is validated for
-the same UniProc research harness, not general vLLM multi-process serving.
+**Issue**: the Phase 2 research harness uses `LLM.apply_model()` to reach
+worker-local LoRA slots and direct weight updates. Keep it in the same UniProc
+mode used by the accepted validation commands; serving-time ZO has its own
+worker RPC path.
 
 **Environment variables**:
 ```bash
@@ -135,13 +124,13 @@ Current default is `--enforce-eager 1` for low startup cost; set
 `--enforce-eager 0` only when the run is long enough to amortize compile and
 graph-capture time.
 
-**Future work**: Add a first-class vLLM worker RPC for in-memory CUDA LoRA
-tensors if multi-process serving becomes a requirement.
+**Serving path**: serving-time ZO uses worker RPC and `AsyncLoRASlotRegistry`
+instead of the Phase 2 validation harness.
 
 ### GPU-resident LoRA path
 
-`--lora-residency gpu --lora-injection direct` avoids the old host round trip
-and the per-step LoRAModelManager reload:
+GPU direct LoRA slots avoid the old host round trip and the per-step
+LoRAModelManager reload:
 
 ```text
 CUDA U/V -> CUDA LoRA A/B -> fixed plus/minus slot
@@ -149,12 +138,11 @@ CUDA U/V -> CUDA LoRA A/B -> fixed plus/minus slot
 ```
 
 The direct updater still uses vLLM's wrapper APIs, so packed qkv expansion,
-tensor-parallel slicing, and slot layout remain centralized in vLLM. The
-manager path remains available with `--lora-injection manager`.
+tensor-parallel slicing, and slot layout remain centralized in vLLM.
 
 Short validation:
-- vLLM CPU mock vs GPU residency: exact seed, U/V digest, plus/minus loss, and
-  `c` match for 3/3 steps.
+- Archived CPU-mock comparison showed exact seed, U/V digest, plus/minus loss,
+  and `c` match for 3/3 steps before that path was removed.
 - GPU direct side-by-side vs LOZO baseline: 20/20 steps accepted,
   `direction_digest_mismatch_steps=[]`, `sign_fail_steps=[]`,
   `max_loss_plus_diff=0.009428`, `max_loss_minus_diff=0.009200`,
@@ -163,14 +151,12 @@ Short validation:
 
 ### Direct base-weight update path
 
-`--weight-update direct` skips the old sequence:
+`--weight-update direct` replaces the removed full-weight copy sequence that
+first updated an HF-side master tensor dict and then copied every updated
+weight into vLLM.
 
-```text
-LOZOController.apply_update_to_master()
-    -> WeightSync.sync(full_updated_weights)
-```
-
-and instead applies the update in the vLLM worker:
+`LOZO direction provider` now keeps only parameter metadata for direction sampling, and
+the update is applied in the vLLM worker:
 
 ```text
 W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
@@ -178,12 +164,12 @@ W <- W * (1 - lr * weight_decay) - lr * c * U @ V.T
 
 For packed OPT q/k/v weights, the update is applied to the corresponding
 `qkv_proj.weight` slice. For other Linear weights, it is applied directly to
-the base layer weight. The `float32` precision mode mirrors the controller's
+the base layer weight. The `float32` precision mode mirrors the plain LOZO provider's
 math; the faster `param` precision mode uses the vLLM parameter dtype and true
 in-place `addmm_`.
 
 Short validation:
-- Fake packed-qkv unit check: exact equality with the controller formula in
+- Fake packed-qkv unit check: exact equality with the plain LOZO update formula in
   `float32` mode.
 - Clean 20-step `direct/param` side-by-side vs LOZO baseline accepted:
   `direction_digest_mismatch_steps=[]`, `sign_fail_steps=[]`,
@@ -199,9 +185,9 @@ Short validation:
 
 ### Execution flags
 
-- `--batch-invariant 0` is the training default. Use `--batch-invariant 1` only
-  for explicit sample-level batch-invariance validation or reproducing older
-  accepted runs.
+- Training runners do not read or set `VLLM_BATCH_INVARIANT`; it is not a
+  runner setting. Dedicated sample-level batch-invariance validation may still
+  set the env var internally.
 - `--enforce-eager 1` is the default because it keeps vLLM engine startup low.
   A 20-step GPU-resident timing ablation found the fastest loop at
   `batch_invariant=0,enforce_eager=0` (`step_s_mean=0.2092`,

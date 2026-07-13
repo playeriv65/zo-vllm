@@ -89,7 +89,6 @@ class ConvergenceTrainer(LowRankTrainer):
 
     def lowrank_zo_step(self, model, inputs):
         step_t0 = time.perf_counter()
-        args = self.args
         if hasattr(self, 'step'):
             self.step += 1
         else:
@@ -158,7 +157,7 @@ def main():
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--eps", type=float, default=1e-3)
-    parser.add_argument("--step-interval", type=int, default=100)
+    parser.add_argument("--nu", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-interval", type=int, default=20)
     parser.add_argument(
@@ -168,7 +167,7 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zo-random-device", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--train-scope", choices=["lora_only", "full"], default="lora_only")
+    parser.add_argument("--train-scope", choices=["lora_normal", "full"], default="lora_normal")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
@@ -182,7 +181,7 @@ def main():
     rank_r = args.rank
     lr = args.lr
     zo_eps = args.eps
-    step_interval = args.step_interval
+    nu = args.nu
     batch_size = args.batch_size
     num_steps = args.steps
 
@@ -226,8 +225,6 @@ def main():
     # Set numpy seed again (same as vLLM version before training loop)
     np.random.seed(args.seed)
 
-    # max_steps = num_steps (not len(prompts))
-    total_train_batch_size = batch_size * 1  # no gradient accumulation
     max_epochs = num_steps // (len(dataset) // batch_size) + 2
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -252,7 +249,7 @@ def main():
         rank_r=rank_r,
         lozo_random_device=args.zo_random_device,
         lozo_train_scope=args.train_scope,
-        step_interval=step_interval,
+        step_interval=nu,
         trainer="LOZO",
         per_device_train_batch_size=batch_size,
         max_steps=num_steps,
@@ -305,7 +302,7 @@ def main():
                 "rank_r": rank_r,
                 "lr": lr,
                 "zo_eps": zo_eps,
-                "step_interval": step_interval,
+                "nu": nu,
                 "batch_size": batch_size,
                 "num_steps": num_steps,
                 "backend": "baseline",
