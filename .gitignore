@@ -25,15 +25,15 @@ adapters*/
 phase1*_results.json
 phase1/artifacts/
 phase2/artifacts/
-phase2/results/
-phase3/results/
-phase4/results/
-phase5/results/
-phase6/results/
+phase2/results
+phase3/results
+phase4/results
+phase5/results
+phase6/results
 phase7/logs/
-zo_vllm_runs/
+zo_vllm_runs
 zo_post/artifacts/
-zo_post/results/
+zo_post/results
 zo_post/logs/
 phase4/LOZO.pdf
 /LOZO.pdf
@@ -42,8 +42,8 @@ preprint_package.zip
 
 # Logs and results
 logs/
-results/
-phase1/results/
+results
+phase1/results
 phase1/*.log
 wandb/
 scratch/
