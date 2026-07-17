@@ -6,9 +6,11 @@ from argparse import Namespace
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from zo_vllm.experiment.infra.stats import summarize, summarize_tail
+from zo_vllm.experiment.infra.storage import resolve_artifact_path
 
 
 @dataclass(frozen=True)
@@ -31,16 +33,28 @@ def resolve_vllm_output_paths(
 
     if args.output_dir is not None:
         return ResolvedOutputPaths(
-            output_dir=str(args.output_dir),
+            output_dir=str(
+                resolve_artifact_path(
+                    args.output_dir,
+                    project_name="zo-vllm",
+                    fallback_root=project_root,
+                )
+            ),
             output_root=None,
             experiment_name=None,
         )
-    default_output_root = (
-        os.path.join(project_root, "zo_post", "results")
+    default_output_root = Path(
+        "zo_post/results"
         if args.direction_provider in {"agzo", "uagzo", "suagzo"}
-        else os.path.join(project_root, "phase3", "results")
+        else "phase3/results"
     )
-    output_root = str(args.output_root or default_output_root)
+    output_root = str(
+        resolve_artifact_path(
+            args.output_root or default_output_root,
+            project_name="zo-vllm",
+            fallback_root=project_root,
+        )
+    )
     experiment_name = str(
         args.experiment_name
         or (
@@ -220,7 +234,9 @@ def write_vllm_perf_json(
                     },
                 },
                 "checkpoints": ckpt_paths,
-                "checkpoint_records": [] if checkpoint_records is None else checkpoint_records,
+                "checkpoint_records": []
+                if checkpoint_records is None
+                else checkpoint_records,
                 "best_checkpoint": best_checkpoint,
                 "loaded_best_checkpoint": loaded_best_checkpoint,
                 "u_snapshots": u_snapshot_paths,

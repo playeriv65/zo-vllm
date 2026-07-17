@@ -20,6 +20,7 @@ from zo_trainer import (
     ZOTrainerArguments,
     ZOTrainerModel,
 )
+from zo_vllm.experiment.infra.storage import resolve_artifact_path
 from zo_vllm.utils.io import append_jsonl, write_json
 from zo_vllm.tasks.hf_preprocessing import (
     load_sst2_prompt_classification_datasets,
@@ -447,9 +448,11 @@ def _make_run_dir(server_args: Any, request: ServingZOStartRequest) -> Path:
     name = request.run_name or (
         f"serving_sst2_r{request.rank}_bank{request.update_bank_rank}_{ts}"
     )
-    output_root = Path(request.output_dir).expanduser()
-    if not output_root.is_absolute():
-        output_root = PROJECT_ROOT / output_root
+    output_root = resolve_artifact_path(
+        request.output_dir,
+        project_name="zo-vllm",
+        fallback_root=PROJECT_ROOT,
+    )
     run_dir = output_root / f"{model_slug}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
