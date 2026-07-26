@@ -45,6 +45,24 @@ class UProvider(Protocol):
         ...
 
 
+class UPoolIndexSelector(Protocol):
+    """Select local orthogonal-pool columns for every target in a ZO step."""
+
+    def select_indices(
+        self,
+        *,
+        step: int,
+        u_dim: int,
+        targets: Sequence[DirectionSpec],
+    ) -> Mapping[str, Sequence[int]]:
+        """Return one local index sequence for each requested target."""
+        ...
+
+    def info(self) -> Mapping[str, Any]:
+        """Return selector provenance for direction logging."""
+        ...
+
+
 class VProvider(Protocol):
     """Provider that generates V matrices on request."""
 
@@ -184,6 +202,7 @@ class _OrthogonalUPoolBase:
         self.u_dim = int(u_dim)
         self.seed = int(seed)
         self.u_pool_seed_offset = int(u_pool_seed_offset)
+        self._u_pool_generation = 0
         self._u_pools: dict[
             tuple[str, int, torch.device, torch.dtype],
             torch.Tensor,
@@ -193,7 +212,17 @@ class _OrthogonalUPoolBase:
         return {
             "u_dim": self.u_dim,
             "u_pool_seed_offset": self.u_pool_seed_offset,
+            "u_pool_generation": self._u_pool_generation,
         }
+
+    def _set_u_pool_generation(self, generation: int) -> None:
+        generation_i = int(generation)
+        if generation_i < 0:
+            raise ValueError("U pool generation must be non-negative")
+        if generation_i == self._u_pool_generation:
+            return
+        self._u_pool_generation = generation_i
+        self._u_pools.clear()
 
     @torch.no_grad()
     def _u_pool_for(
@@ -229,9 +258,13 @@ class _OrthogonalUPoolBase:
     def _pool_seed_for(self, name: str) -> int:
         digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
         name_seed = int.from_bytes(digest, byteorder="little", signed=False)
-        return int(self.u_pool_seed_offset + self.seed * 1_000_000 + name_seed) % (
-            2**63 - 1
-        )
+        generation_seed = self._u_pool_generation * 10_000_000_000
+        return int(
+            self.u_pool_seed_offset
+            + self.seed * 1_000_000
+            + generation_seed
+            + name_seed
+        ) % (2**63 - 1)
 
 
 class PoolUProvider(_OrthogonalUPoolBase):
@@ -244,6 +277,7 @@ class PoolUProvider(_OrthogonalUPoolBase):
         u_dim: int,
         seed: int = 0,
         u_pool_seed_offset: int = 300000,
+        index_selector: UPoolIndexSelector | None = None,
     ) -> None:
         if int(u_dim) < int(rank):
             raise ValueError("u_dim must be greater than or equal to rank")
@@ -253,6 +287,66 @@ class PoolUProvider(_OrthogonalUPoolBase):
             u_pool_seed_offset=int(u_pool_seed_offset),
         )
         self.rank = int(rank)
+        self.index_selector = index_selector
+
+    def set_index_selector(self, selector: UPoolIndexSelector | None) -> None:
+        """Install a per-target selector without changing the stored U pools."""
+
+        self.index_selector = selector
+
+    def info(self) -> dict[str, Any]:
+        values = {
+            **super().info(),
+            "u_provider": "pool",
+            "u_pool_index_mode": (
+                "per_target_random"
+                if self.index_selector is None
+                else "per_target_selector"
+            ),
+        }
+        selector_info = getattr(self.index_selector, "info", None)
+        if callable(selector_info):
+            values.update(dict(selector_info()))
+        return values
+
+    def state_dict(self) -> dict[str, Any]:
+        selector_state = None
+        state_dict = getattr(self.index_selector, "state_dict", None)
+        if callable(state_dict):
+            selector_state = state_dict()
+        return {
+            "type": "pool_u_provider",
+            "rank": self.rank,
+            "u_dim": self.u_dim,
+            "seed": self.seed,
+            "u_pool_seed_offset": self.u_pool_seed_offset,
+            "u_pool_generation": self._u_pool_generation,
+            "index_selector": selector_state,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("type") != "pool_u_provider":
+            raise ValueError("invalid pool U provider checkpoint")
+        expected = {
+            "rank": self.rank,
+            "u_dim": self.u_dim,
+            "seed": self.seed,
+            "u_pool_seed_offset": self.u_pool_seed_offset,
+        }
+        for key, value in expected.items():
+            if int(state.get(key, -1)) != int(value):
+                raise ValueError(f"pool U provider checkpoint mismatch: {key}")
+        self._set_u_pool_generation(int(state.get("u_pool_generation", 0)))
+        selector_state = state.get("index_selector")
+        if selector_state is None:
+            return
+        load_state_dict = getattr(self.index_selector, "load_state_dict", None)
+        if not callable(load_state_dict):
+            raise RuntimeError(
+                "pool U checkpoint contains selector state but no compatible "
+                "selector is installed"
+            )
+        load_state_dict(selector_state)
 
     @torch.no_grad()
     def collect(
@@ -264,22 +358,122 @@ class PoolUProvider(_OrthogonalUPoolBase):
         basis_seed: int,
         perturb_seed: int,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-        del batch, step, basis_seed, perturb_seed
-        return {
-            spec.name: {
-                "U": self.sample(
-                    name=spec.name,
-                    out_features=int(spec.out_features),
-                    rank=int(spec.rank),
-                    device=spec.device,
-                    dtype=spec.dtype,
+        del batch, basis_seed, perturb_seed
+        target_list = list(targets)
+        generation_for_step = getattr(
+            self.index_selector, "pool_generation_for_step", None
+        )
+        if callable(generation_for_step):
+            self._set_u_pool_generation(generation_for_step(step=int(step)))
+        selected_indices = self._selected_indices_for_step(
+            target_list, step=int(step)
+        )
+        scale_for_selection = getattr(
+            self.index_selector, "u_scale_for_selection", None
+        )
+        selected_scales: list[float] = []
+        u_map: dict[str, dict[str, Any]] = {}
+        for spec in target_list:
+            indices = (
+                None if selected_indices is None else selected_indices[spec.name]
+            )
+            u_value = self.sample(
+                name=spec.name,
+                out_features=int(spec.out_features),
+                rank=int(spec.rank),
+                device=spec.device,
+                dtype=spec.dtype,
+                indices=indices,
+            )
+            if indices is not None and callable(scale_for_selection):
+                scale = float(
+                    scale_for_selection(
+                        step=int(step),
+                        target_name=spec.name,
+                        indices=indices,
+                    )
                 )
-            }
-            for spec in targets
-        }, {
+                if not math.isfinite(scale) or scale <= 0.0:
+                    raise ValueError("U selector importance scale must be positive")
+                u_value.mul_(scale)
+                selected_scales.append(scale)
+            u_map[spec.name] = {"U": u_value}
+        info = {
             "u_provider": "pool",
-            "u_direction_sampling": "pool_columns",
+            "u_pool_generation": self._u_pool_generation,
+            "u_direction_sampling": (
+                "pool_columns"
+                if selected_indices is None
+                else "selected_per_target_pool_columns"
+            ),
         }
+        if selected_indices is not None:
+            serialized = "|".join(
+                f"{name}:{','.join(str(value) for value in indices)}"
+                for name, indices in selected_indices.items()
+            )
+            info["u_pool_action_digest"] = hashlib.blake2b(
+                serialized.encode("utf-8"), digest_size=8
+            ).hexdigest()
+            info["u_pool_action_num_targets"] = len(selected_indices)
+            info["u_pool_action_unique_indices"] = len(
+                {
+                    int(value)
+                    for indices in selected_indices.values()
+                    for value in indices
+                }
+            )
+        if selected_scales:
+            info["u_pool_importance_scale_mean"] = sum(selected_scales) / len(
+                selected_scales
+            )
+            info["u_pool_importance_scale_max"] = max(selected_scales)
+        return u_map, info
+
+    def _selected_indices_for_step(
+        self,
+        targets: Sequence[DirectionSpec],
+        *,
+        step: int,
+    ) -> dict[str, tuple[int, ...]] | None:
+        if self.index_selector is None:
+            return None
+        raw_by_name = self.index_selector.select_indices(
+            step=int(step),
+            u_dim=self.u_dim,
+            targets=targets,
+        )
+        expected_names = [spec.name for spec in targets]
+        if set(raw_by_name) != set(expected_names):
+            missing = sorted(set(expected_names) - set(raw_by_name))
+            extra = sorted(set(raw_by_name) - set(expected_names))
+            raise ValueError(
+                "U pool selector target mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+        selected: dict[str, tuple[int, ...]] = {}
+        for spec in targets:
+            indices = tuple(int(value) for value in raw_by_name[spec.name])
+            effective_rank = int(spec.rank)
+            if effective_rank > self.u_dim:
+                raise ValueError(
+                    f"target rank exceeds U pool dimension: {spec.name}"
+                )
+            if len(indices) != effective_rank:
+                raise ValueError(
+                    "U pool selector must return one distinct index per target "
+                    f"rank column: {spec.name}"
+                )
+            if len(set(indices)) != len(indices):
+                raise ValueError(
+                    f"U pool selector indices must be distinct: {spec.name}"
+                )
+            if any(index < 0 or index >= self.u_dim for index in indices):
+                raise ValueError(
+                    f"U pool selector index is outside the configured pool: {spec.name}"
+                )
+            selected[spec.name] = indices
+        return selected
 
     @torch.no_grad()
     def sample(
@@ -290,6 +484,7 @@ class PoolUProvider(_OrthogonalUPoolBase):
         rank: int,
         device: torch.device,
         dtype: torch.dtype,
+        indices: Sequence[int] | None = None,
     ) -> torch.Tensor:
         rank_i = int(rank)
         if rank_i <= 0:
@@ -300,6 +495,15 @@ class PoolUProvider(_OrthogonalUPoolBase):
             device=device,
             dtype=dtype,
         )
+        if indices is not None:
+            if len(indices) != rank_i:
+                raise ValueError("provided U pool indices do not match rank")
+            index_tensor = torch.tensor(
+                list(indices),
+                device=pool.device,
+                dtype=torch.long,
+            )
+            return pool.index_select(1, index_tensor).contiguous()
         if rank_i <= self.u_dim:
             return self._sample_pool_columns(pool, rank_i)
 
@@ -748,11 +952,45 @@ class QueuedAGZOVProvider:
         self.inner = inner
         self.nu = int(nu)
         self.subspace_queue = SubspaceQueue(queue_size)
+        self._preinitialized_step: int | None = None
 
     def will_refresh(self, *, step: int) -> bool:
+        if self._preinitialized_step == int(step) and not self.subspace_queue.is_empty:
+            return False
         if should_refresh_for_nu(step=int(step), nu=self.nu):
             return True
         return bool(self.subspace_queue.is_empty)
+
+    def prime(
+        self,
+        batch: SubspaceTokenProbeBatch,
+        *,
+        targets: Sequence[DirectionSpec],
+        step: int,
+        basis_seed: int,
+        perturb_seed: int,
+    ) -> dict[str, Any]:
+        """Initialize V before an HF-native step consumes a plain token batch."""
+
+        step_i = int(step)
+        if step_i <= 0:
+            raise ValueError("preinitialized V step must be positive")
+        if not self.subspace_queue.is_empty:
+            raise RuntimeError("cannot preinitialize a non-empty V queue")
+        cached_directions, raw = self.inner.collect(
+            batch,
+            targets=targets,
+            step=step_i,
+            basis_seed=int(basis_seed),
+            perturb_seed=int(perturb_seed),
+        )
+        victim_idx = self.subspace_queue.insert(cached_directions)
+        self._preinitialized_step = step_i
+        return {
+            **dict(raw),
+            "basis_preinitialized": True,
+            "subspace_queue_victim_idx": int(victim_idx),
+        }
 
     def collect(
         self,
@@ -763,7 +1001,11 @@ class QueuedAGZOVProvider:
         basis_seed: int,
         perturb_seed: int,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-        refreshed = self.will_refresh(step=int(step))
+        step_i = int(step)
+        preinitialized = (
+            self._preinitialized_step == step_i and not self.subspace_queue.is_empty
+        )
+        refreshed = self.will_refresh(step=step_i)
         if refreshed:
             cached_directions, raw = self.inner.collect(
                 batch,
@@ -777,12 +1019,16 @@ class QueuedAGZOVProvider:
             raw["subspace_queue_victim_idx"] = int(victim_idx)
         else:
             raw = {"basis_reused": True}
+            if preinitialized:
+                raw["basis_preinitialized"] = True
 
         directions = self._combine_v_slots(
             self.subspace_queue.active_slot_items(),
             queue_size=self.subspace_queue.queue_size,
             v_refreshed=refreshed,
         )
+        if preinitialized:
+            self._preinitialized_step = None
         return directions, raw
 
     def info(self) -> dict[str, Any]:
@@ -798,6 +1044,7 @@ class QueuedAGZOVProvider:
             "type": "queued_agzo_v",
             "nu": int(self.nu),
             "subspace_queue": self.subspace_queue.state_dict(),
+            "preinitialized_step": self._preinitialized_step,
         }
 
     def load_state_dict(
@@ -814,6 +1061,8 @@ class QueuedAGZOVProvider:
             state["subspace_queue"],
             direction_specs=direction_specs,
         )
+        raw_step = state.get("preinitialized_step")
+        self._preinitialized_step = None if raw_step is None else int(raw_step)
 
     @torch.no_grad()
     def _combine_v_slots(
@@ -902,6 +1151,7 @@ __all__ = [
     "PoolUProvider",
     "QueuedAGZOVProvider",
     "SubspaceUProvider",
+    "UPoolIndexSelector",
     "GaussianVProvider",
     "UProvider",
     "VProvider",

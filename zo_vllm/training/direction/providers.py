@@ -152,15 +152,57 @@ class FactorizedDirectionProvider:
     def direction_specs(self) -> list[DirectionSpec]:
         return list(self._direction_specs)
 
+    @torch.no_grad()
+    def prime_v(self, batch: ProbeBatch, *, step: int) -> dict[str, Any]:
+        """Build V once before an HF-native training batch reaches the estimator."""
+
+        step_i = int(step)
+        if step_i <= 0:
+            raise ValueError("step must be positive")
+        prime = getattr(self.v_provider, "prime", None)
+        if not callable(prime):
+            raise RuntimeError(
+                "direction V provider does not support preinitialization"
+            )
+        basis_seed = self.basis_seed_offset + step_i + self.seed * 1_000_000
+        perturb_seed = self.perturb_seed_offset + step_i + self.seed * 1_000_000
+        raw = prime(
+            batch,
+            targets=self.direction_specs(),
+            step=step_i,
+            basis_seed=basis_seed,
+            perturb_seed=perturb_seed,
+        )
+        provider_info = {}
+        info_fn = getattr(self.v_provider, "info", None)
+        if callable(info_fn):
+            provider_info = dict(info_fn())
+        return {
+            "direction_provider": self.direction_provider_name,
+            "basis_seed": basis_seed,
+            "perturb_seed": perturb_seed,
+            **provider_info,
+            **{
+                str(key): value
+                for key, value in dict(raw).items()
+                if isinstance(value, (str, int, float, bool))
+            },
+            "subspace_effective_rank": int(self.rank),
+        }
+
     def state_dict(self) -> dict[str, Any]:
         state_dict = getattr(self.v_provider, "state_dict", None)
         if not callable(state_dict):
             raise RuntimeError("direction V provider does not support checkpointing")
-        return {
+        state = {
             "type": "factorized_direction_provider",
             "direction_provider_name": self.direction_provider_name,
             "v_provider": state_dict(),
         }
+        u_state_dict = getattr(self.u_provider, "state_dict", None)
+        if callable(u_state_dict):
+            state["u_provider"] = u_state_dict()
+        return state
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if state.get("type") != "factorized_direction_provider":
@@ -175,8 +217,13 @@ class FactorizedDirectionProvider:
                 state["v_provider"],
                 direction_specs=self.direction_specs(),
             )
-            return
-        load_state_dict(state["v_provider"])
+        else:
+            load_state_dict(state["v_provider"])
+        if "u_provider" in state:
+            load_u_state_dict = getattr(self.u_provider, "load_state_dict", None)
+            if not callable(load_u_state_dict):
+                raise RuntimeError("direction U provider cannot load checkpoints")
+            load_u_state_dict(state["u_provider"])
 
     def next(self, batch: ProbeBatch, *, step: int) -> DirectionSample:
         step_i = int(step)
@@ -461,6 +508,8 @@ class LOZOFastDirectionProvider:
         self.perturb_seed_offset = int(perturb_seed_offset)
         self.seed_sampler = seed_sampler
         self.step = 0
+        self._active_perturb_seed: int | None = None
+        self._active_directions: dict[str, dict[str, torch.Tensor]] | None = None
         self._normalization_info = _perturbation_normalization_info_from_specs(
             self._direction_specs,
             perturbation_normalization=self.perturbation_normalization,
@@ -476,37 +525,68 @@ class LOZOFastDirectionProvider:
         )
 
     def will_refresh(self, *, step: int) -> bool:
+        if self.seed_sampler is not None:
+            return self._active_perturb_seed != self._seed_for_step(step)
         return self.v_provider.will_refresh(step=int(step))
 
     def direction_specs(self) -> list[DirectionSpec]:
         return list(self._direction_specs)
 
     def state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "type": "lozo_fast_direction_provider",
             "step": int(self.step),
+            "active_perturb_seed": self._active_perturb_seed,
             "v_provider": self.v_provider.state_dict(),
         }
+        sampler_state_dict = getattr(self.seed_sampler, "state_dict", None)
+        if callable(sampler_state_dict):
+            state["seed_sampler"] = sampler_state_dict()
+        return state
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if state.get("type") != "lozo_fast_direction_provider":
             raise ValueError("invalid fast LOZO direction provider checkpoint")
         self.step = int(state["step"])
+        raw_active_seed = state.get("active_perturb_seed")
+        self._active_perturb_seed = (
+            None if raw_active_seed is None else int(raw_active_seed)
+        )
+        self._active_directions = None
         self.v_provider.load_state_dict(state["v_provider"])
+        if "seed_sampler" in state:
+            load_sampler_state = getattr(self.seed_sampler, "load_state_dict", None)
+            if not callable(load_sampler_state):
+                raise RuntimeError(
+                    "LOZO checkpoint contains seed-sampler state but no compatible "
+                    "sampler is installed"
+                )
+            load_sampler_state(state["seed_sampler"])
 
     def next(self, batch: ProbeBatch, *, step: int) -> DirectionSample:
         del batch
         step_i = int(step)
         if step_i <= 0:
             raise ValueError("step must be positive")
+        perturb_seed = self._seed_for_step(step_i)
         if self.seed_sampler is None:
-            perturb_seed = self.perturb_seed_offset + step_i + self.seed * 1_000_000
+            directions = self.sample_direction(perturb_seed, step=step_i)
+            refreshed = any(
+                bool(item.get("v_refreshed", False)) for item in directions.values()
+            )
         else:
-            perturb_seed = int(self.seed_sampler(step_i))
-        directions = self.sample_direction(perturb_seed, step=step_i)
-        refreshed = any(
-            bool(item.get("v_refreshed", False)) for item in directions.values()
-        )
+            refreshed = self._active_perturb_seed != perturb_seed
+            if refreshed or self._active_directions is None:
+                directions = self._sample_complete_direction(
+                    perturb_seed,
+                    step=step_i,
+                )
+                self._active_perturb_seed = perturb_seed
+                self._active_directions = directions
+            else:
+                directions = self._active_directions
+            for direction in directions.values():
+                direction["v_refreshed"] = bool(refreshed)
         normalization_info = dict(self._normalization_info)
         return DirectionSample(
             directions=directions,
@@ -521,6 +601,28 @@ class LOZOFastDirectionProvider:
                 "subspace_effective_rank": int(self.rank),
             },
         )
+
+    def _seed_for_step(self, step: int) -> int:
+        step_i = int(step)
+        if step_i <= 0:
+            raise ValueError("step must be positive")
+        if self.seed_sampler is None:
+            return self.perturb_seed_offset + step_i + self.seed * 1_000_000
+        return int(self.seed_sampler(step_i))
+
+    @torch.no_grad()
+    def _sample_complete_direction(
+        self,
+        perturb_seed: int,
+        *,
+        step: int,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        # A lifecycle seed identifies the entire low-rank direction. Clear the
+        # Gaussian V cache so replaying that seed consumes the same RNG stream
+        # for both V and U, independent of the provider's ordinary nu cadence.
+        self.v_provider.v_cache.clear()
+        self.v_provider.vt_cache.clear()
+        return self.sample_direction(int(perturb_seed), step=int(step))
 
     @torch.no_grad()
     def sample_direction(
@@ -644,6 +746,11 @@ class UAGZODirectionProvider(FactorizedDirectionProvider):
 
     def _u_pool_for(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         return self.u_provider._u_pool_for(*args, **kwargs)
+
+    def set_u_index_selector(self, selector: Any | None) -> None:
+        """Install an external per-target U-pool selector for future steps."""
+
+        self.u_provider.set_index_selector(selector)
 
 
 class SUAGZODirectionProvider(FactorizedDirectionProvider):
