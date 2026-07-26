@@ -365,18 +365,14 @@ class PoolUProvider(_OrthogonalUPoolBase):
         )
         if callable(generation_for_step):
             self._set_u_pool_generation(generation_for_step(step=int(step)))
-        selected_indices = self._selected_indices_for_step(
-            target_list, step=int(step)
-        )
+        selected_indices = self._selected_indices_for_step(target_list, step=int(step))
         scale_for_selection = getattr(
             self.index_selector, "u_scale_for_selection", None
         )
         selected_scales: list[float] = []
         u_map: dict[str, dict[str, Any]] = {}
         for spec in target_list:
-            indices = (
-                None if selected_indices is None else selected_indices[spec.name]
-            )
+            indices = None if selected_indices is None else selected_indices[spec.name]
             u_value = self.sample(
                 name=spec.name,
                 out_features=int(spec.out_features),
@@ -448,17 +444,14 @@ class PoolUProvider(_OrthogonalUPoolBase):
             missing = sorted(set(expected_names) - set(raw_by_name))
             extra = sorted(set(raw_by_name) - set(expected_names))
             raise ValueError(
-                "U pool selector target mismatch: "
-                f"missing={missing}, extra={extra}"
+                f"U pool selector target mismatch: missing={missing}, extra={extra}"
             )
         selected: dict[str, tuple[int, ...]] = {}
         for spec in targets:
             indices = tuple(int(value) for value in raw_by_name[spec.name])
             effective_rank = int(spec.rank)
             if effective_rank > self.u_dim:
-                raise ValueError(
-                    f"target rank exceeds U pool dimension: {spec.name}"
-                )
+                raise ValueError(f"target rank exceeds U pool dimension: {spec.name}")
             if len(indices) != effective_rank:
                 raise ValueError(
                     "U pool selector must return one distinct index per target "

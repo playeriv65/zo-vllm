@@ -73,9 +73,7 @@ class FixedPerTargetSelector:
         assert u_dim == 2
         assert all(int(target.rank) == 1 for target in targets)
         self.steps.append(int(step))
-        return {
-            target.name: (self.indices_by_name[target.name],) for target in targets
-        }
+        return {target.name: (self.indices_by_name[target.name],) for target in targets}
 
     def info(self):
         return {"u_selector": "fixed_per_target"}
@@ -88,8 +86,7 @@ class FixedPerTargetSelector:
 
     def load_state_dict(self, state):
         self.indices_by_name = {
-            str(name): int(index)
-            for name, index in state["indices_by_name"].items()
+            str(name): int(index) for name, index in state["indices_by_name"].items()
         }
         self.steps = [int(step) for step in state["steps"]]
 
@@ -450,9 +447,7 @@ def test_uagzo_checkpoint_restores_selector_state():
     resumed.set_u_index_selector(resumed_selector)
     resumed.load_state_dict(state)
 
-    assert resumed_selector.indices_by_name == {
-        "model.layers.0.fc1.weight": 1
-    }
+    assert resumed_selector.indices_by_name == {"model.layers.0.fc1.weight": 1}
     assert resumed_selector.steps == [1]
     assert resumed.next(batch, step=2).info["u_pool_action_num_targets"] == 1
 
