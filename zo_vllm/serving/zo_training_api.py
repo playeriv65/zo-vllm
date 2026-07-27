@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -536,7 +537,17 @@ def attach_router(app: Any) -> None:
                 ServingZOStopRequest(wait=True, timeout_s=60.0),
             )
 
-    app.add_event_handler("shutdown", shutdown_serving_zo)
+    parent_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def serving_zo_lifespan(lifespan_app: Any):
+        async with parent_lifespan(lifespan_app) as state:
+            try:
+                yield state
+            finally:
+                await shutdown_serving_zo()
+
+    app.router.lifespan_context = serving_zo_lifespan
 
 
 async def init_serving_zo_state(

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import inspect
 from pathlib import Path
 import threading
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from datasets import Dataset
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from zo_trainer import ZOTrainer, ZOTrainerArguments, ZOTrainerModel
 from zo_vllm.engine import TokenScoreResult
@@ -179,10 +182,21 @@ def test_only_engine_service_operations_are_async() -> None:
     assert inspect.iscoroutinefunction(AsyncZOEngineService.score_clean)
 
 
-def test_router_shutdown_waits_for_background_training(
+def test_router_lifespan_preserves_parent_and_waits_for_background_training(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app = FastAPI()
+    lifecycle: list[str] = []
+
+    @asynccontextmanager
+    async def parent_lifespan(app):
+        del app
+        lifecycle.append("parent_start")
+        try:
+            yield {"parent": "state"}
+        finally:
+            lifecycle.append("parent_stop")
+
+    app = FastAPI(lifespan=parent_lifespan)
     attach_router(app)
     requests: list[ServingZOStopRequest] = []
 
@@ -196,13 +210,79 @@ def test_router_shutdown_waits_for_background_training(
         fake_stop,
     )
     app.state.zo_vllm_background_training = object()
-    assert app.router.on_shutdown
 
-    asyncio.run(app.router.on_shutdown[-1]())
+    async def exercise_lifespan() -> None:
+        async with app.router.lifespan_context(app) as state:
+            assert state == {"parent": "state"}
+            lifecycle.append("active")
+
+    asyncio.run(exercise_lifespan())
 
     assert len(requests) == 1
     assert requests[0].wait is True
     assert requests[0].timeout_s == 60.0
+    assert lifecycle == ["parent_start", "active", "parent_stop"]
+
+
+def test_serving_api_http_routes_validate_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FastAPI()
+    app.state.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(policy="priority"),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    app.state.zo_vllm_serving_engine_client = object()
+    app.state.zo_vllm_serving_server_args = SimpleNamespace(
+        enable_lora=True,
+        max_loras=2,
+        max_lora_rank=16,
+    )
+    app.state.zo_vllm_background_training = None
+    app.state.server_load_metrics = 0
+    app.state.enable_server_load_tracking = True
+    calls: list[tuple[Any, ...]] = []
+
+    async def fake_start(state, request: ServingZOStartRequest):
+        del state
+        calls.append(("start", request.steps, request.rank))
+        return {"enabled": True, "running": True}
+
+    async def fake_stop(state, request: ServingZOStopRequest):
+        del state
+        calls.append(("stop", request.wait, request.timeout_s))
+        return {"enabled": True, "running": False}
+
+    monkeypatch.setattr(zo_training_api_module, "_start_background_training", fake_start)
+    monkeypatch.setattr(zo_training_api_module, "_stop_background_training", fake_stop)
+    attach_router(app)
+
+    with TestClient(app) as client:
+        status = client.get("/zo_vllm/serving_zo/status")
+        assert status.status_code == 200
+        assert status.json()["running"] is False
+
+        start = client.post(
+            "/zo_vllm/serving_zo/start",
+            json={"steps": 3, "rank": 8},
+        )
+        assert start.status_code == 200
+        assert start.json()["running"] is True
+
+        invalid = client.post(
+            "/zo_vllm/serving_zo/start",
+            json={"steps": -1},
+        )
+        assert invalid.status_code == 422
+
+        stop = client.post(
+            "/zo_vllm/serving_zo/stop",
+            json={"wait": True, "timeout_s": 2.5},
+        )
+        assert stop.status_code == 200
+        assert stop.json()["running"] is False
+
+    assert calls == [("start", 3, 8), ("stop", True, 2.5)]
 
 
 def _score(request_nll: list[float]) -> TokenScoreResult:

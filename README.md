@@ -13,6 +13,23 @@ objective evaluations inside a conventional training loop, ZO-vLLM routes the
 dominant scoring phase through a vLLM-based runtime and represents nearby
 parameter states as dynamic LoRA adapter states.
 
+## Installation
+
+The supported environment is Python 3.12.13 with uv 0.11.15. Install exactly
+the checked-in resolution:
+
+```bash
+git submodule update --init --recursive
+uv sync --locked
+uv lock --check
+```
+
+Normal installation keeps `third_party/vllm` Python sources editable and uses
+the pinned upstream precompiled native wheel. Do not compile vLLM unless the
+fork changes C++, CUDA, CMake, or generated native interfaces. FastAPI and
+Starlette are transitive vLLM dependencies; the ZO serving router composes the
+vLLM FastAPI lifespan and does not require `starlette<1`.
+
 ## Highlights
 
 - **OPT-13B SST-2 long run**: vLLM completes the matched LoRA-only 20k-step
@@ -121,20 +138,15 @@ If the repository was already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-The main repository uses Python 3.12 through `uv`:
+Install the Python 3.12 environment from the checked-in lock:
 
 ```bash
-uv venv .venv --python 3.12
-source .venv/bin/activate
-uv pip install -e .
+uv sync --locked
+uv lock --check
 ```
 
-Build the vLLM fork:
-
-```bash
-MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda \
-  uv pip install -e third_party/vllm --no-build-isolation
-```
+This keeps the vLLM Python fork editable and obtains its native extensions from
+the pinned precompiled wheel. Do not run a source build for normal deployment.
 
 The official LOZO baseline uses its own environment:
 

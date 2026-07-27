@@ -43,15 +43,18 @@ perturbation_normalization=rms    # 默认解析式归一化全局U@V.T RMS；�
 direction_scale=1.0              # 显式用户振幅倍率；在perturbation_normalization之后生效
 ```
 
-## 构建命令
+## Build and deployment
 
 ```bash
-# 激活环境
-source .venv/bin/activate
-
-# 构建vLLM
-MAX_JOBS=16 NVCC_THREADS=4 VLLM_TARGET_DEVICE=cuda pip install -e third_party/vllm --no-build-isolation
+uv sync --locked
+uv lock --check
 ```
+
+Normal installation uses editable `third_party/vllm` Python sources plus the
+pinned upstream precompiled native wheel. Do not compile vLLM unless the fork
+changes C++, CUDA, CMake, or generated native interfaces. FastAPI and Starlette
+are transitive vLLM dependencies; use FastAPI lifespan composition and do not
+add `starlette<1`.
 
 ## vLLM批处理优化
 

@@ -5,7 +5,41 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zo-vllm"
 version = "0.1.0"
-requires-python = ">=3.10"
+description = "vLLM-backed zeroth-order optimization for large language models"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "accelerate>=1.13,<2",
+    "datasets>=4.8,<5",
+    "numpy>=2.3,<3",
+    "pydantic>=2.13,<3",
+    "safetensors>=0.7,<1",
+    "torch==2.11.0",
+    "transformers>=5.8,<5.9",
+    "vllm",
+    "wandb>=0.27,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.9,<3",
+    "pytest>=9,<10",
+    "ruff>=0.15,<0.16",
+]
+
+[tool.uv]
+required-version = "==0.11.15"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.extra-build-variables.vllm]
+VLLM_USE_PRECOMPILED = "1"
+VLLM_PRECOMPILED_WHEEL_COMMIT = "0867497368f390212a3f9684e2e05f698f8d1149"
+VLLM_PRECOMPILED_WHEEL_VARIANT = "cu130"
+VLLM_VERSION_OVERRIDE = "0.21.1+zo"
+
+[tool.uv.sources]
+vllm = { path = "third_party/vllm", editable = true }
 
 [tool.setuptools.packages.find]
 include = ["zo_vllm", "zo_vllm.*", "zo_trainer", "zo_trainer.*"]
