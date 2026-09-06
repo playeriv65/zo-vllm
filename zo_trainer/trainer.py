@@ -137,6 +137,7 @@ class ZOTrainer(Trainer):
         model.train()
         step = int(self.state.global_step) + 1
         optimizer = self._zo_optimizer()
+        inputs = self._svrg_anchor_inputs(inputs, step=step)
 
         def compute_probe_loss(outputs: Mapping[str, Any]) -> torch.Tensor:
             return self._compute_loss_from_outputs(outputs)
@@ -148,6 +149,46 @@ class ZOTrainer(Trainer):
         )
         optimizer.stage(pending_step)
         return torch.tensor(float(pending_step.reported_loss), device=self.args.device)
+
+    # MeZO-SVRG anchor batches. Set by the runner; zero disables.
+    svrg_q: int = 0
+    svrg_anchor_batches: int = 1
+    _svrg_iter: Any = None
+
+    def _svrg_anchor_inputs(
+        self, inputs: dict[str, Any], *, step: int
+    ) -> dict[str, Any]:
+        """On an anchor step, widen the batch to ``svrg_anchor_batches`` batches.
+
+        The collator emits list-valued fields (token rows, option counts,
+        labels), so batches concatenate by key. The extra batches come from a
+        side iterator over the train loader and so are fresh rows, not repeats.
+        """
+
+        q = int(self.svrg_q)
+        k = int(self.svrg_anchor_batches)
+        if q <= 0 or k <= 1:
+            return inputs
+        is_anchor = q <= 1 or (int(step) - 1) % q == 0
+        if not is_anchor:
+            return inputs
+        merged = {key: list(value) for key, value in inputs.items()}
+        for _ in range(k - 1):
+            extra = self._svrg_next_batch()
+            for key, value in extra.items():
+                if key not in merged:
+                    raise RuntimeError(f"anchor batch key mismatch: {key}")
+                merged[key].extend(value)
+        return merged
+
+    def _svrg_next_batch(self) -> dict[str, Any]:
+        if self._svrg_iter is None:
+            self._svrg_iter = iter(self.get_train_dataloader())
+        try:
+            return next(self._svrg_iter)
+        except StopIteration:
+            self._svrg_iter = iter(self.get_train_dataloader())
+            return next(self._svrg_iter)
 
     def _zo_optimizer(self) -> ZOSGDOptimizer:
         optimizer = self.optimizer

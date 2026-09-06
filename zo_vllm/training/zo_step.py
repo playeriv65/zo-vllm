@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import time
+
+import torch
 from typing import Any
 
 from zo_vllm.engine import ZOVLLMEngine
@@ -225,6 +227,47 @@ class ZOStepCallback:
         return None
 
 
+@dataclass
+class SVRGState:
+    """MeZO-SVRG (Gautam et al., ICML 2024), Algorithm 1, on the rank-1 path.
+
+    Every ``q`` steps the anchor step estimates the directional derivative on a
+    large batch, snapshots the weights and steps with ``eta_1 = anchor_lr_ratio
+    * eta_2``. In between, each mini step estimates the same direction at the
+    current weights and at the snapshot, and steps along
+    ``g_I(theta) - g_I(theta_bar) + g_anchor`` with ``eta_2``. Since the
+    snapshot the weights differ by a handful of rank-1 increments, so the
+    snapshot is reached by un-folding those increments in place, scoring, and
+    folding them back: three rank-K folds instead of a copy of the weights.
+
+    Both mini-batch estimates share one perturbation z, which is what makes
+    their difference a control variate; the reference code draws a fresh seed
+    for each, which we do not follow.
+    """
+
+    q: int = 2
+    anchor_lr_ratio: float = 5.0
+    anchor: dict[str, dict[str, torch.Tensor]] | None = None
+    since_snapshot: list[dict[str, tuple[torch.Tensor, torch.Tensor]]] = field(
+        default_factory=list
+    )
+    last: dict[str, float] = field(default_factory=dict)
+
+    def is_anchor(self, step: int) -> bool:
+        return int(self.q) <= 1 or (int(step) - 1) % int(self.q) == 0
+
+
+class _ReplaySampler:
+    """Hand the estimator the bundle already sampled this step."""
+
+    def __init__(self, bundle: "DirectionBundle") -> None:
+        self._bundle = bundle
+
+    def sample(self, *, seed: int | None = None) -> "DirectionBundle":
+        del seed
+        return self._bundle
+
+
 class _StepDirectionSampler:
     """Step-local direction sampler used by estimators."""
 
@@ -241,6 +284,7 @@ class _StepDirectionSampler:
         self.step = int(step)
         self.perturbation_normalization = perturbation_normalization
         self.first_sample: DirectionSample | None = None
+        self.first_bundle: DirectionBundle | None = None
         self._refreshed = False
         self._direction_info: dict[str, Any] = {}
         self.profile_s: dict[str, float] = {}
@@ -292,10 +336,13 @@ class _StepDirectionSampler:
             time.perf_counter() - prepare_t0
         )
         self.profile_s["direction_sample_total"] = time.perf_counter() - sample_t0
-        return DirectionBundle(
+        bundle = DirectionBundle(
             directions=sample.directions,
             score_directions=score_directions,
         )
+        if self.first_bundle is None:
+            self.first_bundle = bundle
+        return bundle
 
     def sample_raw(self, *, seed: int) -> dict[str, dict[str, Any]]:
         return _sample_direction_from_specs(
@@ -346,6 +393,7 @@ class ZOStepper:
         self.callbacks = list(callbacks or [])
         self.control = ZOStepControl()
         self._force_direction_slot_sync = False
+        self.svrg: SVRGState | None = None
 
     def invalidate_direction_slot_state(self) -> None:
         """Force cached direction factors into newly created runtime slots."""
@@ -418,6 +466,10 @@ class ZOStepper:
         sample = sampler.first_sample
         if sample is None:
             sample = DirectionSample(directions={}, refreshed=False, info={})
+        if self.svrg is not None and sampler.first_bundle is not None:
+            estimate = self._svrg_adjust(
+                estimate, sampler.first_bundle, batch, step=step_i, engine=engine, scorer=scorer
+            )
         self._call_event(
             "on_score_end",
             step=step_i,
@@ -445,6 +497,88 @@ class ZOStepper:
                 profile_t0=profile_t0,
             ),
         )
+
+    def _svrg_fold(self, increments, *, sign: float) -> None:
+        """Apply ``sign * sum_k U_k V_k^T`` for the recorded increments."""
+
+        if not increments:
+            return
+        stacked: dict[str, dict[str, torch.Tensor]] = {}
+        names = set().union(*(inc.keys() for inc in increments))
+        for name in names:
+            us = [inc[name][0] for inc in increments if name in inc]
+            vs = [inc[name][1] for inc in increments if name in inc]
+            stacked[name] = {
+                "U": torch.cat(us, dim=1),
+                "V": torch.cat(vs, dim=1),
+                "V_T": None,
+            }
+        st = self.update_state
+        # apply_lozo_update does W <- W - lr * c * U V^T
+        st.weight_sync.apply_lozo_update(
+            stacked,
+            c=-float(sign),
+            lr=1.0,
+            weight_decay=0.0,
+            precision=st.precision,
+            sync_device=bool(st.sync_device),
+            qkv_update_mode=st.qkv_update_mode,
+        )
+
+    def _svrg_adjust(self, estimate, bundle, batch, *, step, engine, scorer):
+        svrg = self.svrg
+        assert svrg is not None
+        g = float(estimate.gradient.scale)
+        if svrg.is_anchor(step):
+            # snapshot: the large-batch estimate along this step's direction
+            svrg.anchor = {
+                name: {
+                    "U": (d["U"] * (g * float(d.get("scale", 1.0)))).detach().clone(),
+                    "V": d["V"].detach().clone(),
+                }
+                for name, d in bundle.directions.items()
+            }
+            svrg.since_snapshot = []
+            svrg.last = {"svrg_anchor": 1.0, "svrg_g": g}
+            # eta_1 = ratio * eta_2, folded into the coefficient
+            return replace(
+                estimate,
+                gradient=replace(estimate.gradient, scale=g * float(svrg.anchor_lr_ratio)),
+            )
+        # mini step: same z, scored at the snapshot
+        self._svrg_fold(svrg.since_snapshot, sign=-1.0)
+        try:
+            est_bar = self._estimate(
+                batch, _ReplaySampler(bundle), step=step, engine=engine, scorer=scorer
+            )
+        finally:
+            self._svrg_fold(svrg.since_snapshot, sign=+1.0)
+        g_bar = float(est_bar.gradient.scale)
+        svrg.last = {"svrg_anchor": 0.0, "svrg_g": g, "svrg_g_bar": g_bar, "svrg_g_diff": g - g_bar}
+        return replace(estimate, gradient=replace(estimate.gradient, scale=g - g_bar))
+
+    def _svrg_after_apply(self, *, learning_rate: float, step: int) -> None:
+        """Record what just entered the weights; add the anchor term on mini steps."""
+
+        svrg = self.svrg
+        assert svrg is not None
+        st = self.update_state
+        inc: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for name, acc in st.accumulated_u.items():
+            V = st.v_cache.get(name)
+            if V is None:
+                continue
+            inc[name] = (acc.detach().clone(), V.detach().clone())
+        if inc:
+            svrg.since_snapshot.append(inc)
+        if svrg.is_anchor(step) or svrg.anchor is None:
+            return
+        anchor_inc = {
+            name: ((-float(learning_rate)) * d["U"], d["V"])
+            for name, d in svrg.anchor.items()
+        }
+        self._svrg_fold([anchor_inc], sign=+1.0)
+        svrg.since_snapshot.append(anchor_inc)
 
     def _apply_estimate(
         self,
@@ -485,6 +619,9 @@ class ZOStepper:
                 weight_decay=weight_decay,
                 step=step,
             )
+            if self.svrg is not None:
+                self._svrg_after_apply(learning_rate=learning_rate, step=step)
+                update_info = {**update_info, **self.svrg.last}
         apply_update_s = time.perf_counter() - apply_t0
         if refresh_fold_s:
             update_info = dict(update_info)
