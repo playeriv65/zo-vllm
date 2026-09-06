@@ -280,6 +280,11 @@ class _StepDirectionSampler:
         self._record_sample(sample)
         self.profile_s["direction_sample_record"] = time.perf_counter() - record_t0
         prepare_t0 = time.perf_counter()
+        shape = getattr(self.stepper.update_state, "shape_directions", None)
+        if callable(shape):
+            # perturbation-side transforms (ZO-AdaMU) must act before the
+            # plus/minus scoring so the probe and the update share one z
+            shape(sample.directions)
         score_directions = self.stepper.update_state.prepare_for_score(
             sample.directions
         )

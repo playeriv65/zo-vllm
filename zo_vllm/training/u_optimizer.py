@@ -30,7 +30,7 @@ import math
 
 import torch
 
-U_OPTIMIZER_NAMES = ("plain", "sgd", "adam", "adamw", "adam_scalar")
+U_OPTIMIZER_NAMES = ("plain", "sgd", "adam", "adamw", "adam_scalar", "zo_adamu")
 U_OPTIMIZER_CODES = {name: code for code, name in enumerate(U_OPTIMIZER_NAMES)}
 
 

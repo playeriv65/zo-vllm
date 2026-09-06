@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import math
 import time
 from typing import Any, Protocol
 
@@ -193,10 +194,32 @@ class AccumulatedLowRankUpdateState:
         default_factory=list
     )
     momentum_tol: float = 1e-3
+    # ZO-AdaMU (Jiang et al., AAAI 2024), ported to the low-rank factors.
+    # The paper relocates momentum from the gradient to the perturbation: the
+    # next z is drawn centred on sign(g_t) * m_t, mixed with a fresh Gaussian by
+    # an annealed beta_1, and the step is m / sqrt(v). Here z = U V^T, so the
+    # same recipe is applied to each factor and the rank-1 product of the
+    # mixed factors is the perturbation. Their schedule (warmup 1024, cosine
+    # to 0.8 T, shared shrinking limit across the three varphi calls) is kept
+    # verbatim, evaluated once per step rather than once per parameter.
+    u_total_steps: int = 0
+    u_adamu_seed: int = 0
+    adamu_hist: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    adamu_mv: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
+    adamu_step: int = 0
+    adamu_limit: float = 0.0
+    adamu_gen: torch.Generator | None = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= float(self.u_beta) <= 1.0):
             raise ValueError("u_beta must be in [0, 1]")
+        if str(self.u_optimizer) == "zo_adamu":
+            if int(self.u_total_steps) <= 0:
+                raise ValueError("zo_adamu needs u_total_steps for its anneal schedule")
+            self.adamu_limit = float(self.u_total_steps)
+            self.adamu_gen = torch.Generator().manual_seed(int(self.u_adamu_seed))
         # Momentum on this state lives in the weight-space queue, not in the
         # coefficient optimizer, so the optimizer runs momentum-free here.
         self.u_opt = UCoefficientOptimizer(
@@ -211,6 +234,55 @@ class AccumulatedLowRankUpdateState:
             raise ValueError("u_norm_cap must be positive when set")
         if int(self.gradient_accumulation_update_steps) < 0:
             raise ValueError("gradient_accumulation_update_steps must be non-negative")
+
+    def _adamu_ema(self, varphi: float) -> float:
+        """ZO-AdaMU's `_ema_weight`, with the shared shrinking limit."""
+
+        t = int(self.adamu_step)
+        T = int(self.u_total_steps)
+        w1 = min(1024, max(1, T // 8))
+        w2 = int(T * 0.8)
+        if t < w1:
+            return 1.0
+        if t < w2:
+            val = 0.5 * (1.0 + math.cos(math.pi * ((t - w1) / self.adamu_limit)))
+            self.adamu_limit -= varphi * (T - w2) / max(1, (w2 - w1))
+            return val
+        return 0.5 * (1.0 + math.cos(math.pi * ((w2 - w1) / self.adamu_limit)))
+
+    @torch.no_grad()
+    def shape_directions(self, directions: DirectionMap) -> None:
+        """Replace the sampled factors with their momentum-centred mixtures.
+
+        Called once per step before the plus/minus scoring, and mutates the
+        direction map in place so scoring and the update see the same z.
+        """
+
+        if str(self.u_optimizer) != "zo_adamu":
+            return
+        self.adamu_step += 1
+        alpha = self._adamu_ema(1.0)
+        b1 = self._adamu_ema(0.1)
+        b2 = self._adamu_ema(1.5)
+        gen = self.adamu_gen
+        for name, direction in dict(directions).items():
+            U = direction["U"].detach().float()
+            V = direction["V"].detach().float()
+            hU, hV = self.adamu_hist.get(name, (torch.zeros_like(U), torch.zeros_like(V)))
+            noise_U = torch.randn(U.shape, generator=gen, dtype=torch.float32).to(U.device)
+            noise_V = torch.randn(V.shape, generator=gen, dtype=torch.float32).to(V.device)
+            Uh = hU.to(U.device) + math.sqrt(1.0 - alpha) * noise_U
+            Vh = hV.to(V.device) + math.sqrt(1.0 - alpha) * noise_V
+            Uc = math.sqrt(alpha) * U
+            Vc = math.sqrt(alpha) * V
+            mU = b1 * Uc + (1.0 - b1) * Uh
+            vU = b2 * Uc.square() + (1.0 - b2) * Uh.square()
+            mV = b1 * Vc + (1.0 - b1) * Vh
+            vV = b2 * Vc.square() + (1.0 - b2) * Vh.square()
+            self.adamu_mv[name] = (mU, vU, mV, vV)
+            direction["U"] = mU.to(direction["U"].dtype)
+            direction["V"] = mV.to(direction["V"].dtype)
+            direction["V_T"] = None
 
     def prepare_for_score(
         self, directions: DirectionMap
@@ -262,7 +334,22 @@ class AccumulatedLowRankUpdateState:
                     float(projected_grad) * scale
                 )
                 continue
-            if self.u_opt.name == "adam_scalar":
+            if self.u_opt.name == "zo_adamu":
+                mU, vU, mV, vV = self.adamu_mv[name]
+                eps = float(self.u_adam_eps)
+                dU = mU / (vU.sqrt() + eps)
+                dV = mV / (vV.sqrt() + eps)
+                target_u.add_(
+                    dU.to(target_u.dtype),
+                    alpha=-float(learning_rate) * float(projected_grad) * scale,
+                )
+                # the fold pairs accumulated_u with v_cache, so the normalised
+                # V factor has to be what the fold sees
+                self.v_cache[name] = dV.to(direction["V"].dtype)
+                self.vt_cache[name] = None
+                sgn = 1.0 if float(projected_grad) >= 0.0 else -1.0
+                self.adamu_hist[name] = (sgn * mU, mV)
+            elif self.u_opt.name == "adam_scalar":
                 rate = self.u_opt.scalar_rate(
                     name, float(projected_grad) * scale
                 )
