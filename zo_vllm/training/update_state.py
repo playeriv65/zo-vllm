@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 import torch
 
+from zo_vllm.training.u_optimizer import UCoefficientOptimizer
+
 from zo_vllm.core.weight_sync import WeightSync
 from zo_vllm.engine import DirectionMap, ZOVLLMEngine
 
@@ -170,17 +172,39 @@ class AccumulatedLowRankUpdateState:
     qkv_update_mode: str = "batched"
     u_beta: float = 1.0
     u_momentum: float = 0.0
+    u_optimizer: str = "sgd"
+    u_beta2: float = 0.9
+    u_adam_eps: float = 1e-8
+    u_opt: UCoefficientOptimizer | None = None
     u_norm_cap: float | None = None
     gradient_accumulation_update_steps: int = 0
     accumulated_u: dict[str, torch.Tensor] = field(default_factory=dict)
-    velocity_u: dict[str, torch.Tensor] = field(default_factory=dict)
     pending_u: dict[str, torch.Tensor] = field(default_factory=dict)
     v_cache: dict[str, torch.Tensor] = field(default_factory=dict)
     vt_cache: dict[str, torch.Tensor | None] = field(default_factory=dict)
+    # Heavy-ball velocity kept in weight space as a queue of past rank-r
+    # increments. Under random_full the V basis changes every step, so a
+    # velocity kept in U-space (as the bank does with a frozen V) would be
+    # expressed in a basis that no longer exists by the next step. Each entry
+    # is (age, {name: (U_k, V_k)}); the fold applies sum_k beta^age_k U_k V_k^T,
+    # which is exactly v_t = beta v_{t-1} + g_t d_t unrolled and truncated once
+    # beta^age drops below momentum_tol.
+    momentum_queue: list[tuple[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]] = field(
+        default_factory=list
+    )
+    momentum_tol: float = 1e-3
 
     def __post_init__(self) -> None:
         if not (0.0 <= float(self.u_beta) <= 1.0):
             raise ValueError("u_beta must be in [0, 1]")
+        # Momentum on this state lives in the weight-space queue, not in the
+        # coefficient optimizer, so the optimizer runs momentum-free here.
+        self.u_opt = UCoefficientOptimizer(
+            name=str(self.u_optimizer),
+            momentum=0.0 if str(self.u_optimizer) == "sgd" else float(self.u_momentum),
+            beta2=float(self.u_beta2),
+            eps=float(self.u_adam_eps),
+        )
         if not (0.0 <= float(self.u_momentum) < 1.0):
             raise ValueError("u_momentum must be in [0, 1)")
         if self.u_norm_cap is not None and float(self.u_norm_cap) <= 0.0:
@@ -218,6 +242,10 @@ class AccumulatedLowRankUpdateState:
         t0 = time.perf_counter()
         update_interval = int(self.gradient_accumulation_update_steps)
         update_target = self.pending_u if update_interval > 0 else self.accumulated_u
+        self.u_opt.begin_step()
+        use_torch_opt = self.u_opt.uses_torch
+        batch_grads: dict[str, torch.Tensor] = {}
+        batch_targets: dict[str, torch.Tensor] = {}
         for name, raw_direction in dict(directions).items():
             direction = dict(raw_direction)
             target_u = update_target.get(name)
@@ -228,26 +256,24 @@ class AccumulatedLowRankUpdateState:
             scale = float(direction.get("scale", 1.0))
             if float(self.u_beta) != 1.0:
                 target_u.mul_(float(self.u_beta))
-            if float(self.u_momentum) > 0.0:
-                # Heavy-ball on the estimate, not decay on the parameter.
-                # u_beta shrinks U_accum itself, which forgets distance already
-                # travelled; momentum instead carries a velocity so that a
-                # residual field whose per-step estimates scatter still adds up.
-                # The velocity lives in the current V's U-space, so a refresh
-                # that replaces that basis invalidates it.
-                vel = self.velocity_u.get(name)
-                if vel is None:
-                    vel = torch.zeros_like(direction["U"])
-                    self.velocity_u[name] = vel
-                vel.mul_(float(self.u_momentum)).add_(
-                    direction["U"], alpha=float(projected_grad) * scale
+            if use_torch_opt:
+                batch_targets[name] = target_u
+                batch_grads[name] = direction["U"] * (
+                    float(projected_grad) * scale
                 )
-                target_u.add_(vel, alpha=-float(learning_rate))
+                continue
+            if self.u_opt.name == "adam_scalar":
+                rate = self.u_opt.scalar_rate(
+                    name, float(projected_grad) * scale
+                )
+                target_u.add_(direction["U"], alpha=-float(learning_rate) * rate)
             else:
                 target_u.add_(
                     direction["U"],
                     alpha=-float(learning_rate) * float(projected_grad) * scale,
                 )
+        if use_torch_opt and batch_targets:
+            self.u_opt.step(batch_grads, batch_targets, learning_rate)
         accumulate_s = time.perf_counter() - t0
         pending_flush_s = 0.0
         cap_scale = None
@@ -269,6 +295,8 @@ class AccumulatedLowRankUpdateState:
             "u_momentum": float(self.u_momentum),
             "u_optimizer": str(self.u_optimizer),
             "u_beta2": float(self.u_beta2),
+            "u_optimizer_code": self.u_opt.code,
+            "momentum_queue_len": len(self.momentum_queue),
             "u_norm_cap": None if self.u_norm_cap is None else float(self.u_norm_cap),
             "u_cap_scale": cap_scale,
             "u_norm_after_cap": capped_norm,
@@ -295,6 +323,9 @@ class AccumulatedLowRankUpdateState:
             self.accumulated_u.clear()
             return 0.0
         t0 = time.perf_counter()
+        beta = float(self.u_momentum)
+        if beta > 0.0:
+            fold_directions = self._with_momentum_queue(fold_directions, beta)
         self.weight_sync.apply_lozo_update(
             fold_directions,
             c=-1.0,
@@ -307,6 +338,48 @@ class AccumulatedLowRankUpdateState:
         for acc in self.accumulated_u.values():
             acc.zero_()
         return time.perf_counter() - t0
+
+    def _with_momentum_queue(
+        self,
+        fresh: dict[str, dict[str, torch.Tensor]],
+        beta: float,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Stack the fresh increment with beta^age-scaled past increments.
+
+        The fresh increment enters the queue at age 0 with weight 1, matching
+        the term ``g_t d_t`` of ``v_t = beta v_{t-1} + g_t d_t``; every older
+        entry contributes ``beta^age U_k V_k^T``. Stacking along the rank axis
+        turns the whole velocity into one rank-K fold instead of K rank-1 ones.
+        """
+
+        snapshot = {
+            name: (d["U"].detach().clone(), d["V"].detach().clone())
+            for name, d in fresh.items()
+        }
+        self.momentum_queue.append((0, snapshot))
+        # age every entry, drop the ones whose weight is below tolerance
+        kept: list[tuple[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]] = []
+        for age, entry in self.momentum_queue:
+            if beta ** age >= float(self.momentum_tol):
+                kept.append((age, entry))
+        self.momentum_queue = [(age + 1, entry) for age, entry in kept]
+
+        stacked: dict[str, dict[str, torch.Tensor]] = {}
+        for name in fresh:
+            us = []
+            vs = []
+            for age, entry in kept:
+                if name not in entry:
+                    continue
+                U_k, V_k = entry[name]
+                us.append(U_k * (beta ** age))
+                vs.append(V_k)
+            stacked[name] = {
+                "U": torch.cat(us, dim=1),
+                "V": torch.cat(vs, dim=1),
+                "V_T": None,
+            }
+        return stacked
 
     def flush_pending_to_accumulated(self, *, step: int) -> float:
         del step

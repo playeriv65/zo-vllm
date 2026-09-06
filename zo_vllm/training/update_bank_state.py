@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from zo_vllm.training.u_optimizer import UCoefficientOptimizer
+
 from zo_vllm.engine import DirectionMap, ZOVLLMEngine
 
 from .update_debug import (
@@ -44,19 +46,13 @@ class BlockLoRAUpdateBankState:
     u_beta: float = 1.0
     u_momentum: float = 0.0
     u_optimizer: str = "sgd"
-    torch_params: dict[str, torch.Tensor] = field(default_factory=dict)
-    torch_optimizer: Any = None
     u_beta2: float = 0.9
     u_adam_eps: float = 1e-8
-    scalar_m: dict[str, float] = field(default_factory=dict)
-    scalar_v: dict[str, float] = field(default_factory=dict)
+    u_opt: UCoefficientOptimizer | None = None
     u_norm_cap: float | None = None
     gradient_accumulation_update_steps: int = 0
     bank_a: dict[str, torch.Tensor] = field(default_factory=dict)
     accumulated_u: dict[str, torch.Tensor] = field(default_factory=dict)
-    velocity_u: dict[str, torch.Tensor] = field(default_factory=dict)
-    second_moment_u: dict[str, torch.Tensor] = field(default_factory=dict)
-    adam_step: int = 0
     pending_u: dict[str, torch.Tensor] = field(default_factory=dict)
     zero_u: dict[str, torch.Tensor] = field(default_factory=dict)
     current_blocks: dict[str, _BankBlock] = field(default_factory=dict)
@@ -68,113 +64,16 @@ class BlockLoRAUpdateBankState:
             raise ValueError("update_bank_rank must be positive")
         if not (0.0 <= float(self.u_beta) <= 1.0):
             raise ValueError("u_beta must be in [0, 1]")
-        if not (0.0 <= float(self.u_momentum) < 1.0):
-            raise ValueError("u_momentum must be in [0, 1)")
-        if self.u_optimizer not in {"plain", "sgd", "adam", "adamw", "adam_scalar"}:
-            raise ValueError(
-                "u_optimizer must be plain, sgd, adam, adamw or adam_scalar"
-            )
+        self.u_opt = UCoefficientOptimizer(
+            name=str(self.u_optimizer),
+            momentum=float(self.u_momentum),
+            beta2=float(self.u_beta2),
+            eps=float(self.u_adam_eps),
+        )
         if self.u_norm_cap is not None and float(self.u_norm_cap) <= 0.0:
             raise ValueError("u_norm_cap must be positive when set")
         if int(self.gradient_accumulation_update_steps) < 0:
             raise ValueError("gradient_accumulation_update_steps must be non-negative")
-
-    def _ensure_optimizer(self, targets: dict[str, torch.Tensor]) -> None:
-        """Mirror the U coefficients as parameters and hand them to torch.optim.
-
-        The reference ZO implementations write the estimate into ``param.grad``
-        and let a stock optimizer do the rest, which is how they get momentum
-        and second-moment normalisation. The coefficients here are about 4e5
-        floats against 1.2e9 weights, so mirroring them costs nothing and buys
-        the same optimizers instead of a hand-written approximation of one.
-        """
-
-        fresh = False
-        for name, target in targets.items():
-            param = self.torch_params.get(name)
-            if param is None or param.shape != target.shape:
-                # fp32 master copy. The bank stores u in the model's dtype,
-                # which is fp16 here, and Adam is unusable in fp16: eps=1e-8
-                # underflows to exactly 0 and so does (1-beta2)*g^2 for small
-                # g, leaving a zero denominator that makes the very first step
-                # +-inf (and 0/0 -> NaN wherever the gradient is exactly 0).
-                # These are ~4e5 floats against 1.2e9 weights, so it is free.
-                self.torch_params[name] = torch.nn.Parameter(
-                    target.detach().to(torch.float32).clone(), requires_grad=True
-                )
-                fresh = True
-        if self.torch_optimizer is None or fresh:
-            params = list(self.torch_params.values())
-            if self.u_optimizer == "adam":
-                self.torch_optimizer = torch.optim.Adam(
-                    params, lr=1.0,
-                    betas=(float(self.u_momentum), float(self.u_beta2)),
-                    eps=float(self.u_adam_eps),
-                )
-            elif self.u_optimizer == "adamw":
-                self.torch_optimizer = torch.optim.AdamW(
-                    params, lr=1.0,
-                    betas=(float(self.u_momentum), float(self.u_beta2)),
-                    eps=float(self.u_adam_eps), weight_decay=0.0,
-                )
-            else:
-                self.torch_optimizer = torch.optim.SGD(
-                    params, lr=1.0, momentum=float(self.u_momentum)
-                )
-
-    def _torch_step(
-        self,
-        grads: dict[str, torch.Tensor],
-        targets: dict[str, torch.Tensor],
-        learning_rate: float,
-    ) -> None:
-        self._ensure_optimizer(targets)
-        assert self.torch_optimizer is not None
-        for group in self.torch_optimizer.param_groups:
-            group["lr"] = float(learning_rate)
-        for name in targets:
-            param = self.torch_params[name]
-            # The fp32 master is the source of truth between steps, so it is
-            # not re-seeded from the fp16 target here: round-tripping every
-            # step would quantise away updates below the fp16 spacing.
-            param.grad = grads[name].to(torch.float32)
-        self.torch_optimizer.step()
-        for name, target in targets.items():
-            updated = self.torch_params[name].data
-            if not bool(torch.isfinite(updated).all()):
-                # Fail here rather than at the next forward pass, where the
-                # only symptom is "objective returned non-finite values" and
-                # the offending target is already lost.
-                raise RuntimeError(
-                    f"{self.u_optimizer} produced non-finite u for {name}: "
-                    f"lr={float(learning_rate):.3e} "
-                    f"grad_absmax={float(grads[name].abs().max()):.3e} "
-                    f"u_absmax_before={float(target.abs().max()):.3e}"
-                )
-            target.copy_(updated.to(target.dtype))
-
-    def _scalar_adam_rate(self, name: str, g_hat: float) -> float:
-        """Adam on the scalar coefficient, leaving the direction untouched.
-
-        The per-step estimate here is one scalar times one fixed direction U,
-        so the entries of a target's u vector are coefficients of a single
-        direction, not independent parameters. Normalising them individually,
-        as element-wise Adam does, turns a step along U into a step along
-        sign(U): it discards the estimated direction, not just its scale.
-        Adapting the scalar keeps the direction exact and still gives the
-        second-moment normalisation that lets these methods run a much larger
-        learning rate than raw SGD.
-        """
-
-        b1, b2 = float(self.u_momentum), float(self.u_beta2)
-        m = self.scalar_m.get(name, 0.0) * b1 + (1.0 - b1) * g_hat
-        v = self.scalar_v.get(name, 0.0) * b2 + (1.0 - b2) * g_hat * g_hat
-        self.scalar_m[name] = m
-        self.scalar_v[name] = v
-        t = max(1, int(self.adam_step))
-        m_hat = m / (1.0 - b1**t)
-        v_hat = v / (1.0 - b2**t)
-        return m_hat / (math.sqrt(v_hat) + float(self.u_adam_eps))
 
     def _accum_rms(self) -> float:
         """RMS of the live u coefficients: the displacement the bank carries."""
@@ -254,8 +153,7 @@ class BlockLoRAUpdateBankState:
         if float(weight_decay) != 0.0:
             raise ValueError("BlockLoRAUpdateBankState does not support weight_decay")
         t0 = time.perf_counter()
-        if self.u_optimizer in {"adam", "adam_scalar"}:
-            self.adam_step += 1
+        self.u_opt.begin_step()
         update_interval = int(self.gradient_accumulation_update_steps)
         if zo_bank_debug_enabled():
             self._log_direction_finite_summary(
@@ -272,7 +170,7 @@ class BlockLoRAUpdateBankState:
             )
         batch_grads: dict[str, torch.Tensor] = {}
         batch_targets: dict[str, torch.Tensor] = {}
-        use_torch_opt = self.u_optimizer not in {"plain", "adam_scalar"}
+        use_torch_opt = self.u_opt.uses_torch
         # Magnitude bookkeeping. step_sq tracks the *plain-equivalent* update
         # -lr*pg*scale*U even when a torch optimizer is driving, because that is
         # the quantity an optimizer's lr has to be calibrated against; accum_sq
@@ -289,7 +187,7 @@ class BlockLoRAUpdateBankState:
             U = direction["U"]
             scale = float(direction.get("scale", 1.0))
             if self.u_optimizer == "adam_scalar":
-                scale = self._scalar_adam_rate(
+                scale = self.u_opt.scalar_rate(
                     name, float(projected_grad) * scale
                 )
                 projected_grad_here = 1.0
@@ -344,7 +242,7 @@ class BlockLoRAUpdateBankState:
                     },
                 )
         if use_torch_opt and batch_targets:
-            self._torch_step(batch_grads, batch_targets, learning_rate)
+            self.u_opt.step(batch_grads, batch_targets, learning_rate)
         accumulate_s = time.perf_counter() - t0
         pending_flush_s = 0.0
         cap_scale = None
@@ -367,9 +265,7 @@ class BlockLoRAUpdateBankState:
             "u_beta": float(self.u_beta),
             "u_momentum": float(self.u_momentum),
             "u_optimizer": str(self.u_optimizer),
-            "u_optimizer_code": {
-                "plain": 0, "sgd": 1, "adam": 2, "adamw": 3, "adam_scalar": 4
-            }[str(self.u_optimizer)],
+            "u_optimizer_code": self.u_opt.code,
             "u_step_rms": math.sqrt(step_sq / step_n) if step_n else 0.0,
             "u_accum_rms": self._accum_rms(),
             "u_norm_cap": None if self.u_norm_cap is None else float(self.u_norm_cap),
