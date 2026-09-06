@@ -48,6 +48,8 @@ class BlockLoRAUpdateBankState:
     torch_optimizer: Any = None
     u_beta2: float = 0.9
     u_adam_eps: float = 1e-8
+    scalar_m: dict[str, float] = field(default_factory=dict)
+    scalar_v: dict[str, float] = field(default_factory=dict)
     u_norm_cap: float | None = None
     gradient_accumulation_update_steps: int = 0
     bank_a: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -68,8 +70,10 @@ class BlockLoRAUpdateBankState:
             raise ValueError("u_beta must be in [0, 1]")
         if not (0.0 <= float(self.u_momentum) < 1.0):
             raise ValueError("u_momentum must be in [0, 1)")
-        if self.u_optimizer not in {"plain", "sgd", "adam", "adamw"}:
-            raise ValueError("u_optimizer must be plain, sgd, adam or adamw")
+        if self.u_optimizer not in {"plain", "sgd", "adam", "adamw", "adam_scalar"}:
+            raise ValueError(
+                "u_optimizer must be plain, sgd, adam, adamw or adam_scalar"
+            )
         if self.u_norm_cap is not None and float(self.u_norm_cap) <= 0.0:
             raise ValueError("u_norm_cap must be positive when set")
         if int(self.gradient_accumulation_update_steps) < 0:
@@ -149,6 +153,29 @@ class BlockLoRAUpdateBankState:
                 )
             target.copy_(updated.to(target.dtype))
 
+    def _scalar_adam_rate(self, name: str, g_hat: float) -> float:
+        """Adam on the scalar coefficient, leaving the direction untouched.
+
+        The per-step estimate here is one scalar times one fixed direction U,
+        so the entries of a target's u vector are coefficients of a single
+        direction, not independent parameters. Normalising them individually,
+        as element-wise Adam does, turns a step along U into a step along
+        sign(U): it discards the estimated direction, not just its scale.
+        Adapting the scalar keeps the direction exact and still gives the
+        second-moment normalisation that lets these methods run a much larger
+        learning rate than raw SGD.
+        """
+
+        b1, b2 = float(self.u_momentum), float(self.u_beta2)
+        m = self.scalar_m.get(name, 0.0) * b1 + (1.0 - b1) * g_hat
+        v = self.scalar_v.get(name, 0.0) * b2 + (1.0 - b2) * g_hat * g_hat
+        self.scalar_m[name] = m
+        self.scalar_v[name] = v
+        t = max(1, int(self.adam_step))
+        m_hat = m / (1.0 - b1**t)
+        v_hat = v / (1.0 - b2**t)
+        return m_hat / (math.sqrt(v_hat) + float(self.u_adam_eps))
+
     def _accum_rms(self) -> float:
         """RMS of the live u coefficients: the displacement the bank carries."""
 
@@ -227,7 +254,7 @@ class BlockLoRAUpdateBankState:
         if float(weight_decay) != 0.0:
             raise ValueError("BlockLoRAUpdateBankState does not support weight_decay")
         t0 = time.perf_counter()
-        if self.u_optimizer == "adam":
+        if self.u_optimizer in {"adam", "adam_scalar"}:
             self.adam_step += 1
         update_interval = int(self.gradient_accumulation_update_steps)
         if zo_bank_debug_enabled():
@@ -245,7 +272,7 @@ class BlockLoRAUpdateBankState:
             )
         batch_grads: dict[str, torch.Tensor] = {}
         batch_targets: dict[str, torch.Tensor] = {}
-        use_torch_opt = self.u_optimizer != "plain"
+        use_torch_opt = self.u_optimizer not in {"plain", "adam_scalar"}
         # Magnitude bookkeeping. step_sq tracks the *plain-equivalent* update
         # -lr*pg*scale*U even when a torch optimizer is driving, because that is
         # the quantity an optimizer's lr has to be calibrated against; accum_sq
@@ -261,7 +288,14 @@ class BlockLoRAUpdateBankState:
                 )
             U = direction["U"]
             scale = float(direction.get("scale", 1.0))
-            _alpha = float(learning_rate) * float(projected_grad) * scale
+            if self.u_optimizer == "adam_scalar":
+                scale = self._scalar_adam_rate(
+                    name, float(projected_grad) * scale
+                )
+                projected_grad_here = 1.0
+            else:
+                projected_grad_here = float(projected_grad)
+            _alpha = float(learning_rate) * projected_grad_here * scale
             step_sq += (_alpha * _alpha) * float(U.pow(2).sum())
             step_n += int(U.numel())
             if use_torch_opt:
@@ -285,14 +319,14 @@ class BlockLoRAUpdateBankState:
                 if float(self.u_beta) != 1.0:
                     target.mul_(float(self.u_beta))
                 self._accumulate(
-                    name, target, U, projected_grad, scale, learning_rate
+                    name, target, U, projected_grad_here, scale, learning_rate
                 )
             else:
                 target = self._current_accum_slice(name, block)
                 if float(self.u_beta) != 1.0:
                     target.mul_(float(self.u_beta))
                 self._accumulate(
-                    name, target, U, projected_grad, scale, learning_rate
+                    name, target, U, projected_grad_here, scale, learning_rate
                 )
             if zo_bank_debug_enabled():
                 self._log_single_tensor_if_bad(
@@ -333,9 +367,9 @@ class BlockLoRAUpdateBankState:
             "u_beta": float(self.u_beta),
             "u_momentum": float(self.u_momentum),
             "u_optimizer": str(self.u_optimizer),
-            "u_optimizer_code": {"plain": 0, "sgd": 1, "adam": 2, "adamw": 3}[
-                str(self.u_optimizer)
-            ],
+            "u_optimizer_code": {
+                "plain": 0, "sgd": 1, "adam": 2, "adamw": 3, "adam_scalar": 4
+            }[str(self.u_optimizer)],
             "u_step_rms": math.sqrt(step_sq / step_n) if step_n else 0.0,
             "u_accum_rms": self._accum_rms(),
             "u_norm_cap": None if self.u_norm_cap is None else float(self.u_norm_cap),
