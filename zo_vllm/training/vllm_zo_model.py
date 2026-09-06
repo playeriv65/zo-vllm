@@ -62,6 +62,9 @@ class VLLMZOModel:
             precision=weight_update_precision,
             sync_device=bool(sync_weight_update),
             qkv_update_mode=qkv_update_mode,
+            u_momentum=float(getattr(config, "u_momentum", 0.0)),
+            u_optimizer=str(getattr(config, "u_optimizer", "sgd")),
+            u_beta2=float(getattr(config, "u_beta2", 0.9)),
         )
         self.stepper = ZOStepper(
             engine=engine,

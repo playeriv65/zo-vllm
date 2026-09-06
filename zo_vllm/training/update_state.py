@@ -44,6 +44,21 @@ class ImmediateWeightUpdateState:
     precision: str = "param"
     sync_device: bool = True
     qkv_update_mode: str = "batched"
+    u_momentum: float = 0.0
+    u_optimizer: str = "sgd"
+    u_beta2: float = 0.9
+    u_adam_eps: float = 1e-8
+    velocity_u: dict[str, torch.Tensor] = field(default_factory=dict)
+    second_moment_u: dict[str, torch.Tensor] = field(default_factory=dict)
+    _adam_step: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= float(self.u_momentum) < 1.0):
+            raise ValueError("u_momentum must be in [0, 1)")
+        if self.u_optimizer not in {"sgd", "adam"}:
+            raise ValueError("u_optimizer must be 'sgd' or 'adam'")
+        if not (0.0 <= float(self.u_beta2) < 1.0):
+            raise ValueError("u_beta2 must be in [0, 1)")
 
     def prepare_for_score(
         self, directions: DirectionMap
@@ -60,9 +75,74 @@ class ImmediateWeightUpdateState:
         step: int,
     ) -> dict[str, Any]:
         del step
+        payload = dict(directions)
+        coefficient = float(projected_grad)
+        if self.u_optimizer == "adam":
+            # The reference ZO implementations write the estimate into
+            # param.grad and hand it to a stock optimizer, so the second-moment
+            # normalisation comes for free. This path applies the update itself,
+            # so Adam has to be written out. Normalising by sqrt(v) is what lets
+            # these methods run a learning rate ~50x the SGD one: the raw
+            # coefficient here swings between 0.3 and 245 step to step, and
+            # heavy-ball alone passes that swing straight through.
+            self._adam_step += 1
+            b1, b2 = float(self.u_momentum), float(self.u_beta2)
+            bc1 = 1.0 - b1 ** self._adam_step
+            bc2 = 1.0 - b2 ** self._adam_step
+            carried = {}
+            for name, direction in payload.items():
+                U = direction["U"]
+                # The moments are kept in fp32 regardless of the model dtype:
+                # in fp16 both eps=1e-8 and (1-beta2)*g^2 for small g underflow
+                # to exactly 0, so the denominator vanishes and the first step
+                # is +-inf (0/0 -> NaN where the gradient is exactly 0).
+                g = (U * (coefficient * float(direction.get("scale", 1.0)))).to(
+                    torch.float32
+                )
+                m = self.velocity_u.get(name)
+                v = self.second_moment_u.get(name)
+                if m is None or m.shape != g.shape:
+                    m = torch.zeros_like(g)
+                    self.velocity_u[name] = m
+                if v is None or v.shape != g.shape:
+                    v = torch.zeros_like(g)
+                    self.second_moment_u[name] = v
+                m.mul_(b1).add_(g, alpha=1.0 - b1)
+                v.mul_(b2).addcmul_(g, g, value=1.0 - b2)
+                step = ((m / bc1) / ((v / bc2).sqrt() + float(self.u_adam_eps))).to(
+                    U.dtype
+                )
+                moved = dict(direction)
+                moved["U"] = step
+                moved["scale"] = 1.0
+                carried[name] = moved
+            payload = carried
+            coefficient = 1.0
+        elif float(self.u_momentum) > 0.0:
+            # This path writes each update straight into the weights and keeps
+            # no U state, so momentum needs its own. Carrying a velocity turns
+            # the per-step estimate into a running sum, which is what a residual
+            # field whose estimates scatter step to step needs; the coefficient
+            # is folded into the velocity, so the update applies it at c = 1.
+            carried = {}
+            for name, direction in payload.items():
+                U = direction["U"]
+                vel = self.velocity_u.get(name)
+                if vel is None or vel.shape != U.shape:
+                    vel = torch.zeros_like(U)
+                    self.velocity_u[name] = vel
+                vel.mul_(float(self.u_momentum)).add_(
+                    U, alpha=coefficient * float(direction.get("scale", 1.0))
+                )
+                moved = dict(direction)
+                moved["U"] = vel
+                moved["scale"] = 1.0
+                carried[name] = moved
+            payload = carried
+            coefficient = 1.0
         return self.weight_sync.apply_lozo_update(
-            dict(directions),
-            c=float(projected_grad),
+            payload,
+            c=coefficient,
             lr=float(learning_rate),
             weight_decay=float(weight_decay),
             precision=self.precision,
@@ -89,9 +169,11 @@ class AccumulatedLowRankUpdateState:
     sync_device: bool = True
     qkv_update_mode: str = "batched"
     u_beta: float = 1.0
+    u_momentum: float = 0.0
     u_norm_cap: float | None = None
     gradient_accumulation_update_steps: int = 0
     accumulated_u: dict[str, torch.Tensor] = field(default_factory=dict)
+    velocity_u: dict[str, torch.Tensor] = field(default_factory=dict)
     pending_u: dict[str, torch.Tensor] = field(default_factory=dict)
     v_cache: dict[str, torch.Tensor] = field(default_factory=dict)
     vt_cache: dict[str, torch.Tensor | None] = field(default_factory=dict)
@@ -99,6 +181,8 @@ class AccumulatedLowRankUpdateState:
     def __post_init__(self) -> None:
         if not (0.0 <= float(self.u_beta) <= 1.0):
             raise ValueError("u_beta must be in [0, 1]")
+        if not (0.0 <= float(self.u_momentum) < 1.0):
+            raise ValueError("u_momentum must be in [0, 1)")
         if self.u_norm_cap is not None and float(self.u_norm_cap) <= 0.0:
             raise ValueError("u_norm_cap must be positive when set")
         if int(self.gradient_accumulation_update_steps) < 0:
@@ -144,10 +228,26 @@ class AccumulatedLowRankUpdateState:
             scale = float(direction.get("scale", 1.0))
             if float(self.u_beta) != 1.0:
                 target_u.mul_(float(self.u_beta))
-            target_u.add_(
-                direction["U"],
-                alpha=-float(learning_rate) * float(projected_grad) * scale,
-            )
+            if float(self.u_momentum) > 0.0:
+                # Heavy-ball on the estimate, not decay on the parameter.
+                # u_beta shrinks U_accum itself, which forgets distance already
+                # travelled; momentum instead carries a velocity so that a
+                # residual field whose per-step estimates scatter still adds up.
+                # The velocity lives in the current V's U-space, so a refresh
+                # that replaces that basis invalidates it.
+                vel = self.velocity_u.get(name)
+                if vel is None:
+                    vel = torch.zeros_like(direction["U"])
+                    self.velocity_u[name] = vel
+                vel.mul_(float(self.u_momentum)).add_(
+                    direction["U"], alpha=float(projected_grad) * scale
+                )
+                target_u.add_(vel, alpha=-float(learning_rate))
+            else:
+                target_u.add_(
+                    direction["U"],
+                    alpha=-float(learning_rate) * float(projected_grad) * scale,
+                )
         accumulate_s = time.perf_counter() - t0
         pending_flush_s = 0.0
         cap_scale = None
@@ -166,13 +266,24 @@ class AccumulatedLowRankUpdateState:
             "num_accumulated_modules": len(self.accumulated_u),
             "num_pending_modules": len(self.pending_u),
             "u_beta": float(self.u_beta),
+            "u_momentum": float(self.u_momentum),
+            "u_optimizer": str(self.u_optimizer),
+            "u_beta2": float(self.u_beta2),
             "u_norm_cap": None if self.u_norm_cap is None else float(self.u_norm_cap),
             "u_cap_scale": cap_scale,
             "u_norm_after_cap": capped_norm,
         }
 
     def fold_before_direction_refresh(self, *, step: int) -> float:
-        """Fold accumulated U before the provider replaces the current V basis."""
+        """Fold accumulated U before the provider replaces the current V basis.
+
+        The velocity survives the refresh. It lives in the U-space, whose
+        dimension does not change with V, and the measured drift of V over 8000
+        steps is a median 13 degrees on most targets -- small enough that the
+        mixing this introduces costs less than throwing away the accumulation
+        that a slow residual field needs.
+        """
+
         return self.fold(step=step)
 
     def fold(self, *, step: int) -> float:

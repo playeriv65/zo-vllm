@@ -93,6 +93,7 @@ def init_worker_update_bank(
         bank_state=BlockLoRAUpdateBankState(
             update_bank_rank=int(bank_config["update_bank_rank"]),
             u_beta=float(bank_config.get("u_beta", 1.0)),
+            u_momentum=float(bank_config.get("u_momentum", 0.0)),
             u_norm_cap=bank_config.get("u_norm_cap"),
             gradient_accumulation_update_steps=int(
                 bank_config.get("gradient_accumulation_update_steps", 0)

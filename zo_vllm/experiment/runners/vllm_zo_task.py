@@ -251,6 +251,9 @@ def main():
 
     config = VLLMZOConfig(
         estimator=args.estimator,
+        u_momentum=args.u_momentum,
+        u_optimizer=getattr(args, 'u_optimizer', 'sgd'),
+        u_beta2=getattr(args, 'u_beta2', 0.9),
         direction_provider=args.direction_provider,
         lozo_provider_mode=args.lozo_provider_mode,
         rank=args.rank,
@@ -529,6 +532,7 @@ def main():
             engine=zo_engine,
             update_bank_rank=int(args.update_bank_rank),
             u_beta=args.u_beta,
+            u_momentum=args.u_momentum,
             u_norm_cap=args.u_norm_cap,
             gradient_accumulation_update_steps=int(
                 args.gradient_accumulation_update_steps
@@ -558,6 +562,7 @@ def main():
             sync_device=bool(int(args.sync_weight_update)),
             qkv_update_mode=args.qkv_weight_update,
             u_beta=args.u_beta,
+            u_momentum=args.u_momentum,
             u_norm_cap=args.u_norm_cap,
             gradient_accumulation_update_steps=int(
                 args.gradient_accumulation_update_steps

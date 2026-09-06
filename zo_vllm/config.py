@@ -172,6 +172,9 @@ class VLLMZOConfig:
     """Algorithm settings for one vLLM-backed ZO training loop."""
 
     estimator: str = "single_direction_antithetic"
+    u_momentum: float = 0.0
+    u_optimizer: str = "sgd"
+    u_beta2: float = 0.9
     num_queries: int = 1
     perturbation_sides: str = "two_sided"
     query_microbatch_size: int = 2
@@ -317,6 +320,7 @@ class ZOServingConfig:
     priority: int = 1000
     gradient_accumulation_update_steps: int = 0
     u_beta: float = 1.0
+    u_momentum: float = 0.0
     u_norm_cap: float | None = None
     random_device: str = "cuda"
     direction_device: str = "cuda"
@@ -411,6 +415,10 @@ class ZOServingConfig:
             object.__setattr__(self, name, parsed)
         if self.u_beta > 1.0:
             raise ValueError("u_beta must be <= 1.0")
+        u_mom = float(self.u_momentum)
+        if not (0.0 <= u_mom < 1.0):
+            raise ValueError("u_momentum must be in [0, 1)")
+        object.__setattr__(self, "u_momentum", u_mom)
         if self.u_norm_cap is not None and float(self.u_norm_cap) <= 0.0:
             raise ValueError("u_norm_cap must be positive when provided")
         if float(self.max_score_admission_gpu_utilization) > 100.0:

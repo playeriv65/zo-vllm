@@ -54,6 +54,7 @@ class AsyncWorkerUpdateBankClient:
         self.bank_config = {
             "update_bank_rank": int(request.update_bank_rank),
             "u_beta": float(request.u_beta),
+            "u_momentum": float(getattr(request, "u_momentum", 0.0)),
             "u_norm_cap": request.u_norm_cap,
             "gradient_accumulation_update_steps": int(
                 request.gradient_accumulation_update_steps
