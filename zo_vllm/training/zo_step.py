@@ -247,6 +247,15 @@ class SVRGState:
 
     q: int = 2
     anchor_lr_ratio: float = 5.0
+    # Algorithm 4 of the paper: once per window of ``anneal_window`` steps,
+    # compare the mean training loss of the last window with the one before;
+    # if the ratio exceeds ``anneal_kappa`` divide both learning rates by
+    # ``anneal_alpha``. ``lr_scale`` carries the accumulated division.
+    anneal_alpha: float = 5.0
+    anneal_kappa: float = 1.05
+    anneal_window: int = 0
+    lr_scale: float = 1.0
+    losses: list[float] = field(default_factory=list)
     anchor: dict[str, dict[str, torch.Tensor]] | None = None
     since_snapshot: list[dict[str, tuple[torch.Tensor, torch.Tensor]]] = field(
         default_factory=list
@@ -255,6 +264,20 @@ class SVRGState:
 
     def is_anchor(self, step: int) -> bool:
         return int(self.q) <= 1 or (int(step) - 1) % int(self.q) == 0
+
+    def observe_loss(self, loss: float, step: int) -> None:
+        """Record a training loss and apply the window-based anneal."""
+
+        w = int(self.anneal_window)
+        if w <= 0:
+            return
+        self.losses.append(float(loss))
+        if len(self.losses) >= 2 * w and int(step) % w == 0:
+            recent = sum(self.losses[-w:]) / w
+            before = sum(self.losses[-2 * w:-w]) / w
+            if before > 0 and recent / before > float(self.anneal_kappa):
+                self.lr_scale /= float(self.anneal_alpha)
+                self.last["svrg_annealed"] = 1.0
 
 
 class _ReplaySampler:
@@ -528,6 +551,7 @@ class ZOStepper:
     def _svrg_adjust(self, estimate, bundle, batch, *, step, engine, scorer):
         svrg = self.svrg
         assert svrg is not None
+        svrg.observe_loss(float(estimate.reported_loss), step)
         g = float(estimate.gradient.scale)
         if svrg.is_anchor(step):
             # snapshot: the large-batch estimate along this step's direction
@@ -539,11 +563,14 @@ class ZOStepper:
                 for name, d in bundle.directions.items()
             }
             svrg.since_snapshot = []
-            svrg.last = {"svrg_anchor": 1.0, "svrg_g": g}
-            # eta_1 = ratio * eta_2, folded into the coefficient
+            svrg.last = {"svrg_anchor": 1.0, "svrg_g": g, "svrg_lr_scale": svrg.lr_scale}
+            # eta_1 = ratio * eta_2, folded into the coefficient, times the anneal
             return replace(
                 estimate,
-                gradient=replace(estimate.gradient, scale=g * float(svrg.anchor_lr_ratio)),
+                gradient=replace(
+                    estimate.gradient,
+                    scale=g * float(svrg.anchor_lr_ratio) * float(svrg.lr_scale),
+                ),
             )
         # mini step: same z, scored at the snapshot
         self._svrg_fold(svrg.since_snapshot, sign=-1.0)
@@ -554,8 +581,14 @@ class ZOStepper:
         finally:
             self._svrg_fold(svrg.since_snapshot, sign=+1.0)
         g_bar = float(est_bar.gradient.scale)
-        svrg.last = {"svrg_anchor": 0.0, "svrg_g": g, "svrg_g_bar": g_bar, "svrg_g_diff": g - g_bar}
-        return replace(estimate, gradient=replace(estimate.gradient, scale=g - g_bar))
+        svrg.last = {
+            "svrg_anchor": 0.0, "svrg_g": g, "svrg_g_bar": g_bar,
+            "svrg_g_diff": g - g_bar, "svrg_lr_scale": svrg.lr_scale,
+        }
+        return replace(
+            estimate,
+            gradient=replace(estimate.gradient, scale=(g - g_bar) * float(svrg.lr_scale)),
+        )
 
     def _svrg_after_apply(self, *, learning_rate: float, step: int) -> None:
         """Record what just entered the weights; add the anchor term on mini steps."""
@@ -574,7 +607,7 @@ class ZOStepper:
         if svrg.is_anchor(step) or svrg.anchor is None:
             return
         anchor_inc = {
-            name: ((-float(learning_rate)) * d["U"], d["V"])
+            name: ((-float(learning_rate) * float(svrg.lr_scale)) * d["U"], d["V"])
             for name, d in svrg.anchor.items()
         }
         self._svrg_fold([anchor_inc], sign=+1.0)
