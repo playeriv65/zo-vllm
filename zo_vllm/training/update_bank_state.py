@@ -49,6 +49,15 @@ class BlockLoRAUpdateBankState:
     u_beta2: float = 0.9
     u_adam_eps: float = 1e-8
     u_opt: UCoefficientOptimizer | None = None
+    # Direction tracking. With a frozen V* the u-direction estimated at step
+    # t-1 is a good guess for step t, so instead of spending every probe on a
+    # fresh random U the first probe of each step is spent on the previous
+    # aggregate direction itself: it measures how strong that direction still
+    # is (the correction), and the remaining probes measure how the direction
+    # has swung. The multi-query estimator then averages the probes as usual.
+    u_track: bool = False
+    track_u: dict[str, torch.Tensor] = field(default_factory=dict)
+    _queries_this_step: int = 0
     u_norm_cap: float | None = None
     gradient_accumulation_update_steps: int = 0
     bank_a: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -141,6 +150,29 @@ class BlockLoRAUpdateBankState:
             )
         return prepared
 
+    @torch.no_grad()
+    def shape_directions(self, directions: DirectionMap) -> None:
+        """Spend the first probe of the step on the tracked direction."""
+
+        if not self.u_track:
+            return
+        self._queries_this_step += 1
+        if self._queries_this_step != 1 or not self.track_u:
+            return
+        for name, direction in dict(directions).items():
+            prev = self.track_u.get(name)
+            if prev is None or prev.shape != direction["U"].shape:
+                continue
+            direction["U"] = prev.to(direction["U"].dtype, copy=True)
+
+    def _remember_track(self, directions: DirectionMap) -> None:
+        for name, direction in dict(directions).items():
+            U = direction["U"].detach().float()
+            rms = U.pow(2).mean().sqrt()
+            if float(rms) > 0.0:
+                self.track_u[name] = (U / rms).clone()
+        self._queries_this_step = 0
+
     def apply(
         self,
         directions: DirectionMap,
@@ -152,6 +184,9 @@ class BlockLoRAUpdateBankState:
     ) -> dict[str, Any]:
         if float(weight_decay) != 0.0:
             raise ValueError("BlockLoRAUpdateBankState does not support weight_decay")
+        if self.u_track:
+            # the aggregate U handed to apply is the step's direction estimate
+            self._remember_track(directions)
         t0 = time.perf_counter()
         self.u_opt.begin_step()
         update_interval = int(self.gradient_accumulation_update_steps)
@@ -266,6 +301,7 @@ class BlockLoRAUpdateBankState:
             "u_momentum": float(self.u_momentum),
             "u_optimizer": str(self.u_optimizer),
             "u_optimizer_code": self.u_opt.code,
+            "u_track": 1.0 if self.u_track else 0.0,
             "u_step_rms": math.sqrt(step_sq / step_n) if step_n else 0.0,
             "u_accum_rms": self._accum_rms(),
             "u_norm_cap": None if self.u_norm_cap is None else float(self.u_norm_cap),
