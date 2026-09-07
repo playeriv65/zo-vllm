@@ -655,6 +655,7 @@ def _profile_from_log_history(
         "zo_stepper_total_s": "zo_profile_zo_stepper_total_s",
         "scorer_batch_unpack_s": "zo_profile_scorer_batch_unpack_s",
         "scorer_loss_dispatch_s": "zo_profile_scorer_loss_dispatch_s",
+        "scorer_device_wait_s": "zo_profile_scorer_device_wait_s",
         "scorer_loss_to_host_s": "zo_profile_scorer_loss_to_host_s",
         "scorer_total_s": "zo_profile_scorer_total_s",
         "scorer_forward_unpack_s": "zo_profile_scorer_forward_unpack_s",

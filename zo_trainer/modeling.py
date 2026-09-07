@@ -94,6 +94,10 @@ class ZOTrainerModel(nn.Module):
         super().__init__()
         self.zo_model = zo_model
         self._dummy_param = nn.Parameter(torch.zeros(()))
+        # Device the backend returns probe tensors on, learned from the first
+        # forward. Classification labels are staged onto it before the engine
+        # call so the host-to-device copy never lands behind a queued forward.
+        self._probe_label_device: torch.device | None = None
 
     def forward(
         self, **inputs: Any
@@ -167,7 +171,6 @@ class ZOTrainerModel(nn.Module):
                 "option_loss_token_counts": option_loss_token_counts,
                 "row_option_counts": row_option_counts,
                 "labels": class_labels,
-                "device_label_cache": {},
             }
         else:
             token_groups, labels = hf_batch_to_token_groups(inputs)
@@ -209,7 +212,6 @@ class ZOTrainerModel(nn.Module):
                     lora_ids=lora_ids,
                     max_logits_tokens=max_logits_tokens,
                     loss_impl=loss_impl,
-                    device_label_cache=classification_context["device_label_cache"],
                 )
             compute_loss_t0 = time.perf_counter()
             grouped_losses = _compute_grouped_probe_losses(
@@ -293,12 +295,20 @@ class ZOTrainerModel(nn.Module):
         lora_ids: Sequence[int] | None,
         max_logits_tokens: int | None = None,
         loss_impl: str | None = None,
-        device_label_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor]
-        | None = None,
     ) -> OptionClassificationOutput:
         engine = self.zo_model.engine
         config = self.zo_model.config
         forward_t0 = time.perf_counter()
+        # Stage the labels before the engine call. A host-to-device copy of a
+        # Python list synchronises the current stream, so issuing it after the
+        # forward has been queued blocks the host on the whole forward and
+        # charges that wait to postprocessing. Issued first, it only waits for
+        # the LoRA slot writes that are already on the stream.
+        label_tensor = None
+        if self._probe_label_device is not None:
+            label_tensor = torch.as_tensor(
+                labels, dtype=torch.long, device=self._probe_label_device
+            )
         engine_t0 = time.perf_counter()
         result = engine.forward_token_request_nll(
             token_groups,
@@ -317,16 +327,11 @@ class ZOTrainerModel(nn.Module):
             result.request_nll,
             row_option_counts,
         )
-        label_key = (str(logits.device), tuple(int(value) for value in labels))
-        label_tensor = None
-        if device_label_cache is not None:
-            label_tensor = device_label_cache.get(label_key)
-        if label_tensor is None:
+        if label_tensor is None or label_tensor.device != logits.device:
+            self._probe_label_device = logits.device
             label_tensor = torch.as_tensor(
                 labels, dtype=torch.long, device=logits.device
             )
-            if device_label_cache is not None:
-                device_label_cache[label_key] = label_tensor
         return OptionClassificationOutput(
             logits=logits,
             loss_labels=label_tensor,
@@ -657,6 +662,7 @@ def _probe_loss_from_forward_outputs(
     num_requests: int,
     requests_per_group: int,
 ) -> ProbeLossResult:
+    device_wait_s = _wait_for_grouped_losses(grouped_losses)
     loss_values, loss_to_host_s = _float_losses(grouped_losses)
     if not loss_values:
         raise ValueError("grouped probe losses must not be empty")
@@ -671,7 +677,10 @@ def _probe_loss_from_forward_outputs(
     return ProbeLossResult(
         group_losses=tuple(loss_values),
         requests_per_group=int(requests_per_group),
-        timing=timing.resolve_cuda_events().updated(loss_to_host_s=loss_to_host_s),
+        timing=timing.resolve_cuda_events().updated(
+            device_wait_s=device_wait_s,
+            loss_to_host_s=loss_to_host_s,
+        ),
     )
 
 
@@ -738,6 +747,32 @@ def _compute_grouped_probe_losses(
         )
         losses.append(compute_loss_from_outputs_fn(grouped_outputs))
     return losses
+
+
+def _wait_for_grouped_losses(losses: Sequence[Any]) -> float:
+    """Wait for the queued probe forward and report the wait separately.
+
+    Probe scoring runs in two phases. The submit phase queues the forward, the
+    loss reduction and the objective loss onto the scoring stream and never
+    touches a value, so it returns while the device is still busy. The consume
+    phase below is the first host read, and it is where the device time is
+    actually paid. Draining the stream here instead of inside the first
+    device-to-host copy keeps that wait out of the copy's own measurement; it
+    changes no value, because the copy would have waited for exactly the same
+    work.
+    """
+
+    devices = {
+        loss.device
+        for loss in losses
+        if isinstance(loss, torch.Tensor) and loss.device.type == "cuda"
+    }
+    if not devices or not torch.cuda.is_available():
+        return 0.0
+    wait_t0 = time.perf_counter()
+    for device in devices:
+        torch.cuda.current_stream(device).synchronize()
+    return time.perf_counter() - wait_t0
 
 
 def _float_loss(loss: Any) -> float:

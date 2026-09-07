@@ -285,6 +285,7 @@ adds them to Hugging Face logs with a `zo_` prefix, for example:
 - `zo_profile_score_token_groups_s`;
 - `zo_profile_scorer_batch_unpack_s`;
 - `zo_profile_scorer_loss_dispatch_s`;
+- `zo_profile_scorer_device_wait_s`;
 - `zo_profile_scorer_loss_to_host_s`;
 - `zo_profile_scorer_forward_unpack_s`;
 - `zo_profile_scorer_engine_call_s`;
@@ -296,20 +297,37 @@ adds them to Hugging Face logs with a `zo_` prefix, for example:
 `zo_profile_score_token_groups_s` remains the stable aggregate interval around
 the scorer callback. The `zo_profile_scorer_*` fields split that interval into
 one-time HF batch unpacking, the host-side engine call, output postprocessing,
-HF loss dispatch, and the required scalar synchronization. The host engine call
-is not labeled as GPU time. Device-resident runs resolve worker CUDA events only
-after the grouped loss scalar reaches CPU and expose those values as
-`zo_profile_worker_cuda_model_forward_s` and `zo_profile_worker_cuda_loss_s`.
+HF loss dispatch, the device wait, and the required scalar synchronization. The
+host engine call is not labeled as GPU time. Device-resident runs resolve worker
+CUDA events only after the grouped loss scalar reaches CPU and expose those
+values as `zo_profile_worker_cuda_model_forward_s` and
+`zo_profile_worker_cuda_loss_s`.
+
+Probe scoring on a device-resident backend runs in two phases, and the fields
+follow that split. Everything up to and including `scorer_loss_dispatch` only
+queues work: the engine call queues the forward and the NLL reduction, output
+postprocessing reshapes device tensors, and HF loss dispatch queues the
+objective loss. None of it reads a value, so all of it is host time. The device
+time is paid once, in `scorer_device_wait`, which drains the scoring stream
+before the first host read. `scorer_loss_to_host` is then the scalar
+device-to-host copy alone.
+
+Host-to-device copies belong in the submit phase, before the forward is queued,
+because a copy from pageable host memory synchronises the stream: issued after
+the forward, it silently charges the whole forward to whichever field encloses
+it. Classification labels are staged this way in
+`ZOTrainerModel._forward_prompt_classification_token_groups`.
 
 The fields are nested rather than additive across the whole list:
 
 ```text
 scorer_total
   scorer_batch_unpack
-  scorer_forward_total
+  scorer_forward_total          <- submit phase, host only
     scorer_engine_call
     scorer_output_postprocess
-  scorer_loss_dispatch
+  scorer_loss_dispatch          <- submit phase, host only
+  scorer_device_wait            <- consume phase, device time
   scorer_loss_to_host
 ```
 

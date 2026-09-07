@@ -201,6 +201,7 @@ def parse_args():
     parser.add_argument("--paired-barrier", action="store_true")
     parser.add_argument("--resume-existing", action="store_true")
     parser.add_argument("--u-beta", type=float, default=None)
+    parser.add_argument("--u-momentum", type=float, default=None)
     parser.add_argument("--u-norm-cap", type=float, default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -214,6 +215,9 @@ def main():
     if args.u_beta is not None:
         defaults = dict(defaults)
         defaults["u_beta"] = args.u_beta
+    if args.u_momentum is not None:
+        defaults = dict(defaults)
+        defaults["u_momentum"] = args.u_momentum
     if args.u_norm_cap is not None:
         defaults = dict(defaults)
         defaults["u_norm_cap"] = args.u_norm_cap

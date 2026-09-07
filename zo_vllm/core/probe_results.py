@@ -17,6 +17,7 @@ class ProbeTiming:
     engine_call_s: float = 0.0
     output_postprocess_s: float = 0.0
     loss_dispatch_s: float = 0.0
+    device_wait_s: float = 0.0
     loss_to_host_s: float = 0.0
     forward_unpack_s: float = 0.0
     forward_total_s: float = 0.0
@@ -71,6 +72,7 @@ class ProbeTiming:
                 "scorer_engine_call": self.engine_call_s,
                 "scorer_output_postprocess": self.output_postprocess_s,
                 "scorer_loss_dispatch": self.loss_dispatch_s,
+                "scorer_device_wait": self.device_wait_s,
                 "scorer_loss_to_host": self.loss_to_host_s,
                 "scorer_forward_unpack": self.forward_unpack_s,
                 "scorer_forward_total": self.forward_total_s,
