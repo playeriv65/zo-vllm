@@ -124,7 +124,14 @@ class BlockLoRAUpdateBankState:
             direction = dict(raw_direction)
             U = direction["U"]
             block = self.current_blocks.get(name)
-            must_allocate = block is None or bool(direction.get("v_refreshed", True))
+            # The v_refreshed flag is advisory: the multi-query aggregate sets it
+            # unconditionally, and with a frozen V* re-allocating a block per
+            # step would exhaust the bank by step 2. Allocate only when the V
+            # factor actually differs from the one the current block holds.
+            must_allocate = block is None or (
+                bool(direction.get("v_refreshed", True))
+                and not self._same_v(name, block, direction)
+            )
             if must_allocate:
                 block = self._allocate_block(name, direction)
             elif int(U.shape[1]) != int(block.rank):
@@ -455,6 +462,19 @@ class BlockLoRAUpdateBankState:
 
     def max_used_rank(self) -> int:
         return max((int(value) for value in self.used_rank.values()), default=0)
+
+    def _same_v(
+        self, name: str, block: _BankBlock, direction: Mapping[str, torch.Tensor]
+    ) -> bool:
+        bank = self.bank_a.get(name)
+        if bank is None:
+            return False
+        V_T = direction.get("V_T")
+        lora_a = V_T if V_T is not None else direction["V"].T
+        held = bank[block.start : block.start + block.rank, :]
+        if tuple(held.shape) != tuple(lora_a.shape):
+            return False
+        return bool(torch.equal(held, lora_a.to(held.device, held.dtype)))
 
     def _allocate_block(
         self, name: str, direction: Mapping[str, torch.Tensor]
