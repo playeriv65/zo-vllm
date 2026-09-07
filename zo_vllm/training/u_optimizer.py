@@ -149,12 +149,3 @@ class UCoefficientOptimizer:
                     f"u_absmax_before={float(target.abs().max()):.3e}"
                 )
             target.copy_(updated.to(target.dtype))
-
-    def reset_state(self) -> None:
-        """Drop the carried state; the U-space basis it lived in is gone."""
-
-        self.params.clear()
-        self.optimizer = None
-        self.scalar_m.clear()
-        self.scalar_v.clear()
-        self.step_count = 0

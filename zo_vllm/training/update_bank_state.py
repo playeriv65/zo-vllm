@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import logging
 import math
-import os
 import time
 from typing import Any
 
@@ -230,9 +229,7 @@ class BlockLoRAUpdateBankState:
             U = direction["U"]
             scale = float(direction.get("scale", 1.0))
             if self.u_optimizer == "adam_scalar":
-                scale = self.u_opt.scalar_rate(
-                    name, float(projected_grad) * scale
-                )
+                scale = self.u_opt.scalar_rate(name, float(projected_grad) * scale)
                 projected_grad_here = 1.0
             else:
                 projected_grad_here = float(projected_grad)
@@ -467,6 +464,8 @@ class BlockLoRAUpdateBankState:
     def _same_v(
         self, name: str, block: _BankBlock, direction: Mapping[str, torch.Tensor]
     ) -> bool:
+        """Whether ``direction`` carries the V factor the block already holds."""
+
         bank = self.bank_a.get(name)
         if bank is None:
             return False
@@ -474,19 +473,8 @@ class BlockLoRAUpdateBankState:
         lora_a = V_T if V_T is not None else direction["V"].T
         held = bank[block.start : block.start + block.rank, :]
         if tuple(held.shape) != tuple(lora_a.shape):
-            if os.environ.get("ZO_BANK_SAMEV_DEBUG"):
-                print(f"[same_v] {name}: shape {tuple(held.shape)} vs {tuple(lora_a.shape)}", flush=True)
             return False
-        cand = lora_a.to(held.device, held.dtype)
-        same = bool(torch.equal(held, cand))
-        if not same and os.environ.get("ZO_BANK_SAMEV_DEBUG"):
-            h = held.float().reshape(-1); c = cand.float().reshape(-1)
-            cos = float((h @ c) / (h.norm() * c.norm() + 1e-30))
-            print(f"[same_v] {name}: maxdiff={float((h-c).abs().max()):.3e} "
-                  f"|held|={float(h.norm()):.4g} |cand|={float(c.norm()):.4g} cos={cos:.6f} "
-                  f"dtype held={held.dtype} cand={lora_a.dtype} V_T_given={direction.get('V_T') is not None}",
-                  flush=True)
-        return same
+        return bool(torch.equal(held, lora_a.to(held.device, held.dtype)))
 
     def _allocate_block(
         self, name: str, direction: Mapping[str, torch.Tensor]

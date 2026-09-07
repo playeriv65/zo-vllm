@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 import math
-import os
 import time
 
 import torch
@@ -275,7 +274,7 @@ class SVRGState:
         self.losses.append(float(loss))
         if len(self.losses) >= 2 * w and int(step) % w == 0:
             recent = sum(self.losses[-w:]) / w
-            before = sum(self.losses[-2 * w:-w]) / w
+            before = sum(self.losses[-2 * w : -w]) / w
             if before > 0 and recent / before > float(self.anneal_kappa):
                 self.lr_scale /= float(self.anneal_alpha)
                 self.last["svrg_annealed"] = 1.0
@@ -287,7 +286,9 @@ class _ReplaySampler:
     def __init__(self, bundle: "DirectionBundle") -> None:
         self._bundle = bundle
 
-    def sample(self, *, seed: int | None = None, probe: int | None = None) -> "DirectionBundle":
+    def sample(
+        self, *, seed: int | None = None, probe: int | None = None
+    ) -> "DirectionBundle":
         del seed, probe
         return self._bundle
 
@@ -321,8 +322,6 @@ class _StepDirectionSampler:
         provider = self.stepper.direction_provider
         if probe is not None and hasattr(provider, "u_provider"):
             # factorised provider: same V*, U re-drawn per probe
-            if os.environ.get("ZO_BANK_SAMEV_DEBUG"):
-                print(f"[sampler] provider.next probe={probe} step={self.step} type={type(provider).__name__}", flush=True)
             sample = provider.next(self.batch, step=self.step, probe=int(probe))
         elif seed is None:
             sample = provider.next(self.batch, step=self.step)
@@ -500,7 +499,12 @@ class ZOStepper:
             sample = DirectionSample(directions={}, refreshed=False, info={})
         if self.svrg is not None and sampler.first_bundle is not None:
             estimate = self._svrg_adjust(
-                estimate, sampler.first_bundle, batch, step=step_i, engine=engine, scorer=scorer
+                estimate,
+                sampler.first_bundle,
+                batch,
+                step=step_i,
+                engine=engine,
+                scorer=scorer,
             )
         self._call_event(
             "on_score_end",
@@ -572,7 +576,11 @@ class ZOStepper:
                 for name, d in bundle.directions.items()
             }
             svrg.since_snapshot = []
-            svrg.last = {"svrg_anchor": 1.0, "svrg_g": g, "svrg_lr_scale": svrg.lr_scale}
+            svrg.last = {
+                "svrg_anchor": 1.0,
+                "svrg_g": g,
+                "svrg_lr_scale": svrg.lr_scale,
+            }
             # eta_1 = ratio * eta_2, folded into the coefficient, times the anneal
             return replace(
                 estimate,
@@ -591,12 +599,17 @@ class ZOStepper:
             self._svrg_fold(svrg.since_snapshot, sign=+1.0)
         g_bar = float(est_bar.gradient.scale)
         svrg.last = {
-            "svrg_anchor": 0.0, "svrg_g": g, "svrg_g_bar": g_bar,
-            "svrg_g_diff": g - g_bar, "svrg_lr_scale": svrg.lr_scale,
+            "svrg_anchor": 0.0,
+            "svrg_g": g,
+            "svrg_g_bar": g_bar,
+            "svrg_g_diff": g - g_bar,
+            "svrg_lr_scale": svrg.lr_scale,
         }
         return replace(
             estimate,
-            gradient=replace(estimate.gradient, scale=(g - g_bar) * float(svrg.lr_scale)),
+            gradient=replace(
+                estimate.gradient, scale=(g - g_bar) * float(svrg.lr_scale)
+            ),
         )
 
     def _svrg_after_apply(self, *, learning_rate: float, step: int) -> None:

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from collections.abc import Mapping, Sequence
 import hashlib
 import math
@@ -1011,10 +1009,6 @@ class QueuedAGZOVProvider:
             # the V computed by the first, not re-run the seeded power
             # iteration and hand every probe a slightly different V.
             refreshed = False
-        if os.environ.get("ZO_BANK_SAMEV_DEBUG"):
-            print(f"[vq] collect step={step_i} refreshed={refreshed} preinit={preinitialized} "
-                  f"last_refresh={self._last_refresh_step} queue_empty={self.subspace_queue.is_empty} "
-                  f"perturb_seed={int(perturb_seed)}", flush=True)
         if refreshed:
             self._last_refresh_step = step_i
             cached_directions, raw = self.inner.collect(

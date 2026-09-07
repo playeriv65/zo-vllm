@@ -90,8 +90,8 @@ class ImmediateWeightUpdateState:
             # heavy-ball alone passes that swing straight through.
             self._adam_step += 1
             b1, b2 = float(self.u_momentum), float(self.u_beta2)
-            bc1 = 1.0 - b1 ** self._adam_step
-            bc2 = 1.0 - b2 ** self._adam_step
+            bc1 = 1.0 - b1**self._adam_step
+            bc2 = 1.0 - b2**self._adam_step
             carried = {}
             for name, direction in payload.items():
                 U = direction["U"]
@@ -190,8 +190,8 @@ class AccumulatedLowRankUpdateState:
     # is (age, {name: (U_k, V_k)}); the fold applies sum_k beta^age_k U_k V_k^T,
     # which is exactly v_t = beta v_{t-1} + g_t d_t unrolled and truncated once
     # beta^age drops below momentum_tol.
-    momentum_queue: list[tuple[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]] = field(
-        default_factory=list
+    momentum_queue: list[tuple[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]] = (
+        field(default_factory=list)
     )
     momentum_tol: float = 1e-3
     # ZO-AdaMU (Jiang et al., AAAI 2024), ported to the low-rank factors.
@@ -204,10 +204,12 @@ class AccumulatedLowRankUpdateState:
     # verbatim, evaluated once per step rather than once per parameter.
     u_total_steps: int = 0
     u_adamu_seed: int = 0
-    adamu_hist: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
-    adamu_mv: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+    adamu_hist: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
+    adamu_mv: dict[
+        str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
     adamu_step: int = 0
     adamu_limit: float = 0.0
     adamu_gen: torch.Generator | None = None
@@ -268,9 +270,15 @@ class AccumulatedLowRankUpdateState:
         for name, direction in dict(directions).items():
             U = direction["U"].detach().float()
             V = direction["V"].detach().float()
-            hU, hV = self.adamu_hist.get(name, (torch.zeros_like(U), torch.zeros_like(V)))
-            noise_U = torch.randn(U.shape, generator=gen, dtype=torch.float32).to(U.device)
-            noise_V = torch.randn(V.shape, generator=gen, dtype=torch.float32).to(V.device)
+            hU, hV = self.adamu_hist.get(
+                name, (torch.zeros_like(U), torch.zeros_like(V))
+            )
+            noise_U = torch.randn(U.shape, generator=gen, dtype=torch.float32).to(
+                U.device
+            )
+            noise_V = torch.randn(V.shape, generator=gen, dtype=torch.float32).to(
+                V.device
+            )
             Uh = hU.to(U.device) + math.sqrt(1.0 - alpha) * noise_U
             Vh = hV.to(V.device) + math.sqrt(1.0 - alpha) * noise_V
             Uc = math.sqrt(alpha) * U
@@ -330,9 +338,7 @@ class AccumulatedLowRankUpdateState:
                 target_u.mul_(float(self.u_beta))
             if use_torch_opt:
                 batch_targets[name] = target_u
-                batch_grads[name] = direction["U"] * (
-                    float(projected_grad) * scale
-                )
+                batch_grads[name] = direction["U"] * (float(projected_grad) * scale)
                 continue
             if self.u_opt.name == "zo_adamu":
                 mU, vU, mV, vV = self.adamu_mv[name]
@@ -350,9 +356,7 @@ class AccumulatedLowRankUpdateState:
                 sgn = 1.0 if float(projected_grad) >= 0.0 else -1.0
                 self.adamu_hist[name] = (sgn * mU, mV)
             elif self.u_opt.name == "adam_scalar":
-                rate = self.u_opt.scalar_rate(
-                    name, float(projected_grad) * scale
-                )
+                rate = self.u_opt.scalar_rate(name, float(projected_grad) * scale)
                 target_u.add_(direction["U"], alpha=-float(learning_rate) * rate)
             else:
                 target_u.add_(
@@ -447,7 +451,7 @@ class AccumulatedLowRankUpdateState:
         # age every entry, drop the ones whose weight is below tolerance
         kept: list[tuple[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]] = []
         for age, entry in self.momentum_queue:
-            if beta ** age >= float(self.momentum_tol):
+            if beta**age >= float(self.momentum_tol):
                 kept.append((age, entry))
         self.momentum_queue = [(age + 1, entry) for age, entry in kept]
 
@@ -459,7 +463,7 @@ class AccumulatedLowRankUpdateState:
                 if name not in entry:
                     continue
                 U_k, V_k = entry[name]
-                us.append(U_k * (beta ** age))
+                us.append(U_k * (beta**age))
                 vs.append(V_k)
             stacked[name] = {
                 "U": torch.cat(us, dim=1),
