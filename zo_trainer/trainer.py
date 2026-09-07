@@ -162,7 +162,10 @@ class ZOTrainer(Trainer):
 
         The collator emits list-valued fields (token rows, option counts,
         labels), so batches concatenate by key. The extra batches come from a
-        side iterator over the train loader and so are fresh rows, not repeats.
+        side loader over the same (column-pruned) train dataset with its own
+        RNG: reusing ``get_train_dataloader()`` would replay the main loop's
+        seedable permutation, so the anchor would contain its own batch twice
+        and pre-consume the following mini-steps' rows.
         """
 
         q = int(self.svrg_q)
@@ -181,13 +184,29 @@ class ZOTrainer(Trainer):
                 merged[key].extend(value)
         return merged
 
+    def _svrg_side_loader(self) -> Any:
+        from torch.utils.data import DataLoader, RandomSampler
+
+        base = self.get_train_dataloader()
+        seed = (
+            self.args.data_seed if self.args.data_seed is not None else self.args.seed
+        )
+        generator = torch.Generator().manual_seed(int(seed) + 7_919)
+        return DataLoader(
+            base.dataset,
+            batch_size=int(self.args.per_device_train_batch_size),
+            sampler=RandomSampler(base.dataset, generator=generator),
+            collate_fn=base.collate_fn,
+            drop_last=bool(self.args.dataloader_drop_last),
+        )
+
     def _svrg_next_batch(self) -> dict[str, Any]:
         if self._svrg_iter is None:
-            self._svrg_iter = iter(self.get_train_dataloader())
+            self._svrg_iter = iter(self._svrg_side_loader())
         try:
             return next(self._svrg_iter)
         except StopIteration:
-            self._svrg_iter = iter(self.get_train_dataloader())
+            self._svrg_iter = iter(self._svrg_side_loader())
             return next(self._svrg_iter)
 
     def _zo_optimizer(self) -> ZOSGDOptimizer:

@@ -415,7 +415,10 @@ class AccumulatedLowRankUpdateState:
             return 0.0
         t0 = time.perf_counter()
         beta = float(self.u_momentum)
-        if beta > 0.0:
+        # The weight-space queue is the momentum for the plain/SGD coefficient
+        # path only. The Adam family keeps beta1 inside the coefficient
+        # optimizer, so applying the queue there would double the momentum.
+        if beta > 0.0 and str(self.u_optimizer) in ("plain", "sgd"):
             fold_directions = self._with_momentum_queue(fold_directions, beta)
         self.weight_sync.apply_lozo_update(
             fold_directions,

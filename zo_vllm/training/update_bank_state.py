@@ -73,6 +73,13 @@ class BlockLoRAUpdateBankState:
             raise ValueError("update_bank_rank must be positive")
         if not (0.0 <= float(self.u_beta) <= 1.0):
             raise ValueError("u_beta must be in [0, 1]")
+        if str(self.u_optimizer) == "zo_adamu":
+            # The bank path has no shape_directions hook, so ZO-AdaMU would
+            # silently degrade to plain SGD here; only the random_full path
+            # implements it.
+            raise ValueError(
+                "u_optimizer='zo_adamu' is only supported on the random_full path"
+            )
         self.u_opt = UCoefficientOptimizer(
             name=str(self.u_optimizer),
             momentum=float(self.u_momentum),
