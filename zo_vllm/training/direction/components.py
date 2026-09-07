@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Mapping, Sequence
 import hashlib
 import math
@@ -946,6 +948,7 @@ class QueuedAGZOVProvider:
         self.nu = int(nu)
         self.subspace_queue = SubspaceQueue(queue_size)
         self._preinitialized_step: int | None = None
+        self._last_refresh_step: int | None = None
 
     def will_refresh(self, *, step: int) -> bool:
         if self._preinitialized_step == int(step) and not self.subspace_queue.is_empty:
@@ -998,8 +1001,22 @@ class QueuedAGZOVProvider:
         preinitialized = (
             self._preinitialized_step == step_i and not self.subspace_queue.is_empty
         )
+        if preinitialized:
+            # consuming the primed V counts as this step's refresh
+            self._last_refresh_step = step_i
         refreshed = self.will_refresh(step=step_i)
+        if refreshed and self._last_refresh_step == step_i:
+            # A refresh step is refreshed once. Several collects within the
+            # same step (one per probe of a multi-query estimate) must all see
+            # the V computed by the first, not re-run the seeded power
+            # iteration and hand every probe a slightly different V.
+            refreshed = False
+        if os.environ.get("ZO_BANK_SAMEV_DEBUG"):
+            print(f"[vq] collect step={step_i} refreshed={refreshed} preinit={preinitialized} "
+                  f"last_refresh={self._last_refresh_step} queue_empty={self.subspace_queue.is_empty} "
+                  f"perturb_seed={int(perturb_seed)}", flush=True)
         if refreshed:
+            self._last_refresh_step = step_i
             cached_directions, raw = self.inner.collect(
                 batch,
                 targets=targets,

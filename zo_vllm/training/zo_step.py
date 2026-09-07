@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 import math
+import os
 import time
 
 import torch
@@ -320,6 +321,8 @@ class _StepDirectionSampler:
         provider = self.stepper.direction_provider
         if probe is not None and hasattr(provider, "u_provider"):
             # factorised provider: same V*, U re-drawn per probe
+            if os.environ.get("ZO_BANK_SAMEV_DEBUG"):
+                print(f"[sampler] provider.next probe={probe} step={self.step} type={type(provider).__name__}", flush=True)
             sample = provider.next(self.batch, step=self.step, probe=int(probe))
         elif seed is None:
             sample = provider.next(self.batch, step=self.step)
