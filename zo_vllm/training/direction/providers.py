@@ -225,7 +225,15 @@ class FactorizedDirectionProvider:
                 raise RuntimeError("direction U provider cannot load checkpoints")
             load_u_state_dict(state["u_provider"])
 
-    def next(self, batch: ProbeBatch, *, step: int) -> DirectionSample:
+    def next(self, batch: ProbeBatch, *, step: int, probe: int = 0) -> DirectionSample:
+        """One direction for ``step``; ``probe`` > 0 re-draws U under the same V.
+
+        The V provider is keyed on the step and basis seed, so with a frozen
+        V* every probe of a step shares the same V and only the U seed moves.
+        This is what a multi-query estimate over the u-space needs; the
+        spec-based sampler it used before drew a fresh V per probe as well.
+        """
+
         step_i = int(step)
         if step_i <= 0:
             raise ValueError("step must be positive")
@@ -234,6 +242,8 @@ class FactorizedDirectionProvider:
             perturb_seed = self.perturb_seed_offset + step_i + self.seed * 1_000_000
         else:
             perturb_seed = int(self.seed_sampler(step_i))
+        if int(probe) > 0:
+            perturb_seed += int(probe) * 7_919_000
 
         rng_state = torch.get_rng_state()
         cuda_states = (

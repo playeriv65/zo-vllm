@@ -286,8 +286,8 @@ class _ReplaySampler:
     def __init__(self, bundle: "DirectionBundle") -> None:
         self._bundle = bundle
 
-    def sample(self, *, seed: int | None = None) -> "DirectionBundle":
-        del seed
+    def sample(self, *, seed: int | None = None, probe: int | None = None) -> "DirectionBundle":
+        del seed, probe
         return self._bundle
 
 
@@ -312,11 +312,17 @@ class _StepDirectionSampler:
         self._direction_info: dict[str, Any] = {}
         self.profile_s: dict[str, float] = {}
 
-    def sample(self, *, seed: int | None = None) -> DirectionBundle:
+    def sample(
+        self, *, seed: int | None = None, probe: int | None = None
+    ) -> DirectionBundle:
         sample_t0 = time.perf_counter()
         provider_t0 = time.perf_counter()
-        if seed is None:
-            sample = self.stepper.direction_provider.next(self.batch, step=self.step)
+        provider = self.stepper.direction_provider
+        if probe is not None and hasattr(provider, "u_provider"):
+            # factorised provider: same V*, U re-drawn per probe
+            sample = provider.next(self.batch, step=self.step, probe=int(probe))
+        elif seed is None:
+            sample = provider.next(self.batch, step=self.step)
             if self.stepper._force_direction_slot_sync:
                 for direction in sample.directions.values():
                     direction["v_refreshed"] = True

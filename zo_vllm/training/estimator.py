@@ -106,7 +106,9 @@ class DirectionBundle:
 class ZODirectionSampler(Protocol):
     """Sampler used by estimators to request exactly the probes they need."""
 
-    def sample(self, *, seed: int | None = None) -> DirectionBundle:
+    def sample(
+        self, *, seed: int | None = None, probe: int | None = None
+    ) -> DirectionBundle:
         """Sample one direction and prepare its score-time representation."""
         ...
 
@@ -416,7 +418,7 @@ class MultiQueryZOEstimator:
         scorer: Any | None = None,
     ) -> ZOEstimate:
         query_bundles = [
-            direction_sampler.sample(seed=self.seed + int(step) * 100000 + i)
+            direction_sampler.sample(seed=self.seed + int(step) * 100000 + i, probe=i)
             for i in range(self.num_queries)
         ]
         if self.perturbation_sides == "one_sided":
